@@ -1,0 +1,4 @@
+extends: base/ashare_thsdk_robust_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_robust_v1

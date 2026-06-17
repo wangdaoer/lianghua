@@ -1,0 +1,4 @@
+extends: base/ashare_main_chinext_multifactor_satellite_quality_base.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_satellite_quality_v2

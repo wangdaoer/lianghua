@@ -1,0 +1,4 @@
+extends: base/ashare_main_chinext_thsdk_hold_prefer_dd_guard_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_dd_guard_v1

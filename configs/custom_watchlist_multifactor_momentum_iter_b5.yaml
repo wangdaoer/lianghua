@@ -1,0 +1,6 @@
+extends:
+  - custom_watchlist_multifactor_momentum_iter_b.yaml
+  - base/risk_disabled_base.yaml
+
+project:
+  name: mf_momentum_iter_b5

@@ -1,0 +1,7 @@
+extends: custom_watchlist_thsdk_base.yaml
+
+project:
+  name: custom_watchlist_thsdk_hold20_base
+
+strategy:
+  min_hold_days: 20

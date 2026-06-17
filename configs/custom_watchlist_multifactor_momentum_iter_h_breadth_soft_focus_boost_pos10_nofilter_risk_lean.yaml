@@ -1,0 +1,7 @@
+extends:
+  - custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost_pos9_nofilter.yaml
+  - base/strategy_max_positions_10_base.yaml
+  - base/risk_lean_base.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_pos10_nofilter_risk_lean

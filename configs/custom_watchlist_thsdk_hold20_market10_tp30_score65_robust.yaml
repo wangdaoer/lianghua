@@ -1,0 +1,24 @@
+extends: base/custom_watchlist_thsdk_hold20_base.yaml
+
+project:
+  name: custom_watchlist_thsdk_hold20_market10_tp30_score65_robust_v1
+
+strategy:
+  min_score: 65
+  take_profit_pct: 0.30
+
+risk:
+  enabled: true
+  benchmark_code: "510300"
+  benchmark_name: "CSI300 ETF"
+  benchmark_asset_type: etf
+  benchmark_ma_window: 120
+  benchmark_drop_window: 20
+  benchmark_drop_threshold: -0.08
+  benchmark_off_exposure: 0.10
+  benchmark_crash_exposure: 0.0
+  drawdown_levels:
+    - drawdown: 0.99
+      exposure: 1.0
+  protection_drawdown: 0.99
+  recovery_drawdown: 0.15

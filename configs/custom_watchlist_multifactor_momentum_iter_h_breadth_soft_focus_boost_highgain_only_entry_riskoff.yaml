@@ -1,0 +1,6 @@
+extends:
+  - custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost_highgain_only_entry.yaml
+  - base/risk_disabled_base.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_highgain_only_entry_riskoff

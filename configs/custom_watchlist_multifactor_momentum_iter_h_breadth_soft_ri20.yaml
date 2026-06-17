@@ -1,0 +1,7 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_ri20
+
+strategy:
+  factor_rebalance_interval: 20

@@ -1,0 +1,10 @@
+extends: trend_base.yaml
+
+project:
+  name: stock_trend_base
+
+strategy:
+  lot_size: 100
+
+costs:
+  stamp_tax_rate: 0.0005

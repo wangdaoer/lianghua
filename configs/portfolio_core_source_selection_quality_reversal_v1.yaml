@@ -1,0 +1,32 @@
+extends: base/portfolio_core_satellite_guarded_base.yaml
+
+project:
+  name: main_chinext_core_source_selection_quality_reversal_v1
+
+curves:
+  satellite:
+    path: outputs/walk_forward/main_chinext_satellite_quality_v2_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+satellite_sources:
+  quality:
+    path: outputs/walk_forward/main_chinext_satellite_quality_v2_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  reversal:
+    path: outputs/walk_forward/main_chinext_reversal_v1_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  blend_q70_r30:
+    path: outputs/research/ensemble_curves_20260614/quality70_reversal30.csv
+    equity_column: stitched_equity
+  blend_q50_r50:
+    path: outputs/research/ensemble_curves_20260614/quality50_reversal50.csv
+    equity_column: stitched_equity
+  blend_q30_r70:
+    path: outputs/research/ensemble_curves_20260614/quality30_reversal70.csv
+    equity_column: stitched_equity
+
+notes: >
+  Trains the phase-2 portfolio allocator across multiple satellite sources:
+  quality-v2, reversal-v1, and three quality/reversal blends. The source
+  selection is rolling and uses only each training window before testing the
+  selected source and allocation rule on the next out-of-sample window.

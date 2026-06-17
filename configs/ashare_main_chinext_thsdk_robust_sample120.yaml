@@ -1,0 +1,9 @@
+extends:
+  - base/ashare_thsdk_robust_base.yaml
+  - base/ashare_main_chinext_sample120_source.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_robust_sample120_v1
+
+data:
+  start_date: "20220101"

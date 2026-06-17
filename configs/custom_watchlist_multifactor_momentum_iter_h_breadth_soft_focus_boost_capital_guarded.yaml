@@ -1,0 +1,18 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_capital_guarded
+
+risk:
+  benchmark_off_exposure: 0.60
+  benchmark_crash_exposure: 0.10
+  benchmark_drop_threshold: -0.06
+  drawdown_levels:
+    - drawdown: 0.08
+      exposure: 0.85
+    - drawdown: 0.18
+      exposure: 0.50
+    - drawdown: 0.30
+      exposure: 0.20
+  protection_drawdown: 0.30
+  recovery_drawdown: 0.14

@@ -1,0 +1,9 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_entryfilter
+
+strategy:
+  factor_entry_filter_enabled: true
+  factor_entry_min_trend: 0.02
+  factor_entry_min_momentum: -0.05

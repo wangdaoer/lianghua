@@ -1,0 +1,16 @@
+extends: base/portfolio_core_satellite_guarded_base.yaml
+
+project:
+  name: main_chinext_core_reversal_v1_guarded
+
+curves:
+  satellite:
+    path: outputs/walk_forward/main_chinext_reversal_v1_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+notes: >
+  Uses the completed reversal-v1 rolling out-of-sample curve as a research
+  satellite candidate against the stable-v2 defensive core. Reversal-v1 is not
+  promoted to the core because its full walk-forward drawdown and Sharpe were
+  weaker than stable-v2; this config only tests whether allocator gating can
+  use it opportunistically.

@@ -1,0 +1,24 @@
+extends: base/custom_watchlist_multifactor_balanced20_base.yaml
+
+project:
+  name: custom_watchlist_multifactor_tuned_v1
+
+risk:
+  enabled: true
+  benchmark_code: "510300"
+  benchmark_name: "CSI300 ETF"
+  benchmark_asset_type: etf
+  benchmark_ma_window: 120
+  benchmark_drop_window: 20
+  benchmark_drop_threshold: -0.08
+  benchmark_off_exposure: 0.8
+  benchmark_crash_exposure: 0.2
+  drawdown_levels:
+    - drawdown: 0.10
+      exposure: 0.80
+    - drawdown: 0.20
+      exposure: 0.60
+    - drawdown: 0.35
+      exposure: 0.0
+  protection_drawdown: 0.35
+  recovery_drawdown: 0.18

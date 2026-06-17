@@ -1,0 +1,20 @@
+extends: base/portfolio_core_satellite_common.yaml
+
+project:
+  name: main_chinext_core_satellite_v1
+
+curves:
+  satellite:
+    path: outputs/backtests/ashare_main_chinext_hold_prefer_warm120_dd_light/equity_curve.csv
+    equity_column: equity
+
+weights:
+  risk_on:
+    core: 0.75
+    satellite: 0.25
+
+notes: >
+  Satellite uses the existing warm120_dd_light full-period research curve as a
+  risk-on proxy. Treat this as an allocation-layer experiment; the satellite
+  itself still needs walk-forward validation before it can become a final
+  baseline.

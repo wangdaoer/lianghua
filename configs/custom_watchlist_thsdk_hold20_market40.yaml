@@ -1,0 +1,4 @@
+extends: base/custom_watchlist_thsdk_hold20_market40_base.yaml
+
+project:
+  name: custom_watchlist_thsdk_hold20_market40_v1

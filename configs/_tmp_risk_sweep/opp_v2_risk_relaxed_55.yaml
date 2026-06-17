@@ -1,0 +1,24 @@
+extends: base/custom_watchlist_multifactor_balanced20_base.yaml
+project:
+  name: opp_v2_risk_relaxed_55
+risk:
+  benchmark_asset_type: etf
+  benchmark_code: '510300'
+  benchmark_crash_exposure: 0.02
+  benchmark_drop_threshold: -0.06
+  benchmark_drop_window: 20
+  benchmark_ma_window: 120
+  benchmark_name: CSI300 ETF
+  benchmark_off_exposure: 0.55
+  drawdown_levels:
+  - drawdown: 0.1
+    exposure: 0.75
+  - drawdown: 0.2
+    exposure: 0.55
+  - drawdown: 0.3
+    exposure: 0.25
+  - drawdown: 0.35
+    exposure: 0.05
+  enabled: true
+  protection_drawdown: 0.3
+  recovery_drawdown: 0.13

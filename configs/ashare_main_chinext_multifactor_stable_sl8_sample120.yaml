@@ -1,0 +1,6 @@
+extends:
+  - base/ashare_main_chinext_multifactor_stable_sl8_base.yaml
+  - base/ashare_main_chinext_sample120_source.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_stable_sl8_sample120_v1

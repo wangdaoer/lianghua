@@ -1,0 +1,12 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost_pos8_nofilter.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_pos8_momentum_weight
+
+strategy:
+  factor_weights:
+    momentum: 0.45
+    trend: 0.25
+    reversal: 0.05
+    volatility: 0.15
+    liquidity: 0.10

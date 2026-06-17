@@ -1,0 +1,7 @@
+extends: ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_pos3_base
+
+strategy:
+  max_positions: 3

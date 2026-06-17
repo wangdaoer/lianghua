@@ -1,0 +1,11 @@
+extends: base/ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_pos3_lossguard5d40_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_pos3_lossguard5d40_rsrs_z240_v1
+
+risk:
+  benchmark_rsrs_enabled: true
+  benchmark_rsrs_window: 18
+  benchmark_rsrs_zscore_window: 240
+  benchmark_rsrs_threshold: -0.5
+  benchmark_rsrs_off_exposure: 0.35

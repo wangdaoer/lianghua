@@ -1,0 +1,55 @@
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_base
+  initial_cash: 1000000
+  data_dir: data
+  output_dir: outputs/backtests
+
+data:
+  start_date: "20180101"
+  end_date: null
+  period: daily
+  adjust: qfq
+
+universe_source:
+  type: ashare_main_chinext
+  symbol: all
+  asset_type: stock
+  limit: null
+
+strategy:
+  name: thsdk_monitor
+  fast_window: 20
+  slow_window: 60
+  trend_window: 120
+  rsi_window: 14
+  rsi_oversold: 35
+  rsi_recover: 40
+  rsi_exit: 65
+  max_positions: 5
+  allocation_buffer: 0.995
+  lot_size: 100
+  min_score: 65
+  min_hold_days: 20
+  prefer_existing_positions: true
+  take_profit_pct: 0.30
+
+costs:
+  commission_rate: 0.0003
+  slippage_rate: 0.0005
+  stamp_tax_rate: 0.0005
+
+risk:
+  enabled: true
+  benchmark_code: "510300"
+  benchmark_name: "CSI300 ETF"
+  benchmark_asset_type: etf
+  benchmark_ma_window: 120
+  benchmark_drop_window: 20
+  benchmark_drop_threshold: -0.08
+  benchmark_off_exposure: 0.10
+  benchmark_crash_exposure: 0.0
+  drawdown_levels:
+    - drawdown: 0.99
+      exposure: 1.0
+  protection_drawdown: 0.99
+  recovery_drawdown: 0.15

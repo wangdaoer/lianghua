@@ -1,0 +1,4 @@
+extends: base/ashare_main_chinext_thsdk_hold_prefer_warm120_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_warm120_v1

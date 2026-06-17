@@ -1,0 +1,19 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft_mp4.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_mp4_risk_tighter
+
+risk:
+  enabled: true
+  benchmark_off_exposure: 0.50
+  benchmark_crash_exposure: 0.0
+  benchmark_drop_threshold: -0.06
+  drawdown_levels:
+    - drawdown: 0.10
+      exposure: 0.55
+    - drawdown: 0.20
+      exposure: 0.30
+    - drawdown: 0.35
+      exposure: 0.10
+  protection_drawdown: 0.25
+  recovery_drawdown: 0.12

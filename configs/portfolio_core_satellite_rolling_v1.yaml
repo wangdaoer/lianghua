@@ -1,0 +1,10 @@
+extends: base/portfolio_core_satellite_rolling_base.yaml
+
+project:
+  name: main_chinext_core_satellite_rolling_v1
+
+notes: >
+  Satellite uses the true walk-forward out-of-sample curve from
+  main_chinext_satellite_v1_full_20260613_074155. This is stricter than the
+  earlier proxy satellite test and should be treated as the valid rolling
+  validation comparison.

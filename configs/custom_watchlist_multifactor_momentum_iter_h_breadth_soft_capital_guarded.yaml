@@ -1,0 +1,15 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft.yaml
+
+risk:
+  benchmark_off_exposure: 0.5
+  benchmark_crash_exposure: 0.1
+  benchmark_drop_threshold: -0.06
+  drawdown_levels:
+    - drawdown: 0.08
+      exposure: 0.60
+    - drawdown: 0.15
+      exposure: 0.35
+    - drawdown: 0.25
+      exposure: 0.0
+  protection_drawdown: 0.25
+  recovery_drawdown: 0.12

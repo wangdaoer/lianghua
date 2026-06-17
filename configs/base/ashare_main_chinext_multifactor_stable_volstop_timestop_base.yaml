@@ -1,0 +1,9 @@
+extends: ashare_main_chinext_multifactor_stable_volstop_w20_m25_base.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_stable_volstop_timestop_base
+
+strategy:
+  time_stop_enabled: true
+  time_stop_min_hold_days: 40
+  time_stop_return_threshold_pct: 0.02

@@ -1,0 +1,25 @@
+﻿extends: custom_watchlist_multifactor_tuned.yaml
+
+project:
+  name: mf_momentum_iter_b
+
+strategy:
+  momentum_focus_enabled: true
+  momentum_focus_board_scope: all
+  momentum_focus_threshold_pct: 7.0
+  momentum_focus_limit_up_boost: 0.05
+  momentum_focus_strong_gain_boost: 0.02
+  momentum_focus_only: false
+  factor_rebalance_interval: 5
+  factor_min_history: 60
+  factor_weights:
+    momentum: 0.45
+    trend: 0.20
+    reversal: 0.15
+    volatility: 0.10
+    liquidity: 0.10
+  max_positions: 7
+  score_weighted_allocation: true
+  score_allocation_method: proportional
+  score_allocation_min_multiplier: 0.70
+  score_allocation_max_multiplier: 1.40

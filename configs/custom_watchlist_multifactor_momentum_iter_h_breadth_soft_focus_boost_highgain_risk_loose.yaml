@@ -1,0 +1,23 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost_highgain.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_highgain_risk_loose
+
+strategy:
+  max_positions: 6
+  factor_rebalance_interval: 15
+  allocation_buffer: 1.0
+
+risk:
+  benchmark_off_exposure: 0.95
+  benchmark_crash_exposure: 0.45
+  benchmark_drop_threshold: -0.06
+  drawdown_levels:
+    - drawdown: 0.10
+      exposure: 0.95
+    - drawdown: 0.20
+      exposure: 0.70
+    - drawdown: 0.35
+      exposure: 0.25
+  protection_drawdown: 0.45
+  recovery_drawdown: 0.20

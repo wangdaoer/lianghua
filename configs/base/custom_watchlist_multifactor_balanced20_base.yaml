@@ -1,0 +1,13 @@
+extends: custom_watchlist_multifactor_base.yaml
+
+project:
+  name: custom_watchlist_multifactor_balanced20_base
+
+strategy:
+  factor_rebalance_interval: 20
+  factor_weights:
+    momentum: 0.20
+    trend: 0.20
+    reversal: 0.25
+    volatility: 0.25
+    liquidity: 0.10

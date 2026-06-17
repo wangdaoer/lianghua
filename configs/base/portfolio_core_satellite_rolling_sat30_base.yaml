@@ -1,0 +1,9 @@
+extends: portfolio_core_satellite_rolling_base.yaml
+
+project:
+  name: portfolio_core_satellite_rolling_sat30_base
+
+weights:
+  risk_on:
+    core: 0.70
+    satellite: 0.30

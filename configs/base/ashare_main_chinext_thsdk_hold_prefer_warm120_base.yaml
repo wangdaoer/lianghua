@@ -1,0 +1,7 @@
+extends: ashare_main_chinext_thsdk_hold_prefer_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_warm120_base
+
+strategy:
+  signal_min_history: 120

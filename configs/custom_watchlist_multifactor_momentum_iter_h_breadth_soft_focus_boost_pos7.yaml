@@ -1,0 +1,8 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_pos7
+
+strategy:
+  max_positions: 7
+  factor_rebalance_interval: 15

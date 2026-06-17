@@ -1,0 +1,12 @@
+﻿extends: custom_watchlist_multifactor_tuned.yaml
+
+project:
+  name: mf_momentum_iter_f
+
+strategy:
+  momentum_focus_enabled: true
+  momentum_focus_board_scope: main_chinext
+  momentum_focus_threshold_pct: 7.0
+  momentum_focus_limit_up_boost: 0.03
+  momentum_focus_strong_gain_boost: 0.01
+  momentum_focus_only: false

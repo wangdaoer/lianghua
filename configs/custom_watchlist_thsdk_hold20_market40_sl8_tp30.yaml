@@ -1,0 +1,8 @@
+extends: base/custom_watchlist_thsdk_hold20_market40_base.yaml
+
+project:
+  name: custom_watchlist_thsdk_hold20_market40_sl8_tp30_v1
+
+strategy:
+  stop_loss_pct: 0.08
+  take_profit_pct: 0.30

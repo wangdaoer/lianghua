@@ -1,0 +1,19 @@
+extends: custom_watchlist_multifactor_momentum_iter_b.yaml
+
+project:
+  name: mf_momentum_iter_b6
+
+risk:
+  enabled: true
+  benchmark_off_exposure: 1.0
+  benchmark_crash_exposure: 0.0
+  benchmark_drop_threshold: -0.15
+  drawdown_levels:
+    - drawdown: 0.10
+      exposure: 1.0
+    - drawdown: 0.20
+      exposure: 1.0
+    - drawdown: 0.35
+      exposure: 1.0
+  protection_drawdown: 0.99
+  recovery_drawdown: 0.90

@@ -1,0 +1,7 @@
+extends: base/ashare_thsdk_robust_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_robust_sl8_tp30_v1
+
+strategy:
+  stop_loss_pct: 0.08

@@ -1,0 +1,26 @@
+project:
+  name: portfolio_core_satellite_common
+  initial_cash: 1000000
+  output_dir: outputs/portfolios
+
+curves:
+  core:
+    path: outputs/walk_forward/main_chinext_stable_v2_full_20260613_011322/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+regime:
+  benchmark_path: data/processed/510300.csv
+  benchmark_close_column: close
+  ma_window: 120
+  drop_window: 20
+  risk_on_drop_threshold: -0.05
+  crash_drop_threshold: -0.08
+  default_regime: risk_off
+
+weights:
+  risk_off:
+    core: 1.00
+    satellite: 0.00
+  crash:
+    core: 1.00
+    satellite: 0.00

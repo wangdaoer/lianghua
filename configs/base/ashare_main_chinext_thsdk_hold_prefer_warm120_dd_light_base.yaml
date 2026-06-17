@@ -1,0 +1,15 @@
+extends: ashare_main_chinext_thsdk_hold_prefer_warm120_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_base
+
+risk:
+  drawdown_levels:
+    - drawdown: 0.20
+      exposure: 0.70
+    - drawdown: 0.30
+      exposure: 0.35
+    - drawdown: 0.40
+      exposure: 0.0
+  protection_drawdown: 0.40
+  recovery_drawdown: 0.15

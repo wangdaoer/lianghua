@@ -1,0 +1,30 @@
+extends: portfolio_core_source_selection_quality_reversal_v1.yaml
+
+project:
+  name: main_chinext_core_source_selection_quality_reversal_highgain_pos8
+
+satellite_sources:
+  quality:
+    path: outputs/walk_forward/main_chinext_satellite_quality_v2_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  reversal:
+    path: outputs/walk_forward/main_chinext_reversal_v1_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  blend_q70_r30:
+    path: outputs/research/ensemble_curves_20260614/quality70_reversal30.csv
+    equity_column: stitched_equity
+  blend_q50_r50:
+    path: outputs/research/ensemble_curves_20260614/quality50_reversal50.csv
+    equity_column: stitched_equity
+  blend_q30_r70:
+    path: outputs/research/ensemble_curves_20260614/quality30_reversal70.csv
+    equity_column: stitched_equity
+  highgain_pos8:
+    path: outputs/walk_forward/wf_focus_highgain_pos8_4y6m6_robust_gridrisk_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+notes: >
+  Adds the completed focus_highgain_pos8 robust/risk-grid walk-forward curve
+  as a research-only aggressive satellite source. Validate it with a
+  source-specific satellite weight cap before considering any default
+  allocator change.

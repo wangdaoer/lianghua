@@ -1,0 +1,35 @@
+project:
+  name: ashare_main_chinext_multifactor_base
+  initial_cash: 1000000
+  data_dir: data
+  output_dir: outputs/backtests
+
+data:
+  start_date: "20180101"
+  end_date: null
+  period: daily
+  adjust: qfq
+
+universe_source:
+  type: ashare_main_chinext
+  symbol: all
+  asset_type: stock
+  limit: null
+
+strategy:
+  name: multi_factor
+  max_positions: 10
+  allocation_buffer: 0.95
+  lot_size: 100
+  factor_momentum_window: 60
+  factor_reversal_window: 5
+  factor_volatility_window: 20
+  factor_liquidity_window: 20
+  factor_trend_window: 120
+  factor_min_history: 120
+  factor_rebalance_interval: 20
+
+costs:
+  commission_rate: 0.0003
+  slippage_rate: 0.0005
+  stamp_tax_rate: 0.0005

@@ -1,0 +1,16 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_highgain_only
+
+strategy:
+  max_positions: 8
+  momentum_focus_only: true
+  momentum_focus_limit_up_boost: 0.20
+  momentum_focus_strong_gain_boost: 0.12
+  factor_weights:
+    momentum: 0.45
+    trend: 0.20
+    reversal: 0.15
+    volatility: 0.10
+    liquidity: 0.10

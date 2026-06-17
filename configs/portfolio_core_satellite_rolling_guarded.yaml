@@ -1,0 +1,12 @@
+extends: base/portfolio_core_satellite_guarded_base.yaml
+
+project:
+  name: main_chinext_core_satellite_rolling_guarded
+
+notes: >
+  Uses the true rolling-trained satellite OOS curve with a 30% risk-on nominal
+  satellite weight and a satellite health filter. The filter uses only prior
+  satellite equity information: it turns off satellite exposure after weak
+  10-day satellite momentum or a 20% satellite drawdown, and reduces exposure
+  after a 12% satellite drawdown. Removed satellite weight is reallocated to
+  the defensive core.

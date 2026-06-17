@@ -1,0 +1,12 @@
+extends: base/ashare_thsdk_robust_base.yaml
+
+project:
+  name: ashare_main_board_thsdk_robust_sample80_v1
+
+data:
+  start_date: "20220101"
+
+universe_source:
+  type: ashare_main_board
+  symbol: sample80
+  limit: 80

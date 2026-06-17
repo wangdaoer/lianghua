@@ -1,0 +1,19 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_growth
+
+strategy:
+  max_positions: 6
+  factor_rebalance_interval: 10
+  allocation_buffer: 0.995
+  factor_weights:
+    momentum: 0.45
+    trend: 0.20
+    reversal: 0.15
+    volatility: 0.10
+    liquidity: 0.10
+  factor_entry_filter_enabled: true
+  factor_entry_momentum_window: 2
+  factor_entry_min_momentum: 0.035
+  factor_entry_min_trend: 0.005

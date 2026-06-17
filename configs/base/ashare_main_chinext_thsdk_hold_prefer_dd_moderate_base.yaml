@@ -1,0 +1,15 @@
+extends: ashare_main_chinext_thsdk_hold_prefer_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_dd_moderate_base
+
+risk:
+  drawdown_levels:
+    - drawdown: 0.15
+      exposure: 0.70
+    - drawdown: 0.25
+      exposure: 0.35
+    - drawdown: 0.35
+      exposure: 0.0
+  protection_drawdown: 0.35
+  recovery_drawdown: 0.12

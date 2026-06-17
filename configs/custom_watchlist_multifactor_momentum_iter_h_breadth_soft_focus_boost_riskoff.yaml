@@ -1,0 +1,16 @@
+extends:
+  - custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost.yaml
+  - base/risk_disabled_base.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_riskoff
+
+strategy:
+  max_positions: 7
+  factor_rebalance_interval: 10
+  factor_weights:
+    momentum: 0.45
+    trend: 0.20
+    reversal: 0.15
+    volatility: 0.10
+    liquidity: 0.10

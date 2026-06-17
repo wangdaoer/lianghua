@@ -1,0 +1,23 @@
+extends: base/ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_pos3_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_pos3_lossguard5d40_convergence_v1
+
+strategy:
+  rebalance_loss_guard_pct: 0.05
+  rebalance_loss_guard_max_days: 40
+  cross_sectional_score_enabled: true
+  cross_sectional_score_weights:
+    signal: 0.40
+    momentum: 0.20
+    trend: 0.15
+    convergence: 0.15
+    liquidity: 0.05
+    volatility: 0.05
+  factor_momentum_window: 60
+  factor_reversal_window: 5
+  factor_volatility_window: 20
+  factor_liquidity_window: 20
+  factor_trend_window: 120
+  factor_convergence_windows: [5, 10, 20, 60, 120]
+  factor_min_history: 120

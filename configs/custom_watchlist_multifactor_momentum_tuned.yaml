@@ -1,0 +1,18 @@
+extends: custom_watchlist_multifactor_tuned.yaml
+
+project:
+  name: custom_watchlist_multifactor_momentum_tuned_v1
+
+strategy:
+  name: multi_factor
+  momentum_focus_enabled: true
+  momentum_focus_board_scope: all
+  momentum_focus_threshold_pct: 7.0
+  momentum_focus_limit_up_boost: 0.20
+  momentum_focus_strong_gain_boost: 0.05
+  momentum_focus_only: true
+  score_weighted_allocation: true
+  score_allocation_method: tilt
+  score_allocation_tilt_strength: 0.60
+  score_allocation_min_multiplier: 0.60
+  score_allocation_max_multiplier: 1.40

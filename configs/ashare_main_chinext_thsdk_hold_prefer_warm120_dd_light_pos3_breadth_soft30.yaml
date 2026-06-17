@@ -1,0 +1,11 @@
+extends: base/ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_pos3_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_pos3_breadth_soft30_v1
+
+strategy:
+  market_breadth_exposure_enabled: true
+  market_breadth_window: 120
+  market_breadth_min_count: 500
+  market_breadth_weak_ratio: 0.30
+  market_breadth_weak_exposure: 0.50

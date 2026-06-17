@@ -1,0 +1,18 @@
+extends: ashare_main_chinext_multifactor_satellite_base.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_satellite_quality_base
+
+strategy:
+  factor_entry_filter_enabled: true
+  factor_entry_trend_window: 120
+  factor_entry_min_trend: -0.03
+  factor_entry_momentum_window: 20
+  factor_entry_min_momentum: -0.08
+  market_breadth_enabled: true
+  market_breadth_window: 120
+  market_breadth_min_ratio: 0.30
+  market_breadth_min_count: 500
+  market_breadth_exposure_enabled: true
+  market_breadth_weak_ratio: 0.35
+  market_breadth_weak_exposure: 0.65

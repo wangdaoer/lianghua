@@ -1,0 +1,9 @@
+extends:
+  - base/ashare_main_chinext_multifactor_satellite_quality_base.yaml
+  - base/ashare_main_chinext_sample120_source.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_satellite_quality_sample120_v2
+
+strategy:
+  market_breadth_min_count: 60

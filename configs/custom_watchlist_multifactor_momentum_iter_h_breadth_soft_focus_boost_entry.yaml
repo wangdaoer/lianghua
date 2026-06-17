@@ -1,0 +1,11 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_entry
+
+strategy:
+  factor_entry_filter_enabled: true
+  factor_entry_momentum_window: 1
+  factor_entry_min_momentum: 0.07
+  factor_entry_min_trend: 0.01
+

@@ -1,0 +1,4 @@
+extends: base/custom_watchlist_thsdk_base.yaml
+
+project:
+  name: custom_watchlist_thsdk_monitor_v1

@@ -1,0 +1,6 @@
+extends:
+  - base/ashare_main_chinext_multifactor_stable_timestop40_base.yaml
+  - base/ashare_main_chinext_sample120_source.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_stable_timestop40_sample120_v1

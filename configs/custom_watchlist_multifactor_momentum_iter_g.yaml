@@ -1,0 +1,17 @@
+﻿extends: custom_watchlist_multifactor_tuned.yaml
+
+project:
+  name: mf_momentum_iter_g
+
+strategy:
+  momentum_focus_enabled: true
+  momentum_focus_board_scope: main_chinext
+  momentum_focus_threshold_pct: 7.0
+  momentum_focus_limit_up_boost: 0.03
+  momentum_focus_strong_gain_boost: 0.01
+  momentum_focus_only: false
+  score_weighted_allocation: true
+  score_allocation_method: tilt
+  score_allocation_tilt_strength: 0.60
+  score_allocation_min_multiplier: 0.65
+  score_allocation_max_multiplier: 1.35

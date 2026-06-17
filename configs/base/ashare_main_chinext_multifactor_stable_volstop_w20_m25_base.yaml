@@ -1,0 +1,11 @@
+extends: ashare_main_chinext_multifactor_stable_base.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_stable_volstop_w20_m25_base
+
+strategy:
+  volatility_stop_loss_enabled: true
+  volatility_stop_window: 20
+  volatility_stop_multiplier: 2.5
+  volatility_stop_min_pct: 0.04
+  volatility_stop_max_pct: 0.14

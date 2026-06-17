@@ -1,0 +1,14 @@
+extends: portfolio_core_satellite_common.yaml
+
+project:
+  name: portfolio_core_satellite_rolling_base
+
+curves:
+  satellite:
+    path: outputs/walk_forward/main_chinext_satellite_v1_full_20260613_074155/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+weights:
+  risk_on:
+    core: 0.75
+    satellite: 0.25

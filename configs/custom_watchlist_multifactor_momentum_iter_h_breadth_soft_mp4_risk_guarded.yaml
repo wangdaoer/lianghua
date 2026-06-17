@@ -1,0 +1,6 @@
+extends:
+  - custom_watchlist_multifactor_momentum_iter_h_breadth_soft_mp4.yaml
+  - base/risk_guarded_base.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_mp4_risk_guarded

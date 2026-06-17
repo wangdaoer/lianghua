@@ -1,0 +1,12 @@
+extends: ashare_main_chinext_multifactor_stable_base.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_reversal_base
+
+strategy:
+  factor_weights:
+    momentum: 0.05
+    trend: 0.10
+    reversal: 0.55
+    volatility: 0.20
+    liquidity: 0.10

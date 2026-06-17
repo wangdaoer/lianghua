@@ -1,0 +1,10 @@
+extends: base/ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_breadth40_v1
+
+strategy:
+  market_breadth_enabled: true
+  market_breadth_window: 120
+  market_breadth_min_ratio: 0.40
+  market_breadth_min_count: 500

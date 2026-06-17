@@ -1,0 +1,18 @@
+extends:
+  - custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost_highgain_pos8.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_highgain_pos8_chip_reversal02
+
+strategy:
+  factor_weights:
+    momentum: 0.196
+    trend: 0.196
+    reversal: 0.245
+    volatility: 0.245
+    liquidity: 0.098
+    chip_reversal: 0.02
+  factor_chip_reversal_drawdown_window: 20
+  factor_chip_reversal_cost_window: 20
+  factor_chip_reversal_min_drawdown_pct: 12.0
+  factor_chip_reversal_min_score: 0.08

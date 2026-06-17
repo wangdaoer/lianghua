@@ -1,0 +1,20 @@
+extends: base/trend_base.yaml
+
+project:
+  name: etf_trend_v1
+
+universe:
+  - code: "510300"
+    name: "CSI300 ETF"
+  - code: "510500"
+    name: "CSI500 ETF"
+  - code: "159915"
+    name: "ChiNext ETF"
+  - code: "588000"
+    name: "STAR50 ETF"
+  - code: "512100"
+    name: "CSI1000 ETF"
+  - code: "518880"
+    name: "Gold ETF"
+  - code: "511010"
+    name: "Treasury Bond ETF"

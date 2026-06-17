@@ -1,0 +1,16 @@
+extends: portfolio_core_satellite_rolling_sat30_base.yaml
+
+project:
+  name: portfolio_core_satellite_guarded_base
+
+satellite_filter:
+  enabled: true
+  ma_window: 60
+  momentum_window: 10
+  min_momentum: -0.08
+  max_drawdown: 0.20
+  reduced_drawdown: 0.12
+  reduced_scale: 0.75
+  default_scale: 0.0
+  require_above_ma: false
+  reallocate_to: core

@@ -1,0 +1,9 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft_mp4.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_mp4_entry_light
+
+strategy:
+  factor_entry_filter_enabled: true
+  factor_entry_min_trend: 0.01
+  factor_entry_min_momentum: -0.03

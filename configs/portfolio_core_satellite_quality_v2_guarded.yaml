@@ -1,0 +1,14 @@
+extends: base/portfolio_core_satellite_guarded_base.yaml
+
+project:
+  name: main_chinext_core_satellite_quality_v2_guarded
+
+curves:
+  satellite:
+    path: outputs/walk_forward/main_chinext_satellite_quality_v2_full/oos_equity_stitched.csv
+
+notes: >
+  Uses the completed satellite_quality_v2 rolling out-of-sample curve with a
+  30% risk-on nominal satellite weight and the existing satellite health
+  filter. This is the phase-2 replacement test for the older satellite_v1
+  portfolio config.

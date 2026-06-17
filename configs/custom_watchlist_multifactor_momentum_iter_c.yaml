@@ -1,0 +1,25 @@
+﻿extends: custom_watchlist_multifactor_tuned.yaml
+
+project:
+  name: mf_momentum_iter_c
+
+strategy:
+  momentum_focus_enabled: true
+  momentum_focus_board_scope: main_chinext
+  momentum_focus_threshold_pct: 7.0
+  momentum_focus_limit_up_boost: 0.15
+  momentum_focus_strong_gain_boost: 0.08
+  momentum_focus_only: false
+  factor_rebalance_interval: 10
+  factor_min_history: 90
+  factor_entry_filter_enabled: true
+  factor_entry_trend_window: 60
+  factor_entry_min_trend: 0.0
+  factor_entry_momentum_window: 10
+  factor_entry_min_momentum: -0.05
+  max_positions: 10
+  score_weighted_allocation: true
+  score_allocation_method: tilt
+  score_allocation_tilt_strength: 0.40
+  score_allocation_min_multiplier: 0.55
+  score_allocation_max_multiplier: 1.55

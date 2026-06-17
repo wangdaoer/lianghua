@@ -1,0 +1,4 @@
+extends: base/custom_watchlist_multifactor_risk_base.yaml
+
+project:
+  name: custom_watchlist_multifactor_risk_extends

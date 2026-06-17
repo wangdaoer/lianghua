@@ -1,0 +1,7 @@
+extends: base/ashare_thsdk_robust_base.yaml
+
+project:
+  name: ashare_main_board_thsdk_robust_v1
+
+universe_source:
+  type: ashare_main_board

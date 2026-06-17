@@ -1,0 +1,7 @@
+extends: base/custom_watchlist_thsdk_hold20_market40_tp30_base.yaml
+
+project:
+  name: custom_watchlist_thsdk_hold20_market40_tp30_score70_lowdd_v1
+
+strategy:
+  min_score: 70

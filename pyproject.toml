@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-etf-lab"
+version = "0.1.0"
+description = "A-share ETF research backtesting lab."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "akshare>=1.16",
+  "matplotlib>=3.8",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+quant-etf-lab = "quant_etf_lab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

@@ -1,0 +1,14 @@
+﻿extends:
+  - custom_watchlist_multifactor_momentum_iter_h_breadth_soft_focus_boost_highgain_pos8.yaml
+  - base/strategy_max_positions_10_base.yaml
+  - base/risk_lean_base.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost_highgain_pos10_mainch_risk_lean
+
+strategy:
+  factor_rebalance_interval: 8
+  allocation_buffer: 1.0
+  momentum_focus_board_scope: main_chinext
+  momentum_focus_limit_up_boost: 0.26
+  momentum_focus_strong_gain_boost: 0.20

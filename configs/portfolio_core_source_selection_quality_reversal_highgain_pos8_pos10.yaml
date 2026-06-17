@@ -1,0 +1,32 @@
+extends: portfolio_core_source_selection_quality_reversal_highgain_pos8.yaml
+
+project:
+  name: main_chinext_core_source_selection_quality_reversal_highgain_pos8_pos10
+
+satellite_sources:
+  quality:
+    path: outputs/walk_forward/main_chinext_satellite_quality_v2_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  reversal:
+    path: outputs/walk_forward/main_chinext_reversal_v1_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  blend_q70_r30:
+    path: outputs/research/ensemble_curves_20260614/quality70_reversal30.csv
+    equity_column: stitched_equity
+  blend_q50_r50:
+    path: outputs/research/ensemble_curves_20260614/quality50_reversal50.csv
+    equity_column: stitched_equity
+  blend_q30_r70:
+    path: outputs/research/ensemble_curves_20260614/quality30_reversal70.csv
+    equity_column: stitched_equity
+  highgain_pos8:
+    path: outputs/walk_forward/wf_focus_highgain_pos8_4y6m6_robust_gridrisk_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  pos10_risk_lean:
+    path: outputs/walk_forward/wf_iter_h_breadth_soft_focus_boost_pos10_nofilter_risk_lean_3y12m12_rolling/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+notes: >
+  Adds the pos10 risk-lean aggressive custom-watchlist curve as a research-only
+  source alongside highgain_pos8. Validate with source-specific satellite caps
+  before any default allocator change.

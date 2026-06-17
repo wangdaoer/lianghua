@@ -1,0 +1,11 @@
+extends:
+  - base/stock_trend_base.yaml
+  - base/strategy_max_positions_10_base.yaml
+
+project:
+  name: csi300_stock_trend_v1
+
+universe_source:
+  type: csindex
+  symbol: "000300"
+  asset_type: stock

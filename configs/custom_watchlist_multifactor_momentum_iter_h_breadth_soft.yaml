@@ -1,0 +1,13 @@
+extends: custom_watchlist_multifactor_momentum_iter_h.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft
+
+strategy:
+  market_breadth_enabled: true
+  market_breadth_exposure_enabled: true
+  market_breadth_window: 120
+  market_breadth_min_ratio: 0.35
+  market_breadth_min_count: 20
+  market_breadth_weak_ratio: 0.30
+  market_breadth_weak_exposure: 0.55

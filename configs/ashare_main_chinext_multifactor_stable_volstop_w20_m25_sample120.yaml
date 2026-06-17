@@ -1,0 +1,6 @@
+extends:
+  - base/ashare_main_chinext_multifactor_stable_volstop_w20_m25_base.yaml
+  - base/ashare_main_chinext_sample120_source.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_stable_volstop_w20_m25_sample120_v1

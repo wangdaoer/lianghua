@@ -1,0 +1,19 @@
+extends: base/ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_pos3_base.yaml
+
+project:
+  name: ashare_main_chinext_thsdk_hold_prefer_warm120_dd_light_pos3_xscore_v1
+
+strategy:
+  cross_sectional_score_enabled: true
+  cross_sectional_score_weights:
+    signal: 0.45
+    momentum: 0.25
+    trend: 0.20
+    liquidity: 0.05
+    volatility: 0.05
+  factor_momentum_window: 60
+  factor_reversal_window: 5
+  factor_volatility_window: 20
+  factor_liquidity_window: 20
+  factor_trend_window: 120
+  factor_min_history: 120

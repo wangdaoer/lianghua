@@ -1,0 +1,9 @@
+extends: custom_watchlist_multifactor_momentum_iter_h_breadth_soft.yaml
+
+project:
+  name: mf_momentum_iter_h_breadth_soft_focus_boost
+
+strategy:
+  momentum_focus_limit_up_boost: 0.10
+  momentum_focus_strong_gain_boost: 0.06
+

@@ -1,0 +1,15 @@
+extends: base/portfolio_core_satellite_guarded_base.yaml
+
+project:
+  name: main_chinext_core_ensemble_quality70_reversal30_guarded
+
+curves:
+  satellite:
+    path: outputs/research/ensemble_curves_20260614/quality70_reversal30.csv
+    equity_column: stitched_equity
+
+notes: >
+  Uses a composite research satellite curve built from 70% quality-v2 and 30%
+  reversal-v1 daily satellite returns. The core, regime gate, and guarded
+  portfolio allocator remain inherited from the base config so the comparison
+  isolates the satellite source mix.

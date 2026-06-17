@@ -1,0 +1,9 @@
+extends: base/stock_trend_base.yaml
+
+project:
+  name: custom_watchlist_trend_v1
+
+universe_file: configs/custom_stocks.csv
+
+strategy:
+  max_positions: 5

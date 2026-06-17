@@ -1,0 +1,4 @@
+extends: base/ashare_main_chinext_multifactor_satellite_base.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_satellite_v1

@@ -1,0 +1,7 @@
+extends: ashare_main_chinext_multifactor_stable_base.yaml
+
+project:
+  name: ashare_main_chinext_multifactor_stable_sl8_base
+
+strategy:
+  stop_loss_pct: 0.08

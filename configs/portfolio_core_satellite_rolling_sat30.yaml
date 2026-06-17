@@ -1,0 +1,10 @@
+extends: base/portfolio_core_satellite_rolling_sat30_base.yaml
+
+project:
+  name: main_chinext_core_satellite_rolling_sat30
+
+notes: >
+  Uses the true rolling-trained satellite OOS curve with a 30% risk-on
+  satellite weight. The sweep showed this as the highest-Sharpe point among
+  0%-40% risk-on satellite weights, with moderately higher drawdown than the
+  defensive core.
