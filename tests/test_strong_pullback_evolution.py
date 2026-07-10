@@ -1,4 +1,5 @@
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,10 +19,13 @@ from strong_pullback_evolution import (
     parse_evolution_config,
 )
 from run_strong_pullback_evolution import (
+    PriceBundle,
     StrategyRun,
+    can_resume_trial,
     execute_strategy_trial,
     load_price_bundle,
     load_trial_artifacts,
+    run_evolution,
     validate_input_schema,
     write_trial_artifacts,
 )
@@ -286,6 +290,131 @@ class EvolutionAdapterTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "Trial generated no equity rows"):
                 execute_strategy_trial(price_bundle, DEFAULT_STRATEGY_PARAMS)
+
+
+class EvolutionOrchestrationTest(unittest.TestCase):
+    @staticmethod
+    def _flat_bundle(end_date: pd.Timestamp) -> PriceBundle:
+        dates = pd.date_range("2022-01-03", end=end_date, freq="B")
+        frame = pd.DataFrame({"000001": 10.0}, index=dates)
+        return PriceBundle(
+            frame, frame.copy(), frame.copy(), frame.copy(), frame * 1_000_000,
+            pd.Series(1.0, index=dates),
+        )
+
+    @staticmethod
+    def _run_for_params(bundle: PriceBundle, params: dict[str, object]) -> StrategyRun:
+        dates = bundle.close.index[bundle.close.index >= pd.Timestamp("2024-01-01")]
+        daily = 0.0002 + float(params["leverage"]) * 0.0001
+        equity = pd.DataFrame({
+            "date": dates,
+            "equity": 1_000_000.0 * (1.0 + daily) ** pd.RangeIndex(1, len(dates) + 1),
+            "gross_return": daily,
+            "cost": 0.0,
+            "turnover": 0.10,
+            "gross_exposure": float(params["leverage"]),
+        })
+        return StrategyRun(equity, pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+
+    def test_research_load_finishes_at_validation_end_before_test_load(self):
+        config = parse_evolution_config(valid_raw_config())
+        requested_ends: list[pd.Timestamp] = []
+
+        def loader(data_path, end_date, benchmark_path, params):
+            requested_ends.append(pd.Timestamp(end_date))
+            return self._flat_bundle(pd.Timestamp(end_date))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config=config,
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=None,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                run_id="isolation-test",
+                resume=False,
+                bundle_loader=loader,
+                trial_executor=self._run_for_params,
+                git_commit="test-commit",
+            )
+
+        self.assertEqual(requested_ends[0], pd.Timestamp("2025-12-31"))
+        self.assertTrue(all(value <= pd.Timestamp("2025-12-31") for value in requested_ends[:-1]))
+        self.assertEqual(requested_ends[-1], pd.Timestamp("2026-07-09"))
+        self.assertIn(outcome.test_status, {"ready_for_manual_review", "rollback_recommended"})
+
+    def test_resume_requires_exact_trial_evidence_and_params(self):
+        state = {
+            "status": "completed",
+            "trial_id": "risk_075",
+            "evidence_fingerprint": "abc",
+            "params_hash": "def",
+        }
+
+        self.assertTrue(can_resume_trial(state, "abc", "def", "risk_075"))
+        self.assertFalse(can_resume_trial(state, "changed", "def", "risk_075"))
+        self.assertFalse(can_resume_trial(state, "abc", "changed", "risk_075"))
+        self.assertFalse(can_resume_trial(state, "abc", "def", "other_trial"))
+
+    def test_successful_run_writes_manifest_versioned_artifacts_and_chinese_report(self):
+        config = parse_evolution_config(valid_raw_config())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"), root / "runs",
+                "successful-run", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(pd.Timestamp(end_date)),
+                self._run_for_params, "test-commit",
+            )
+            run_dir = outcome.run_dir
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["status"], "success")
+            self.assertTrue((root / "runs" / "latest.json").exists())
+            self.assertTrue((run_dir / "resolved_config.yaml").exists())
+            self.assertTrue((run_dir / "trials.csv").exists())
+            self.assertTrue((run_dir / "rounds.csv").exists())
+            self.assertTrue((run_dir / "test_comparison.csv").exists())
+            self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
+            self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())
+            summary = Path(manifest["summary"])
+            self.assertIn("风险提示", summary.read_text(encoding="utf-8"))
+
+    def test_failed_run_does_not_update_latest_pointer_and_marks_manifest_failed(self):
+        config = parse_evolution_config(valid_raw_config())
+
+        def broken_executor(bundle, params):
+            raise RuntimeError("trial failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "Baseline trial failed"):
+                run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"), root / "runs",
+                    "failed-run", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(pd.Timestamp(end_date)),
+                    broken_executor, "test-commit",
+                )
+            self.assertFalse((root / "runs" / "latest.json").exists())
+            manifest = json.loads(
+                (root / "runs" / "failed-run" / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["status"], "failed")
 
 
 class EvolutionDecisionTest(unittest.TestCase):
