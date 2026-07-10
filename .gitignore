@@ -1,0 +1,51 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Local code graph/cache
+.codebase-memory/
+
+# Generated outputs and run state
+outputs/
+daily_run_state.jsonl
+*.log
+tmp_*.yaml
+tmp_*.yml
+
+# Market data, research panels, and exported spreadsheets
+*.csv
+*.xls
+*.xlsx
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.db
+*.sqlite
+*.sqlite3
+
+# Archives and large local artifacts
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
