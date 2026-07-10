@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -54,6 +55,17 @@ ALLOWED_OVERRIDE_PARAMS = frozenset({
     "basket_guard_return_20d_min", "basket_guard_distance_ma60_min",
     "basket_guard_scale", "rebound_exit_return", "rebound_exit_scale",
     "rebound_exit_market_exposure_max", "rebound_exit_market_exposure_min",
+})
+
+SELECTION_KEYS = frozenset({
+    "min_validation_days",
+    "min_test_days",
+    "max_drawdown_floor",
+    "min_annualized_return_delta",
+    "min_sharpe_delta",
+    "max_turnover_ratio",
+    "rolling_window_days",
+    "max_negative_window_rate",
 })
 
 
@@ -131,6 +143,12 @@ def _validate_params(params: Mapping[str, object]) -> None:
         raise ValueError("min_pullback_5d must be <= max_pullback_5d")
 
 
+def _identifier(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+    return value.strip()
+
+
 def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
     if raw.get("strategy") != "strong_pullback_satellite":
         raise ValueError("strategy must be strong_pullback_satellite")
@@ -158,17 +176,24 @@ def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
     candidate_ids: set[str] = set()
     groups: list[SearchGroup] = []
     for group_raw in list(raw.get("search_groups") or []):
-        group_id = str(group_raw.get("id", "")).strip()
-        if not group_id or group_id in group_ids:
+        if not isinstance(group_raw, Mapping):
+            raise ValueError("search_groups entries must be mappings")
+        group_id = _identifier(group_raw.get("id"), "Group id")
+        if group_id in group_ids:
             raise ValueError(f"Duplicate or empty group id: {group_id!r}")
         group_ids.add(group_id)
         candidates: list[SearchCandidate] = []
         for candidate_raw in list(group_raw.get("candidates") or []):
-            candidate_id = str(candidate_raw.get("id", "")).strip()
-            if not candidate_id or candidate_id in candidate_ids:
+            if not isinstance(candidate_raw, Mapping):
+                raise ValueError("candidates entries must be mappings")
+            candidate_id = _identifier(candidate_raw.get("id"), "Candidate id")
+            if candidate_id in candidate_ids:
                 raise ValueError(f"Duplicate candidate id: {candidate_id!r}")
             candidate_ids.add(candidate_id)
-            overrides = dict(candidate_raw.get("overrides") or {})
+            overrides_raw = candidate_raw.get("overrides") or {}
+            if not isinstance(overrides_raw, Mapping):
+                raise ValueError("candidate overrides must be a mapping")
+            overrides = dict(overrides_raw)
             unknown = set(overrides) - ALLOWED_OVERRIDE_PARAMS
             if unknown:
                 raise ValueError(f"Unknown strategy parameters: {sorted(unknown)}")
@@ -178,7 +203,16 @@ def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
             raise ValueError(f"Search group {group_id!r} has no candidates")
         groups.append(SearchGroup(group_id, str(group_raw.get("hypothesis_cn", "")).strip(), tuple(candidates)))
 
-    selection_raw = dict(raw.get("selection") or {})
+    selection_value = raw.get("selection")
+    if not isinstance(selection_value, Mapping):
+        raise ValueError("selection must be a mapping")
+    selection_raw = dict(selection_value)
+    unknown_selection = set(selection_raw) - SELECTION_KEYS
+    if unknown_selection:
+        raise ValueError(f"Unknown selection keys: {sorted(unknown_selection)}")
+    missing_selection = SELECTION_KEYS - set(selection_raw)
+    if missing_selection:
+        raise ValueError(f"Missing selection keys: {sorted(missing_selection)}")
     selection = SelectionRules(**selection_raw)
     if selection.min_validation_days <= 0 or selection.min_test_days <= 0:
         raise ValueError("minimum period days must be positive")
@@ -203,6 +237,6 @@ def build_group_candidates(
     incumbent: Mapping[str, object], group: SearchGroup
 ) -> tuple[tuple[str, dict[str, object]], ...]:
     return tuple(
-        (candidate.candidate_id, {**dict(incumbent), **candidate.overrides})
+        (candidate.candidate_id, {**deepcopy(dict(incumbent)), **deepcopy(candidate.overrides)})
         for candidate in group.candidates
     )

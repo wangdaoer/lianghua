@@ -2,6 +2,8 @@ import copy
 import unittest
 
 from strong_pullback_evolution import (
+    SearchCandidate,
+    SearchGroup,
     build_group_candidates,
     parse_evolution_config,
 )
@@ -73,3 +75,66 @@ class EvolutionConfigTest(unittest.TestCase):
         self.assertEqual(generated[1][1]["leverage"], 0.90)
         self.assertEqual(config.baseline["leverage"], 0.60)
         self.assertIsNot(generated[0][1], generated[1][1])
+
+    def test_rejects_null_empty_and_non_string_group_ids(self):
+        for invalid_id in (None, "", 123):
+            with self.subTest(invalid_id=invalid_id):
+                raw = valid_raw_config()
+                raw["search_groups"][0]["id"] = invalid_id
+
+                with self.assertRaisesRegex(ValueError, "Group id must be a non-empty string"):
+                    parse_evolution_config(raw)
+
+    def test_rejects_null_empty_and_non_string_candidate_ids(self):
+        for invalid_id in (None, "", 123):
+            with self.subTest(invalid_id=invalid_id):
+                raw = valid_raw_config()
+                raw["search_groups"][0]["candidates"][0]["id"] = invalid_id
+
+                with self.assertRaisesRegex(ValueError, "Candidate id must be a non-empty string"):
+                    parse_evolution_config(raw)
+
+    def test_group_candidates_are_deeply_independent(self):
+        incumbent = {"nested": {"values": ["incumbent"]}}
+        group = SearchGroup(
+            "nested",
+            "nested values",
+            (
+                SearchCandidate("first", {"nested": {"values": ["first"]}}),
+                SearchCandidate("second", {"nested": {"values": ["second"]}}),
+            ),
+        )
+
+        generated = build_group_candidates(incumbent, group)
+        generated[0][1]["nested"]["values"].append("changed")
+
+        self.assertEqual(generated[1][1]["nested"]["values"], ["second"])
+        self.assertEqual(incumbent["nested"]["values"], ["incumbent"])
+
+    def test_rejects_malformed_search_group_entries(self):
+        raw = valid_raw_config()
+        raw["search_groups"] = [None]
+
+        with self.assertRaisesRegex(ValueError, "search_groups entries must be mappings"):
+            parse_evolution_config(raw)
+
+    def test_rejects_malformed_search_candidate_entries(self):
+        raw = valid_raw_config()
+        raw["search_groups"][0]["candidates"] = [None]
+
+        with self.assertRaisesRegex(ValueError, "candidates entries must be mappings"):
+            parse_evolution_config(raw)
+
+    def test_rejects_unknown_selection_keys(self):
+        raw = valid_raw_config()
+        raw["selection"]["future_rule"] = True
+
+        with self.assertRaisesRegex(ValueError, "Unknown selection keys"):
+            parse_evolution_config(raw)
+
+    def test_rejects_missing_selection_keys(self):
+        raw = valid_raw_config()
+        del raw["selection"]["min_test_days"]
+
+        with self.assertRaisesRegex(ValueError, "Missing selection keys"):
+            parse_evolution_config(raw)
