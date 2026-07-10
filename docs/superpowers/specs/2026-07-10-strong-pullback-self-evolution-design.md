@@ -226,7 +226,7 @@ python run_strong_pullback_evolution.py `
 
 以下情况立即失败并保留失败清单：
 
-- 行情缺少 `date/code/open/high/low/close/amount` 必要字段。
+- 行情缺少 `date/symbol/open/high/low/close/volume/amount` 必要字段。
 - 输入数据覆盖不到配置的训练期或验证期。
 - 时间区间重叠、倒置或测试期不在验证期之后。
 - 验证期有效交易日不足。
