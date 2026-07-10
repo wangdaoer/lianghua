@@ -9,6 +9,8 @@ from typing import Mapping
 import pandas as pd
 import yaml
 
+from run_backtest import max_drawdown, sharpe_like
+
 
 DEFAULT_STRATEGY_PARAMS: dict[str, object] = {
     "train_days": 252,
@@ -111,6 +113,21 @@ class EvolutionConfig:
     baseline: dict[str, object]
     search_groups: tuple[SearchGroup, ...]
     selection: SelectionRules
+
+
+@dataclass(frozen=True)
+class PromotionDecision:
+    eligible: bool
+    reasons: tuple[str, ...]
+    turnover_ratio: float
+    robust_score: float
+
+
+@dataclass(frozen=True)
+class CandidateDecision:
+    candidate_id: str
+    promotion: PromotionDecision
+    metrics: dict[str, float]
 
 
 def _timestamp(value: object, name: str, allow_none: bool = False) -> pd.Timestamp | None:
@@ -240,3 +257,136 @@ def build_group_candidates(
         (candidate.candidate_id, {**deepcopy(dict(incumbent)), **deepcopy(candidate.overrides)})
         for candidate in group.candidates
     )
+
+
+def calculate_segment_metrics(
+    equity: pd.DataFrame,
+    start: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+    rolling_window_days: int,
+) -> dict[str, float]:
+    frame = equity.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame[frame["date"].between(pd.Timestamp(start), pd.Timestamp(end))].sort_values("date")
+    if frame.empty:
+        raise ValueError(f"No equity rows between {start} and {end}")
+    returns = pd.to_numeric(frame["gross_return"], errors="coerce") - pd.to_numeric(
+        frame["cost"], errors="coerce"
+    )
+    if returns.isna().any() or (returns <= -1.0).any():
+        raise ValueError("Segment contains invalid net returns")
+    nav = (1.0 + returns).cumprod()
+    total_return = float(nav.iloc[-1] - 1.0)
+    annualized = float((1.0 + total_return) ** (252.0 / len(nav)) - 1.0)
+    rolling = nav / nav.shift(int(rolling_window_days)) - 1.0
+    completed = rolling.dropna()
+    negative_rate = float(completed.lt(0.0).mean()) if not completed.empty else 0.0
+    worst_rolling = float(completed.min()) if not completed.empty else total_return
+    metrics = {
+        "total_return": total_return,
+        "annualized_return": annualized,
+        "max_drawdown": float(max_drawdown(nav)),
+        "sharpe_like": float(sharpe_like(returns)),
+        "avg_turnover": float(pd.to_numeric(frame["turnover"], errors="coerce").mean()),
+        "avg_gross_exposure": float(pd.to_numeric(frame["gross_exposure"], errors="coerce").mean()),
+        "trade_days": int(len(frame)),
+        "negative_window_rate": negative_rate,
+        "worst_rolling_return": worst_rolling,
+    }
+    if not all(math.isfinite(float(value)) for value in metrics.values()):
+        raise ValueError("Segment metrics contain non-finite values")
+    return metrics
+
+
+def _turnover_ratio(candidate_turnover: float, incumbent_turnover: float) -> float:
+    if abs(incumbent_turnover) <= 1e-12:
+        return 1.0 if abs(candidate_turnover) <= 1e-12 else math.inf
+    return candidate_turnover / incumbent_turnover
+
+
+def _robust_score(metrics: Mapping[str, float], turnover_ratio: float) -> float:
+    return float(
+        metrics["annualized_return"]
+        + 0.15 * metrics["sharpe_like"]
+        + 0.50 * metrics["max_drawdown"]
+        - 0.10 * metrics["negative_window_rate"]
+        - 0.05 * max(turnover_ratio - 1.0, 0.0)
+    )
+
+
+def evaluate_promotion(
+    candidate_metrics: Mapping[str, float],
+    incumbent_metrics: Mapping[str, float],
+    rules: SelectionRules,
+) -> PromotionDecision:
+    required = (
+        "annualized_return", "max_drawdown", "sharpe_like", "avg_turnover",
+        "trade_days", "negative_window_rate",
+    )
+    reasons: list[str] = []
+    if not all(math.isfinite(float(candidate_metrics[key])) for key in required):
+        reasons.append("关键指标存在非有限值")
+    turnover_ratio = _turnover_ratio(
+        float(candidate_metrics["avg_turnover"]), float(incumbent_metrics["avg_turnover"])
+    )
+    if int(candidate_metrics["trade_days"]) < rules.min_validation_days:
+        reasons.append("验证期有效交易日不足")
+    if float(candidate_metrics["max_drawdown"]) < rules.max_drawdown_floor:
+        reasons.append("最大回撤超过限制")
+    if float(candidate_metrics["annualized_return"]) - float(incumbent_metrics["annualized_return"]) < rules.min_annualized_return_delta - 1e-12:
+        reasons.append("年化收益提升不足")
+    if float(candidate_metrics["sharpe_like"]) - float(incumbent_metrics["sharpe_like"]) < rules.min_sharpe_delta - 1e-12:
+        reasons.append("Sharpe 恶化超过限制")
+    if turnover_ratio > rules.max_turnover_ratio + 1e-12:
+        reasons.append("换手率放大超过限制")
+    if float(candidate_metrics["negative_window_rate"]) > rules.max_negative_window_rate + 1e-12:
+        reasons.append("负滚动窗口占比超过限制")
+    return PromotionDecision(
+        eligible=not reasons,
+        reasons=tuple(reasons),
+        turnover_ratio=float(turnover_ratio),
+        robust_score=_robust_score(candidate_metrics, turnover_ratio),
+    )
+
+
+def choose_group_winner(
+    incumbent_id: str,
+    incumbent_metrics: Mapping[str, float],
+    candidates: tuple[tuple[str, Mapping[str, float]], ...],
+    rules: SelectionRules,
+) -> tuple[str, tuple[CandidateDecision, ...]]:
+    decisions = tuple(
+        CandidateDecision(candidate_id, evaluate_promotion(metrics, incumbent_metrics, rules), dict(metrics))
+        for candidate_id, metrics in candidates
+    )
+    eligible = [decision for decision in decisions if decision.promotion.eligible]
+    if not eligible:
+        return incumbent_id, decisions
+    eligible.sort(
+        key=lambda item: (
+            item.metrics["annualized_return"], item.promotion.robust_score,
+            item.metrics["sharpe_like"], item.metrics["max_drawdown"],
+            -item.metrics["avg_turnover"],
+        ),
+        reverse=True,
+    )
+    return eligible[0].candidate_id, decisions
+
+
+def assess_test_result(
+    baseline_metrics: Mapping[str, float],
+    champion_metrics: Mapping[str, float],
+    rules: SelectionRules,
+) -> tuple[str, str]:
+    if min(int(baseline_metrics["trade_days"]), int(champion_metrics["trade_days"])) < rules.min_test_days:
+        return "test_warning", "测试期有效交易日不足，暂不判断晋级"
+    failures: list[str] = []
+    if float(champion_metrics["total_return"]) < float(baseline_metrics["total_return"]):
+        failures.append("测试期收益低于基准")
+    if float(champion_metrics["max_drawdown"]) < rules.max_drawdown_floor:
+        failures.append("测试期最大回撤超过限制")
+    if float(champion_metrics["sharpe_like"]) - float(baseline_metrics["sharpe_like"]) < -0.10:
+        failures.append("测试期 Sharpe 恶化超过 0.10")
+    if failures:
+        return "rollback_recommended", "；".join(failures)
+    return "ready_for_manual_review", "测试期收益、回撤和 Sharpe 门槛通过，等待人工确认"

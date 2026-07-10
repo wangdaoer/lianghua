@@ -1,10 +1,16 @@
 import copy
 import unittest
 
+import pandas as pd
+
 from strong_pullback_evolution import (
+    assess_test_result,
     SearchCandidate,
     SearchGroup,
     build_group_candidates,
+    calculate_segment_metrics,
+    choose_group_winner,
+    evaluate_promotion,
     parse_evolution_config,
 )
 
@@ -138,3 +144,65 @@ class EvolutionConfigTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Missing selection keys"):
             parse_evolution_config(raw)
+
+
+class EvolutionDecisionTest(unittest.TestCase):
+    def test_segment_metrics_compound_net_returns_inside_requested_period(self):
+        equity = pd.DataFrame(
+            {
+                "date": pd.date_range("2025-01-01", periods=4, freq="B"),
+                "gross_return": [0.50, 0.10, -0.05, 0.02],
+                "cost": [0.0, 0.01, 0.0, 0.0],
+                "turnover": [0.0, 0.2, 0.1, 0.0],
+                "gross_exposure": [0.0, 0.6, 0.6, 0.6],
+            }
+        )
+
+        metrics = calculate_segment_metrics(
+            equity, "2025-01-02", "2025-01-06", rolling_window_days=2
+        )
+
+        self.assertAlmostEqual(metrics["total_return"], 1.09 * 0.95 * 1.02 - 1.0)
+        self.assertEqual(metrics["trade_days"], 3)
+        self.assertAlmostEqual(metrics["avg_turnover"], 0.1)
+
+    def test_promotion_accepts_exact_drawdown_and_sharpe_boundaries(self):
+        rules = parse_evolution_config(valid_raw_config()).selection
+        incumbent = {
+            "annualized_return": 0.10, "max_drawdown": -0.30, "sharpe_like": 0.50,
+            "avg_turnover": 0.10, "trade_days": 200, "negative_window_rate": 0.20,
+        }
+        candidate = {
+            "annualized_return": 0.11, "max_drawdown": -0.40, "sharpe_like": 0.40,
+            "avg_turnover": 0.15, "trade_days": 200, "negative_window_rate": 0.60,
+        }
+
+        decision = evaluate_promotion(candidate, incumbent, rules)
+
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.reasons, ())
+
+    def test_group_keeps_incumbent_when_no_candidate_passes(self):
+        rules = parse_evolution_config(valid_raw_config()).selection
+        incumbent = {
+            "annualized_return": 0.10, "max_drawdown": -0.20, "sharpe_like": 0.50,
+            "avg_turnover": 0.10, "trade_days": 200, "negative_window_rate": 0.20,
+        }
+        candidate = {**incumbent, "annualized_return": 0.105}
+
+        winner, decisions = choose_group_winner(
+            "incumbent", incumbent, (("weak_gain", candidate),), rules
+        )
+
+        self.assertEqual(winner, "incumbent")
+        self.assertFalse(decisions[0].promotion.eligible)
+
+    def test_holdout_recommends_rollback_when_champion_loses(self):
+        rules = parse_evolution_config(valid_raw_config()).selection
+        baseline = {"total_return": 0.20, "max_drawdown": -0.20, "sharpe_like": 0.50, "trade_days": 100}
+        champion = {"total_return": 0.10, "max_drawdown": -0.25, "sharpe_like": 0.45, "trade_days": 100}
+
+        status, reason = assess_test_result(baseline, champion, rules)
+
+        self.assertEqual(status, "rollback_recommended")
+        self.assertIn("收益", reason)
