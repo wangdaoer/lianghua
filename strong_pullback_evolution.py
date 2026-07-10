@@ -160,6 +160,17 @@ def _validate_params(params: Mapping[str, object]) -> None:
         value = float(params[key])
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"{key} must be a finite non-negative number")
+    if int(params["market_ma_window"]) <= 0:
+        raise ValueError("market_ma_window must be positive")
+    for key in ("initial_capital", "max_abs_daily_return"):
+        value = float(params[key])
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{key} must be a finite positive number")
+    if float(params["max_abs_daily_return"]) > 1.0:
+        raise ValueError("max_abs_daily_return must be <= 1.0")
+    market_risk_off_drawdown = float(params["market_risk_off_drawdown_20d"])
+    if not math.isfinite(market_risk_off_drawdown) or not -1.0 <= market_risk_off_drawdown <= 0.0:
+        raise ValueError("market_risk_off_drawdown_20d must be between -1 and 0")
     for key in (
         "limit_buffer",
         "market_below_ma_exposure",
@@ -170,6 +181,18 @@ def _validate_params(params: Mapping[str, object]) -> None:
         value = float(params[key])
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:
             raise ValueError(f"{key} must be between 0 and 1")
+    for key in ("basket_guard_return_20d_min", "basket_guard_distance_ma60_min"):
+        value = params[key]
+        if value is not None and (
+            not math.isfinite(float(value)) or not -1.0 <= float(value) <= 1.0
+        ):
+            raise ValueError(f"{key} must be between -1 and 1")
+    rebound_exit_return = params["rebound_exit_return"]
+    if rebound_exit_return is not None and (
+        not math.isfinite(float(rebound_exit_return))
+        or not 0.0 <= float(rebound_exit_return) <= 1.0
+    ):
+        raise ValueError("rebound_exit_return must be between 0 and 1")
     for key in ("rebound_exit_market_exposure_max", "rebound_exit_market_exposure_min"):
         value = params[key]
         if value is not None and (

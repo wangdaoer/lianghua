@@ -293,6 +293,26 @@ class EvolutionConfigTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, key):
                         parse_evolution_config(raw)
 
+    def test_rejects_invalid_remaining_baseline_controls(self):
+        invalid_values = {
+            "market_ma_window": 0,
+            "market_risk_off_drawdown_20d": (-1.01, 0.01),
+            "max_abs_daily_return": (0.0, 1.01),
+            "initial_capital": 0.0,
+            "basket_guard_return_20d_min": (-1.01, 1.01),
+            "basket_guard_distance_ma60_min": (-1.01, 1.01),
+            "rebound_exit_return": (-0.01, 1.01),
+        }
+
+        for key, values in invalid_values.items():
+            for value in values if isinstance(values, tuple) else (values,):
+                with self.subTest(key=key, value=value):
+                    raw = valid_raw_config()
+                    raw["baseline"][key] = value
+
+                    with self.assertRaisesRegex(ValueError, key):
+                        parse_evolution_config(raw)
+
 
 class EvolutionAdapterTest(unittest.TestCase):
     def test_schema_requires_real_ohlcv_and_amount_columns(self):
@@ -770,6 +790,62 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "failed")
             self.assertEqual(manifest["test_status"], "rollback_recommended")
+            self.assertTrue((run_dir / "test_comparison.csv").exists())
+            self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
+            self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())
+            self.assertEqual((root / "runs" / "latest.json").read_text(encoding="utf-8"), latest_before)
+            self.assertEqual(
+                (root / "runs" / "evolution_registry.jsonl").read_text(encoding="utf-8"), registry_before
+            )
+
+    def test_holdout_warning_preserves_artifacts_but_does_not_publish(self):
+        published_config = parse_evolution_config(valid_raw_config())
+        warning_raw = valid_raw_config()
+        warning_raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_test_days": 1_000,
+        })
+        warning_config = parse_evolution_config(warning_raw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            common = dict(
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=None,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                trial_executor=self._run_for_params,
+                git_commit="test-commit",
+            )
+            run_evolution(
+                config=published_config,
+                run_id="published-run",
+                resume=False,
+                **common,
+            )
+            latest_before = (root / "runs" / "latest.json").read_text(encoding="utf-8")
+            registry_before = (root / "runs" / "evolution_registry.jsonl").read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "Holdout test test_warning"):
+                run_evolution(
+                    config=warning_config,
+                    run_id="warning-run",
+                    resume=False,
+                    **common,
+                )
+
+            run_dir = root / "runs" / "warning-run"
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["test_status"], "test_warning")
             self.assertTrue((run_dir / "test_comparison.csv").exists())
             self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
             self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())
