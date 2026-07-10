@@ -17,6 +17,8 @@ env/
 
 # Local code graph/cache
 .codebase-memory/
+.worktrees/
+.superpowers/
 
 # Generated outputs and run state
 outputs/
