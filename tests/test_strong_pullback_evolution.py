@@ -2,6 +2,7 @@ import copy
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -18,6 +19,7 @@ from strong_pullback_evolution import (
 )
 from run_strong_pullback_evolution import (
     StrategyRun,
+    execute_strategy_trial,
     load_price_bundle,
     load_trial_artifacts,
     validate_input_schema,
@@ -198,6 +200,82 @@ class EvolutionAdapterTest(unittest.TestCase):
 
             self.assertEqual(float(loaded.equity.loc[0, "equity"]), 1_010_000.0)
             self.assertEqual(str(loaded.candidates.loc[0, "symbol"]), "000001")
+
+    def test_execute_strategy_trial_forwards_engine_boundary(self):
+        bundle = StrategyRun(
+            equity=pd.DataFrame(), weights=pd.DataFrame(), trades=pd.DataFrame(), candidates=pd.DataFrame()
+        )
+        price_bundle = type("PriceBundleStub", (), {
+            "close": pd.DataFrame({"000001": [10.0]}),
+            "open_px": pd.DataFrame({"000001": [10.0]}),
+            "high": pd.DataFrame({"000001": [10.0]}),
+            "low": pd.DataFrame({"000001": [10.0]}),
+            "amount": pd.DataFrame({"000001": [1_000.0]}),
+            "market_exposure": pd.Series([0.6]),
+        })()
+        params = {
+            **DEFAULT_STRATEGY_PARAMS,
+            "train_days": 111,
+            "top_n": 3,
+            "leverage": 0.75,
+            "min_score": 0.42,
+            "commission_bps": 1.2,
+            "impact_bps": 0.8,
+            "initial_capital": 123_456.0,
+            "basket_guard_return_20d_min": 0.05,
+            "basket_guard_distance_ma60_min": -0.02,
+            "basket_guard_scale": 0.7,
+            "rebound_exit_return": 0.12,
+            "rebound_exit_scale": 0.25,
+            "rebound_exit_market_exposure_max": 0.4,
+            "rebound_exit_market_exposure_min": 0.1,
+        }
+        captured = {}
+
+        def spy(**kwargs):
+            captured.update(kwargs)
+            return (
+                pd.DataFrame({"date": ["2025-01-01"], "equity": [1.0]}),
+                pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+            )
+
+        with patch("run_strong_pullback_evolution.run_satellite_walk_forward", side_effect=spy):
+            result = execute_strategy_trial(price_bundle, params)
+
+        self.assertIsInstance(result, StrategyRun)
+        self.assertEqual(captured["train_days"], 111)
+        self.assertEqual(captured["top_n"], 3)
+        self.assertEqual(captured["leverage"], 0.75)
+        self.assertEqual(captured["min_score"], 0.42)
+        self.assertEqual(captured["commission_bps"], 1.2)
+        self.assertEqual(captured["impact_bps"], 0.8)
+        self.assertIs(captured["market_exposure"], price_bundle.market_exposure)
+        self.assertEqual(captured["initial_capital"], 123_456.0)
+        self.assertEqual(captured["filter_kwargs"], {key: float(params[key]) for key in (
+            "min_close", "min_avg_amount_20d", "min_pullback_5d", "max_pullback_5d",
+            "min_prior_return_20", "min_prior_return_60", "min_return_20d",
+            "min_return_60d", "min_distance_ma60", "max_intraday_return",
+        )})
+        self.assertEqual(captured["basket_guard_return_20d_min"], 0.05)
+        self.assertEqual(captured["basket_guard_distance_ma60_min"], -0.02)
+        self.assertEqual(captured["basket_guard_scale"], 0.7)
+        self.assertEqual(captured["rebound_exit_return"], 0.12)
+        self.assertEqual(captured["rebound_exit_scale"], 0.25)
+        self.assertEqual(captured["rebound_exit_market_exposure_max"], 0.4)
+        self.assertEqual(captured["rebound_exit_market_exposure_min"], 0.1)
+
+    def test_execute_strategy_trial_rejects_empty_equity(self):
+        price_bundle = type("PriceBundleStub", (), {
+            "close": pd.DataFrame(), "open_px": pd.DataFrame(), "high": pd.DataFrame(),
+            "low": pd.DataFrame(), "amount": pd.DataFrame(), "market_exposure": pd.Series(dtype=float),
+        })()
+
+        with patch(
+            "run_strong_pullback_evolution.run_satellite_walk_forward",
+            return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
+        ):
+            with self.assertRaisesRegex(ValueError, "Trial generated no equity rows"):
+                execute_strategy_trial(price_bundle, DEFAULT_STRATEGY_PARAMS)
 
 
 class EvolutionDecisionTest(unittest.TestCase):
