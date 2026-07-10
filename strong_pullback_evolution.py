@@ -156,6 +156,26 @@ def _validate_params(params: Mapping[str, object]) -> None:
         raise ValueError("leverage must be <= 1.5")
     if float(params["max_position_weight"]) > 1.0:
         raise ValueError("max_position_weight must be <= 1.0")
+    for key in ("commission_bps", "impact_bps", "max_buy_open_gap"):
+        value = float(params[key])
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{key} must be a finite non-negative number")
+    for key in (
+        "limit_buffer",
+        "market_below_ma_exposure",
+        "market_crash_exposure",
+        "basket_guard_scale",
+        "rebound_exit_scale",
+    ):
+        value = float(params[key])
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{key} must be between 0 and 1")
+    for key in ("rebound_exit_market_exposure_max", "rebound_exit_market_exposure_min"):
+        value = params[key]
+        if value is not None and (
+            not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+        ):
+            raise ValueError(f"{key} must be between 0 and 1")
     if float(params["min_pullback_5d"]) > float(params["max_pullback_5d"]):
         raise ValueError("min_pullback_5d must be <= max_pullback_5d")
 

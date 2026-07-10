@@ -79,6 +79,9 @@ class RunEvidence:
     data_path: str
     data_size: int
     data_mtime_ns: int
+    benchmark_path: str | None
+    benchmark_size: int | None
+    benchmark_mtime_ns: int | None
     config_path: str
     config_hash: str
     git_commit: str
@@ -102,13 +105,18 @@ def build_run_evidence(
     data_path: Path,
     config_path: Path,
     config: EvolutionConfig,
+    benchmark_path: Path | None,
     git_commit: str,
 ) -> RunEvidence:
     stat = data_path.resolve().stat()
+    benchmark_stat = benchmark_path.resolve().stat() if benchmark_path else None
     return RunEvidence(
         data_path=str(data_path.resolve()),
         data_size=int(stat.st_size),
         data_mtime_ns=int(stat.st_mtime_ns),
+        benchmark_path=str(benchmark_path.resolve()) if benchmark_path else None,
+        benchmark_size=int(benchmark_stat.st_size) if benchmark_stat else None,
+        benchmark_mtime_ns=int(benchmark_stat.st_mtime_ns) if benchmark_stat else None,
         config_path=str(config_path.resolve()),
         config_hash=stable_hash({
             "strategy": config.strategy,
@@ -354,7 +362,7 @@ def run_evolution(
     git_commit: str = "unknown",
 ) -> EvolutionOutcome:
     run_dir = output_root / run_id
-    evidence = build_run_evidence(data_path, config_path, config, git_commit)
+    evidence = build_run_evidence(data_path, config_path, config, benchmark_path, git_commit)
     manifest_path = run_dir / "manifest.json"
     if resume:
         if not manifest_path.exists():
@@ -563,13 +571,18 @@ def run_evolution(
         summary_path = write_chinese_summary(
             run_dir, asof_date, champion_id, round_rows, final_metrics, test_status, test_reason
         )
+        manifest.update({
+            "champion_id": champion_id,
+            "test_status": test_status,
+            "test_reason": test_reason,
+            "summary": str(summary_path),
+        })
+        if test_status != "ready_for_manual_review":
+            raise RuntimeError(f"Holdout test {test_status}: {test_reason}")
 
         manifest.update({
             "status": "success",
             "completed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "champion_id": champion_id,
-            "test_status": test_status,
-            "summary": str(summary_path),
         })
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         (output_root / "latest.json").write_text(

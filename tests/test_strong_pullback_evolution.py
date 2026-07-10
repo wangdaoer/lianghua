@@ -270,6 +270,29 @@ class EvolutionConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Missing selection keys"):
             parse_evolution_config(raw)
 
+    def test_rejects_unsafe_execution_and_exposure_parameters(self):
+        invalid_values = {
+            "commission_bps": -0.01,
+            "impact_bps": -0.01,
+            "limit_buffer": (-0.01, 1.01),
+            "rebound_exit_scale": (-0.01, 1.01),
+            "max_buy_open_gap": -0.01,
+            "market_below_ma_exposure": (-0.01, 1.01),
+            "market_crash_exposure": (-0.01, 1.01),
+            "basket_guard_scale": (-0.01, 1.01),
+            "rebound_exit_market_exposure_max": (-0.01, 1.01),
+            "rebound_exit_market_exposure_min": (-0.01, 1.01),
+        }
+
+        for key, values in invalid_values.items():
+            for value in values if isinstance(values, tuple) else (values,):
+                with self.subTest(key=key, value=value):
+                    raw = valid_raw_config()
+                    raw["baseline"][key] = value
+
+                    with self.assertRaisesRegex(ValueError, key):
+                        parse_evolution_config(raw)
+
 
 class EvolutionAdapterTest(unittest.TestCase):
     def test_schema_requires_real_ohlcv_and_amount_columns(self):
@@ -545,6 +568,45 @@ class EvolutionOrchestrationTest(unittest.TestCase):
 
         self.assertEqual(calls, [])
 
+    def test_resume_rejects_changed_benchmark_evidence_before_executing_trials(self):
+        config = parse_evolution_config(valid_raw_config())
+        calls: list[float] = []
+
+        def executor(bundle, params):
+            calls.append(float(params["leverage"]))
+            return self._run_for_params(bundle, params)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            benchmark = root / "benchmark.csv"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            benchmark.write_text("benchmark evidence", encoding="utf-8")
+            kwargs = dict(
+                config=config,
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=benchmark,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                run_id="benchmark-evidence-mismatch",
+                bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                trial_executor=executor,
+                git_commit="test-commit",
+            )
+            run_evolution(resume=False, **kwargs)
+            calls.clear()
+            benchmark.write_text("changed benchmark evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Resume evidence does not match"):
+                run_evolution(resume=True, **kwargs)
+
+        self.assertEqual(calls, [])
+
     def test_resume_recomputes_trial_when_cached_metrics_or_csv_are_invalid(self):
         config = parse_evolution_config(valid_raw_config())
         mutations = ("missing_metric", "non_finite_metric", "missing_csv", "corrupt_csv")
@@ -653,6 +715,68 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 (root / "runs" / "failed-run" / "manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["status"], "failed")
+
+    def test_holdout_rollback_preserves_artifacts_but_does_not_publish(self):
+        raw = valid_raw_config()
+        raw["selection"]["min_annualized_return_delta"] = 0.0
+        config = parse_evolution_config(raw)
+
+        def rollback_executor(bundle, params):
+            run = self._run_for_params(bundle, params)
+            if bundle.close.index.max() > config.periods.validation_end:
+                daily = 0.0002 if float(params["leverage"]) == config.baseline["leverage"] else -0.0002
+                equity = run.equity.copy()
+                equity["equity"] = 1_000_000.0 * (1.0 + daily) ** pd.RangeIndex(1, len(equity) + 1)
+                equity["gross_return"] = daily
+                return StrategyRun(equity, run.weights, run.trades, run.candidates)
+            return run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            common = dict(
+                config=config,
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=None,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                git_commit="test-commit",
+            )
+            run_evolution(
+                run_id="published-run",
+                resume=False,
+                trial_executor=self._run_for_params,
+                **common,
+            )
+            latest_before = (root / "runs" / "latest.json").read_text(encoding="utf-8")
+            registry_before = (root / "runs" / "evolution_registry.jsonl").read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "Holdout test rollback_recommended"):
+                run_evolution(
+                    run_id="rollback-run",
+                    resume=False,
+                    trial_executor=rollback_executor,
+                    **common,
+                )
+
+            run_dir = root / "runs" / "rollback-run"
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["test_status"], "rollback_recommended")
+            self.assertTrue((run_dir / "test_comparison.csv").exists())
+            self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
+            self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())
+            self.assertEqual((root / "runs" / "latest.json").read_text(encoding="utf-8"), latest_before)
+            self.assertEqual(
+                (root / "runs" / "evolution_registry.jsonl").read_text(encoding="utf-8"), registry_before
+            )
 
 
 class EvolutionDecisionTest(unittest.TestCase):
