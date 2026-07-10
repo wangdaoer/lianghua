@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
+import yaml
 
 from strong_pullback_evolution import (
     DEFAULT_STRATEGY_PARAMS,
@@ -16,6 +18,7 @@ from strong_pullback_evolution import (
     calculate_segment_metrics,
     choose_group_winner,
     evaluate_promotion,
+    load_evolution_config,
     parse_evolution_config,
 )
 from run_strong_pullback_evolution import (
@@ -25,6 +28,7 @@ from run_strong_pullback_evolution import (
     execute_strategy_trial,
     load_price_bundle,
     load_trial_artifacts,
+    parse_args,
     run_evolution,
     validate_input_schema,
     write_trial_artifacts,
@@ -64,6 +68,111 @@ def valid_raw_config() -> dict[str, object]:
             "max_negative_window_rate": 0.60,
         },
     }
+
+
+class EvolutionCliTest(unittest.TestCase):
+    def test_cli_requires_explicit_data_path(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--config", "configs/evolution_strong_pullback.yaml"])
+
+    def test_default_config_parses_and_has_three_hypothesis_groups(self):
+        config = load_evolution_config(Path("configs/evolution_strong_pullback.yaml"))
+
+        self.assertEqual(
+            [group.group_id for group in config.search_groups],
+            ["risk_budget", "entry_depth", "rebound_exit"],
+        )
+        self.assertEqual(config.selection.max_drawdown_floor, -0.40)
+
+    def test_real_engine_evolution_writes_versioned_outputs(self):
+        dates = pd.bdate_range("2024-01-02", periods=150)
+        raw = valid_raw_config()
+        raw["periods"] = {
+            "research_start": dates[0].strftime("%Y-%m-%d"),
+            "train_end": dates[89].strftime("%Y-%m-%d"),
+            "validation_start": dates[90].strftime("%Y-%m-%d"),
+            "validation_end": dates[119].strftime("%Y-%m-%d"),
+            "test_start": dates[120].strftime("%Y-%m-%d"),
+            "test_end": dates[-1].strftime("%Y-%m-%d"),
+        }
+        raw["baseline"].update({
+            "train_days": 65,
+            "retrain_frequency": 10,
+            "top_n": 4,
+            "rebalance_frequency": 5,
+            "max_position_weight": 0.20,
+            "leverage": 0.60,
+            "min_avg_amount_20d": 1.0,
+            "min_pullback_5d": 0.0,
+            "max_pullback_5d": 1.0,
+            "min_prior_return_20": -1.0,
+            "min_prior_return_60": -1.0,
+            "min_return_20d": -1.0,
+            "min_return_60d": -1.0,
+            "min_distance_ma60": -1.0,
+            "max_intraday_return": 1.0,
+        })
+        raw["search_groups"] = [{
+            "id": "risk_budget",
+            "hypothesis_cn": "合成样本风险预算测试",
+            "candidates": [{"id": "risk_065", "overrides": {"leverage": 0.65}}],
+        }]
+        raw["selection"].update({
+            "min_validation_days": 20,
+            "min_test_days": 15,
+            "max_drawdown_floor": -0.90,
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 10.0,
+            "rolling_window_days": 10,
+            "max_negative_window_rate": 1.0,
+        })
+        rows: list[dict[str, object]] = []
+        for symbol_index in range(32):
+            symbol = f"{symbol_index + 1:06d}"
+            for day_index, date in enumerate(dates):
+                base = 8.0 + symbol_index * 0.08
+                close = base * (1.0 + day_index * 0.001) * (
+                    1.0 + 0.03 * np.sin(day_index / 6.0 + symbol_index * 0.2)
+                )
+                open_price = close * (1.0 - 0.002 * np.cos(day_index / 5.0))
+                volume = 1_000_000.0 + symbol_index * 1_000.0
+                rows.append({
+                    "date": date,
+                    "symbol": symbol,
+                    "open": open_price,
+                    "high": max(open_price, close) * 1.01,
+                    "low": min(open_price, close) * 0.99,
+                    "close": close,
+                    "volume": volume,
+                    "amount": volume * close,
+                })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_path = root / "panel.csv"
+            config_path = root / "evolution.yaml"
+            pd.DataFrame(rows).to_csv(data_path, index=False)
+            config_path.write_text(
+                yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
+            )
+            config = load_evolution_config(config_path)
+            outcome = run_evolution(
+                config=config,
+                data_path=data_path,
+                config_path=config_path,
+                benchmark_path=None,
+                asof_date=dates[-1],
+                output_root=root / "runs",
+                run_id="real-engine-smoke",
+                resume=False,
+                git_commit="test-commit",
+            )
+
+            self.assertTrue((outcome.run_dir / "manifest.json").exists())
+            self.assertTrue((outcome.run_dir / "champion_candidate.yaml").exists())
+            self.assertTrue((outcome.run_dir / "test_comparison.csv").exists())
+            self.assertTrue((outcome.run_dir / "final" / "baseline" / "equity_curve.csv").exists())
 
 
 class EvolutionConfigTest(unittest.TestCase):

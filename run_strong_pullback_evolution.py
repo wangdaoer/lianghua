@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
 import platform
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -23,6 +25,7 @@ from strong_pullback_evolution import (
     build_group_candidates,
     calculate_segment_metrics,
     choose_group_winner,
+    load_evolution_config,
 )
 from train_next_open_rank_model import clean_matrix, load_market_exposure
 
@@ -583,3 +586,67 @@ def run_evolution(
         })
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         raise
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Guarded evolution for the strong-pullback satellite strategy."
+    )
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--data", required=True)
+    parser.add_argument("--benchmark", default=None)
+    parser.add_argument("--asof-date", default=None)
+    parser.add_argument("--output-root", default="outputs/evolution_runs")
+    parser.add_argument("--run-id", default=None)
+    parser.add_argument("--resume", default=None, metavar="RUN_ID")
+    return parser.parse_args(argv)
+
+
+def _git_commit(project_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    project_root = Path(__file__).resolve().parent
+    config_path = Path(args.config).resolve()
+    data_path = Path(args.data).resolve()
+    benchmark_path = Path(args.benchmark).resolve() if args.benchmark else None
+    config = load_evolution_config(config_path)
+    validate_input_schema(data_path)
+    newest_date = pd.read_csv(data_path, usecols=["date"], parse_dates=["date"])["date"].max()
+    asof_date = pd.Timestamp(args.asof_date) if args.asof_date else pd.Timestamp(newest_date)
+    if asof_date < config.periods.test_start:
+        raise ValueError("asof-date must reach the configured test period")
+    run_id = args.resume or args.run_id or (
+        f"strong_pullback_{asof_date:%Y%m%d}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    )
+    outcome = run_evolution(
+        config=config,
+        data_path=data_path,
+        config_path=config_path,
+        benchmark_path=benchmark_path,
+        asof_date=asof_date,
+        output_root=Path(args.output_root).resolve(),
+        run_id=run_id,
+        resume=bool(args.resume),
+        git_commit=_git_commit(project_root),
+    )
+    print(
+        "Strong-pullback evolution completed.\n"
+        f"  run_id: {outcome.run_id}\n"
+        f"  champion: {outcome.champion_id}\n"
+        f"  test_status: {outcome.test_status}\n"
+        f"  output: {outcome.run_dir}"
+    )
+
+
+if __name__ == "__main__":
+    main()

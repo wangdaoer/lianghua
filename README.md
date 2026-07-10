@@ -13,6 +13,17 @@
 
 > 说明：本框架为研究用途示例，不构成投资建议；请先在纸面环境复核。
 
+## 月度自进化研究
+
+```powershell
+python run_strong_pullback_evolution.py `
+  --config configs/evolution_strong_pullback.yaml `
+  --data data_panel_history_main_chinext_20220101_YYYYMMDD.csv `
+  --asof-date YYYY-MM-DD
+```
+
+该命令仅供人工或每月研究使用，不接入每日默认流水线，也不会自动修改任何生产配置。
+
 ## 使用说明
 
 1. 准备日线数据文件 `csv`，至少包含：
