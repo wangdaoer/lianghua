@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import platform
 import sys
 from dataclasses import asdict, dataclass
@@ -34,6 +35,17 @@ FILTER_KEYS = (
     "min_prior_return_20", "min_prior_return_60", "min_return_20d",
     "min_return_60d", "min_distance_ma60", "max_intraday_return",
 )
+TRIAL_METRIC_KEYS = (
+    "total_return", "annualized_return", "max_drawdown", "sharpe_like", "avg_turnover",
+    "avg_gross_exposure", "trade_days", "rolling_window_count", "negative_window_rate",
+    "worst_rolling_return",
+)
+TRIAL_ARTIFACTS = {
+    "equity_curve.csv": ("date", "equity", "gross_return", "cost", "turnover", "gross_exposure"),
+    "rolling_feature_weights.csv": ("date",),
+    "trade_audit.csv": ("signal_date",),
+    "selected_candidates.csv": ("signal_date",),
+}
 
 
 @dataclass(frozen=True)
@@ -141,6 +153,54 @@ def can_resume_trial(
         and trial_state.get("evidence_fingerprint") == evidence_fingerprint
         and trial_state.get("params_hash") == params_hash
     )
+
+
+def _bundle_has_holdout_dates(bundle: PriceBundle, validation_end: pd.Timestamp) -> bool:
+    members = {
+        "close": bundle.close,
+        "open_px": bundle.open_px,
+        "high": bundle.high,
+        "low": bundle.low,
+        "amount": bundle.amount,
+        "market_exposure": bundle.market_exposure,
+    }
+    return any(
+        not member.index.empty
+        and pd.Timestamp(member.index.max()) > validation_end
+        for member in members.values()
+    )
+
+
+def _has_complete_cached_metrics(metrics: object) -> bool:
+    if not isinstance(metrics, Mapping):
+        return False
+    for segment in ("train", "validation"):
+        values = metrics.get(segment)
+        if not isinstance(values, Mapping):
+            return False
+        for key in TRIAL_METRIC_KEYS:
+            value = values.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return False
+            if not math.isfinite(float(value)):
+                return False
+    return True
+
+
+def _has_complete_trial_artifacts(trial_dir: Path, run: StrategyRun) -> bool:
+    frames = {
+        "equity_curve.csv": run.equity,
+        "rolling_feature_weights.csv": run.weights,
+        "trade_audit.csv": run.trades,
+        "selected_candidates.csv": run.candidates,
+    }
+    for filename, required_columns in TRIAL_ARTIFACTS.items():
+        frame = frames[filename]
+        if not (trial_dir / filename).exists():
+            return False
+        if not frame.empty and not set(required_columns).issubset(frame.columns):
+            return False
+    return not run.equity.empty
 
 
 def validate_input_schema(path: Path) -> None:
@@ -328,7 +388,7 @@ def run_evolution(
         research_bundle = bundle_loader(
             data_path, config.periods.validation_end, benchmark_path, config.baseline
         )
-        if research_bundle.close.index.max() > config.periods.validation_end:
+        if _bundle_has_holdout_dates(research_bundle, config.periods.validation_end):
             raise AssertionError("Research bundle contains holdout dates")
 
         trial_rows: list[dict[str, object]] = []
@@ -348,12 +408,10 @@ def run_evolution(
                 ):
                     return None
                 metrics = json.loads((trial_dir / "metrics.json").read_text(encoding="utf-8"))
-                if not isinstance(metrics, Mapping) or not all(
-                    isinstance(metrics.get(segment), Mapping) for segment in ("train", "validation")
-                ):
+                if not _has_complete_cached_metrics(metrics):
                     return None
                 run = load_trial_artifacts(trial_dir)
-                if run.equity.empty:
+                if not _has_complete_trial_artifacts(trial_dir, run):
                     return None
                 trial_metrics[trial_id] = {
                     "train": dict(metrics["train"]),

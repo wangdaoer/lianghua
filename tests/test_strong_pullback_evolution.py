@@ -349,6 +349,43 @@ class EvolutionOrchestrationTest(unittest.TestCase):
         self.assertEqual(requested_ends[-1], pd.Timestamp("2026-07-09"))
         self.assertIn(outcome.test_status, {"ready_for_manual_review", "rollback_recommended"})
 
+    def test_research_bundle_rejects_holdout_dates_in_any_member(self):
+        config = parse_evolution_config(valid_raw_config())
+
+        for late_member in ("open_px", "market_exposure"):
+            with self.subTest(late_member=late_member), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data = root / "panel.csv"
+                config_path = root / "config.yaml"
+                data.write_text("evidence", encoding="utf-8")
+                config_path.write_text("evidence", encoding="utf-8")
+
+                def loader(data_path, end_date, benchmark_path, params):
+                    bundle = self._flat_bundle(pd.Timestamp(end_date))
+                    late_date = pd.Timestamp(end_date) + pd.offsets.BDay(1)
+                    if late_member == "open_px":
+                        open_px = pd.concat([
+                            bundle.open_px,
+                            pd.DataFrame({"000001": [10.0]}, index=[late_date]),
+                        ])
+                        return PriceBundle(
+                            bundle.close, open_px, bundle.high, bundle.low, bundle.amount,
+                            bundle.market_exposure,
+                        )
+                    exposure = pd.concat([
+                        bundle.market_exposure,
+                        pd.Series([1.0], index=[late_date]),
+                    ])
+                    return PriceBundle(
+                        bundle.close, bundle.open_px, bundle.high, bundle.low, bundle.amount, exposure
+                    )
+
+                with self.assertRaisesRegex(AssertionError, "Research bundle contains holdout dates"):
+                    run_evolution(
+                        config, data, config_path, None, pd.Timestamp("2026-07-09"), root / "runs",
+                        f"late-{late_member}", False, loader, self._run_for_params, "test-commit",
+                    )
+
     def test_resume_requires_exact_trial_evidence_and_params(self):
         state = {
             "status": "completed",
@@ -361,6 +398,98 @@ class EvolutionOrchestrationTest(unittest.TestCase):
         self.assertFalse(can_resume_trial(state, "changed", "def", "risk_075"))
         self.assertFalse(can_resume_trial(state, "abc", "changed", "risk_075"))
         self.assertFalse(can_resume_trial(state, "abc", "def", "other_trial"))
+
+    def test_resume_rejects_run_level_evidence_mismatch_before_executing_trials(self):
+        config = parse_evolution_config(valid_raw_config())
+        calls: list[float] = []
+
+        def executor(bundle, params):
+            calls.append(float(params["leverage"]))
+            return self._run_for_params(bundle, params)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            kwargs = dict(
+                config=config,
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=None,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                run_id="evidence-mismatch",
+                bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                trial_executor=executor,
+                git_commit="test-commit",
+            )
+            run_evolution(resume=False, **kwargs)
+            calls.clear()
+            data.write_text("changed evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Resume evidence does not match"):
+                run_evolution(resume=True, **kwargs)
+
+        self.assertEqual(calls, [])
+
+    def test_resume_recomputes_trial_when_cached_metrics_or_csv_are_invalid(self):
+        config = parse_evolution_config(valid_raw_config())
+        mutations = ("missing_metric", "non_finite_metric", "missing_csv", "corrupt_csv")
+
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data = root / "panel.csv"
+                config_path = root / "config.yaml"
+                data.write_text("evidence", encoding="utf-8")
+                config_path.write_text("evidence", encoding="utf-8")
+                calls: list[tuple[pd.Timestamp, float]] = []
+
+                def executor(bundle, params):
+                    calls.append((bundle.close.index.max(), float(params["leverage"])))
+                    return self._run_for_params(bundle, params)
+
+                kwargs = dict(
+                    config=config,
+                    data_path=data,
+                    config_path=config_path,
+                    benchmark_path=None,
+                    asof_date=pd.Timestamp("2026-07-09"),
+                    output_root=root / "runs",
+                    run_id=f"invalid-cache-{mutation}",
+                    bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    trial_executor=executor,
+                    git_commit="test-commit",
+                )
+                outcome = run_evolution(resume=False, **kwargs)
+                trial_dir = outcome.run_dir / "trials" / "baseline"
+                if mutation == "missing_metric":
+                    metrics = json.loads((trial_dir / "metrics.json").read_text(encoding="utf-8"))
+                    del metrics["validation"]["worst_rolling_return"]
+                    (trial_dir / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+                elif mutation == "non_finite_metric":
+                    metrics = json.loads((trial_dir / "metrics.json").read_text(encoding="utf-8"))
+                    metrics["train"]["annualized_return"] = "not-a-number"
+                    (trial_dir / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+                elif mutation == "missing_csv":
+                    (trial_dir / "trade_audit.csv").unlink()
+                else:
+                    (trial_dir / "equity_curve.csv").write_text("not,date\nvalid,rows\n", encoding="utf-8")
+
+                calls.clear()
+                run_evolution(resume=True, **kwargs)
+
+                research_baseline_calls = [
+                    call for call in calls
+                    if call[0] <= config.periods.validation_end and call[1] == config.baseline["leverage"]
+                ]
+                self.assertEqual(len(research_baseline_calls), 1)
 
     def test_successful_run_writes_manifest_versioned_artifacts_and_chinese_report(self):
         config = parse_evolution_config(valid_raw_config())
