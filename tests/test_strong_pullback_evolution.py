@@ -165,16 +165,19 @@ class EvolutionDecisionTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["total_return"], 1.09 * 0.95 * 1.02 - 1.0)
         self.assertEqual(metrics["trade_days"], 3)
         self.assertAlmostEqual(metrics["avg_turnover"], 0.1)
+        self.assertEqual(metrics["rolling_window_count"], 1)
 
     def test_promotion_accepts_exact_drawdown_and_sharpe_boundaries(self):
         rules = parse_evolution_config(valid_raw_config()).selection
         incumbent = {
             "annualized_return": 0.10, "max_drawdown": -0.30, "sharpe_like": 0.50,
             "avg_turnover": 0.10, "trade_days": 200, "negative_window_rate": 0.20,
+            "rolling_window_count": 1,
         }
         candidate = {
             "annualized_return": 0.11, "max_drawdown": -0.40, "sharpe_like": 0.40,
             "avg_turnover": 0.15, "trade_days": 200, "negative_window_rate": 0.60,
+            "rolling_window_count": 1,
         }
 
         decision = evaluate_promotion(candidate, incumbent, rules)
@@ -187,6 +190,7 @@ class EvolutionDecisionTest(unittest.TestCase):
         incumbent = {
             "annualized_return": 0.10, "max_drawdown": -0.20, "sharpe_like": 0.50,
             "avg_turnover": 0.10, "trade_days": 200, "negative_window_rate": 0.20,
+            "rolling_window_count": 1,
         }
         candidate = {**incumbent, "annualized_return": 0.105}
 
@@ -197,6 +201,24 @@ class EvolutionDecisionTest(unittest.TestCase):
         self.assertEqual(winner, "incumbent")
         self.assertFalse(decisions[0].promotion.eligible)
 
+    def test_promotion_rejects_candidate_without_completed_rolling_windows(self):
+        rules = parse_evolution_config(valid_raw_config()).selection
+        incumbent = {
+            "annualized_return": 0.10, "max_drawdown": -0.20, "sharpe_like": 0.50,
+            "avg_turnover": 0.10, "trade_days": 200, "negative_window_rate": 0.20,
+            "rolling_window_count": 1,
+        }
+        candidate = {
+            "annualized_return": 0.11, "max_drawdown": -0.20, "sharpe_like": 0.50,
+            "avg_turnover": 0.10, "trade_days": 200, "negative_window_rate": 0.0,
+            "rolling_window_count": 0,
+        }
+
+        decision = evaluate_promotion(candidate, incumbent, rules)
+
+        self.assertFalse(decision.eligible)
+        self.assertIn("滚动窗口", "；".join(decision.reasons))
+
     def test_holdout_recommends_rollback_when_champion_loses(self):
         rules = parse_evolution_config(valid_raw_config()).selection
         baseline = {"total_return": 0.20, "max_drawdown": -0.20, "sharpe_like": 0.50, "trade_days": 100}
@@ -206,3 +228,27 @@ class EvolutionDecisionTest(unittest.TestCase):
 
         self.assertEqual(status, "rollback_recommended")
         self.assertIn("收益", reason)
+
+    def test_holdout_warns_when_required_metrics_are_missing_or_non_finite(self):
+        rules = parse_evolution_config(valid_raw_config()).selection
+        baseline = {"total_return": 0.20, "max_drawdown": -0.20, "sharpe_like": 0.50, "trade_days": 100}
+        champion = {"total_return": 0.20, "max_drawdown": -0.20, "sharpe_like": 0.50, "trade_days": 100}
+
+        for missing_key in ("total_return", "max_drawdown", "sharpe_like", "trade_days"):
+            with self.subTest(case=f"missing {missing_key}"):
+                metrics = dict(champion)
+                del metrics[missing_key]
+                status, _ = assess_test_result(baseline, metrics, rules)
+                self.assertEqual(status, "test_warning")
+
+        for non_finite_key in ("total_return", "max_drawdown", "sharpe_like"):
+            with self.subTest(case=f"non-finite {non_finite_key}"):
+                metrics = dict(champion)
+                metrics[non_finite_key] = float("nan")
+                status, _ = assess_test_result(baseline, metrics, rules)
+                self.assertEqual(status, "test_warning")
+
+        metrics = dict(champion)
+        metrics["trade_days"] = float("nan")
+        status, _ = assess_test_result(baseline, metrics, rules)
+        self.assertEqual(status, "test_warning")

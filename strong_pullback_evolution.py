@@ -290,6 +290,7 @@ def calculate_segment_metrics(
         "avg_turnover": float(pd.to_numeric(frame["turnover"], errors="coerce").mean()),
         "avg_gross_exposure": float(pd.to_numeric(frame["gross_exposure"], errors="coerce").mean()),
         "trade_days": int(len(frame)),
+        "rolling_window_count": int(len(completed)),
         "negative_window_rate": negative_rate,
         "worst_rolling_return": worst_rolling,
     }
@@ -331,6 +332,13 @@ def evaluate_promotion(
     )
     if int(candidate_metrics["trade_days"]) < rules.min_validation_days:
         reasons.append("验证期有效交易日不足")
+    rolling_window_count = candidate_metrics.get("rolling_window_count", 0)
+    try:
+        has_rolling_windows = math.isfinite(float(rolling_window_count)) and float(rolling_window_count) > 0
+    except (TypeError, ValueError):
+        has_rolling_windows = False
+    if not has_rolling_windows:
+        reasons.append("完成的滚动窗口不足")
     if float(candidate_metrics["max_drawdown"]) < rules.max_drawdown_floor:
         reasons.append("最大回撤超过限制")
     if float(candidate_metrics["annualized_return"]) - float(incumbent_metrics["annualized_return"]) < rules.min_annualized_return_delta - 1e-12:
@@ -378,6 +386,13 @@ def assess_test_result(
     champion_metrics: Mapping[str, float],
     rules: SelectionRules,
 ) -> tuple[str, str]:
+    required = ("total_return", "max_drawdown", "sharpe_like", "trade_days")
+    try:
+        values = [float(metrics[key]) for metrics in (baseline_metrics, champion_metrics) for key in required]
+    except (KeyError, TypeError, ValueError):
+        return "test_warning", "测试期关键指标缺失或无效，暂不判断晋级"
+    if not all(math.isfinite(value) for value in values):
+        return "test_warning", "测试期关键指标缺失或无效，暂不判断晋级"
     if min(int(baseline_metrics["trade_days"]), int(champion_metrics["trade_days"])) < rules.min_test_days:
         return "test_warning", "测试期有效交易日不足，暂不判断晋级"
     failures: list[str] = []
