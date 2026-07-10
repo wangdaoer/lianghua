@@ -1,9 +1,12 @@
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 
 import pandas as pd
 
 from strong_pullback_evolution import (
+    DEFAULT_STRATEGY_PARAMS,
     assess_test_result,
     SearchCandidate,
     SearchGroup,
@@ -12,6 +15,13 @@ from strong_pullback_evolution import (
     choose_group_winner,
     evaluate_promotion,
     parse_evolution_config,
+)
+from run_strong_pullback_evolution import (
+    StrategyRun,
+    load_price_bundle,
+    load_trial_artifacts,
+    validate_input_schema,
+    write_trial_artifacts,
 )
 
 
@@ -144,6 +154,50 @@ class EvolutionConfigTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Missing selection keys"):
             parse_evolution_config(raw)
+
+
+class EvolutionAdapterTest(unittest.TestCase):
+    def test_schema_requires_real_ohlcv_and_amount_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "panel.csv"
+            pd.DataFrame({"date": ["2025-01-01"], "symbol": ["000001"], "close": [10.0]}).to_csv(path, index=False)
+
+            with self.assertRaisesRegex(ValueError, "Missing evolution input columns"):
+                validate_input_schema(path)
+
+    def test_price_bundle_is_physically_truncated_at_requested_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "panel.csv"
+            rows = []
+            for date in pd.date_range("2025-01-01", periods=4, freq="B"):
+                rows.append({
+                    "date": date, "symbol": "000001", "open": 10.0, "high": 11.0,
+                    "low": 9.0, "close": 10.0, "volume": 1000.0, "amount": 10_000.0,
+                })
+            pd.DataFrame(rows).to_csv(path, index=False)
+
+            bundle = load_price_bundle(
+                path, pd.Timestamp("2025-01-03"), None,
+                {**DEFAULT_STRATEGY_PARAMS, "max_abs_daily_return": 0.22},
+            )
+
+            self.assertEqual(bundle.close.index.max(), pd.Timestamp("2025-01-03"))
+
+    def test_trial_artifacts_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trial_dir = Path(tmp) / "trial"
+            run = StrategyRun(
+                equity=pd.DataFrame({"date": ["2025-01-02"], "equity": [1_010_000.0], "gross_return": [0.01], "cost": [0.0], "turnover": [0.1], "gross_exposure": [0.6]}),
+                weights=pd.DataFrame({"date": ["2025-01-01"], "momentum_20": [1.0]}),
+                trades=pd.DataFrame({"signal_date": ["2025-01-01"], "gross_return": [0.01]}),
+                candidates=pd.DataFrame({"signal_date": ["2025-01-01"], "symbol": ["000001"]}),
+            )
+
+            write_trial_artifacts(trial_dir, run, {"validation": {"total_return": 0.01}}, {"status": "completed"})
+            loaded = load_trial_artifacts(trial_dir)
+
+            self.assertEqual(float(loaded.equity.loc[0, "equity"]), 1_010_000.0)
+            self.assertEqual(str(loaded.candidates.loc[0, "symbol"]), "000001")
 
 
 class EvolutionDecisionTest(unittest.TestCase):
