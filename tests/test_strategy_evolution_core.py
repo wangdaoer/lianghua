@@ -197,6 +197,26 @@ def test_non_numeric_metric_returns_insufficient_evidence_without_arithmetic_err
     assert "finite_metrics" in decision.failed_gates
 
 
+def test_parseable_numeric_string_metric_returns_insufficient_evidence():
+    challenger = (
+        FoldMetrics(
+            fold_id="f1",
+            total_return=0.08,
+            max_drawdown=-0.12,
+            sharpe=1.1,
+            filled_trades=20,
+            average_turnover="0.20",
+            pnl_concentration=0.30,
+        ),
+        _fold("f2", 0.08),
+        _fold("f3", 0.08),
+    )
+    champion = tuple(_fold(f"f{i}", 0.04) for i in range(1, 4))
+    decision = evaluate_candidate(challenger, champion, PromotionPolicy())
+    assert decision.status == "insufficient_evidence"
+    assert "finite_metrics" in decision.failed_gates
+
+
 def test_evolution_state_mappings_are_immutable_and_serializable():
     initial = EvolutionState.initial(
         "v1",

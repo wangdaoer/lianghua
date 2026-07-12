@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
+from numbers import Real
 
 
 class _FrozenDict(dict[str, object]):
@@ -200,20 +201,20 @@ def _fold_map(folds: Sequence[FoldMetrics]) -> tuple[dict[str, FoldMetrics] | No
 
 
 def _finite_metrics(fold: FoldMetrics) -> bool:
-    try:
-        return all(
-            math.isfinite(float(value))
-            for value in (
-                fold.total_return,
-                fold.max_drawdown,
-                fold.sharpe,
-                fold.filled_trades,
-                fold.average_turnover,
-                fold.pnl_concentration,
-            )
-        )
-    except (TypeError, ValueError):
-        return False
+    values = (
+        fold.total_return,
+        fold.max_drawdown,
+        fold.sharpe,
+        fold.filled_trades,
+        fold.average_turnover,
+        fold.pnl_concentration,
+    )
+    return all(
+        isinstance(value, Real)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        for value in values
+    )
 
 
 def _gate(passed: bool, value: object, threshold: object) -> dict[str, object]:
