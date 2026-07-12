@@ -346,6 +346,7 @@ def run_satellite_walk_forward(
         cost = turnover * (commission_bps + impact_bps) / 1e4
         realized = label.iloc[i].reindex(close.columns).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         gross_return = float((target * realized).sum())
+        symbol_contributions = (target * realized).replace(0.0, np.nan).dropna()
         equity *= 1.0 + gross_return - cost
 
         new_entries = target.gt(0.0) & positions.le(0.0)
@@ -381,6 +382,11 @@ def run_satellite_walk_forward(
                 "realize_date": close.index[i + 2].strftime("%Y-%m-%d"),
                 "turnover": turnover,
                 "gross_return": gross_return,
+                "symbol_contributions_json": json.dumps(
+                    {str(symbol).zfill(6): float(value) for symbol, value in symbol_contributions.items()},
+                    sort_keys=True,
+                    ensure_ascii=True,
+                ),
                 "cost": cost,
                 "positions_count": int(positions.ne(0).sum()),
                 "candidate_count": int(len(candidates)) if not candidates.empty else 0,

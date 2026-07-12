@@ -7,19 +7,24 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import pytest
 import yaml
 
 from strong_pullback_evolution import (
     DEFAULT_STRATEGY_PARAMS,
+    TradingFold,
     assess_test_result,
     SearchCandidate,
     SearchGroup,
+    build_trading_folds,
     build_group_candidates,
+    calculate_fold_metrics,
     calculate_segment_metrics,
     choose_group_winner,
     evaluate_promotion,
     load_evolution_config,
     parse_evolution_config,
+    run_strong_pullback_folds,
 )
 from run_strong_pullback_evolution import (
     PriceBundle,
@@ -856,6 +861,73 @@ class EvolutionOrchestrationTest(unittest.TestCase):
 
 
 class EvolutionDecisionTest(unittest.TestCase):
+    def test_build_trading_folds_uses_actual_index_positions(self):
+        dates = pd.DatetimeIndex(
+            ["2026-01-02", "2026-01-05", "2026-01-08", "2026-01-09", "2026-01-12", "2026-01-16"]
+        )
+
+        folds = build_trading_folds(
+            dates, train_days=2, validation_days=2, test_days=1, step_days=1
+        )
+
+        self.assertEqual(
+            folds[0].train_dates,
+            (pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-05")),
+        )
+        self.assertEqual(
+            folds[0].validation_dates,
+            (pd.Timestamp("2026-01-08"), pd.Timestamp("2026-01-09")),
+        )
+        self.assertEqual(folds[0].test_dates, (pd.Timestamp("2026-01-12"),))
+
+    def test_build_trading_folds_rejects_duplicate_dates(self):
+        dates = pd.DatetimeIndex(["2026-01-02", "2026-01-02", "2026-01-05"])
+
+        with pytest.raises(ValueError, match="unique"):
+            build_trading_folds(dates, train_days=1, validation_days=1, test_days=1, step_days=1)
+
+    def test_calculate_fold_metrics_uses_realized_symbol_pnl_concentration(self):
+        equity = pd.DataFrame(
+            {
+                "date": pd.date_range("2026-01-01", periods=3),
+                "gross_return": [0.0, 0.02, 0.01],
+                "cost": [0.0, 0.0, 0.0],
+                "turnover": [0.0, 0.2, 0.1],
+                "gross_exposure": [0.0, 0.6, 0.6],
+            }
+        )
+        trades = pd.DataFrame(
+            {
+                "symbol_contributions_json": [
+                    '{"000001": 0.012, "000002": 0.008}',
+                    '{"000001": 0.006, "000002": 0.004}',
+                ]
+            }
+        )
+
+        metrics = calculate_fold_metrics(equity, trades, fold_id="f1")
+
+        self.assertAlmostEqual(metrics.pnl_concentration, 0.60)
+
+    def test_fold_runner_never_receives_rows_after_test_end(self):
+        dates = pd.date_range("2026-01-01", periods=6)
+        panel = pd.DataFrame({"date": dates, "symbol": "000001"})
+        folds = (
+            TradingFold("f1", tuple(dates[:2]), tuple(dates[2:4]), (dates[4],)),
+            TradingFold("f2", tuple(dates[:3]), tuple(dates[3:5]), (dates[5],)),
+        )
+        seen: list[pd.Timestamp] = []
+
+        results = run_strong_pullback_folds(
+            panel,
+            folds,
+            lambda sliced, params: seen.append(sliced["date"].max()) or {"params": params},
+            {"leverage": 0.6},
+        )
+
+        self.assertEqual(seen, [fold.test_end for fold in folds])
+        self.assertEqual([fold.fold_id for fold, _ in results], ["f1", "f2"])
+
     def test_segment_metrics_compound_net_returns_inside_requested_period(self):
         equity = pd.DataFrame(
             {

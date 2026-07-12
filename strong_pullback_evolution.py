@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import json
 import math
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 import pandas as pd
 import yaml
 
 from run_backtest import max_drawdown, sharpe_like
+from strategy_evolution_core import FoldMetrics
 
 
 DEFAULT_STRATEGY_PARAMS: dict[str, object] = {
@@ -128,6 +130,18 @@ class CandidateDecision:
     candidate_id: str
     promotion: PromotionDecision
     metrics: dict[str, float]
+
+
+@dataclass(frozen=True)
+class TradingFold:
+    fold_id: str
+    train_dates: tuple[pd.Timestamp, ...]
+    validation_dates: tuple[pd.Timestamp, ...]
+    test_dates: tuple[pd.Timestamp, ...]
+
+    @property
+    def test_end(self) -> pd.Timestamp:
+        return self.test_dates[-1]
 
 
 def _timestamp(value: object, name: str, allow_none: bool = False) -> pd.Timestamp | None:
@@ -299,6 +313,140 @@ def build_group_candidates(
     return tuple(
         (candidate.candidate_id, {**deepcopy(dict(incumbent)), **deepcopy(candidate.overrides)})
         for candidate in group.candidates
+    )
+
+
+def _positive_window_size(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def build_trading_folds(
+    trading_dates: object,
+    train_days: int,
+    validation_days: int,
+    test_days: int,
+    step_days: int,
+) -> tuple[TradingFold, ...]:
+    train_days = _positive_window_size(train_days, "train_days")
+    validation_days = _positive_window_size(validation_days, "validation_days")
+    test_days = _positive_window_size(test_days, "test_days")
+    step_days = _positive_window_size(step_days, "step_days")
+    try:
+        dates = pd.DatetimeIndex(pd.to_datetime(trading_dates)).normalize()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("trading_dates must be valid datetimes") from exc
+    if dates.hasnans:
+        raise ValueError("trading_dates must not contain NaT")
+    if not dates.is_unique:
+        raise ValueError("trading_dates must be unique")
+    dates = dates.sort_values()
+
+    folds: list[TradingFold] = []
+    offset = 0
+    while True:
+        train_end = train_days + offset
+        validation_end = train_end + validation_days
+        test_end = validation_end + test_days
+        if test_end > len(dates):
+            break
+        folds.append(
+            TradingFold(
+                fold_id=f"fold_{len(folds):03d}",
+                train_dates=tuple(dates[:train_end]),
+                validation_dates=tuple(dates[train_end:validation_end]),
+                test_dates=tuple(dates[validation_end:test_end]),
+            )
+        )
+        offset += step_days
+    return tuple(folds)
+
+
+def _slice_fold_rows(frame: pd.DataFrame, fold: TradingFold | None, date_column: str) -> pd.DataFrame:
+    if fold is None or date_column not in frame:
+        return frame.copy()
+    dates = pd.to_datetime(frame[date_column], errors="coerce")
+    return frame.loc[dates.isin(fold.test_dates)].copy()
+
+
+def _positive_symbol_contributions(trades: pd.DataFrame) -> dict[str, float]:
+    if "symbol_contributions_json" not in trades:
+        return {}
+    totals: dict[str, float] = {}
+    for value in trades["symbol_contributions_json"]:
+        try:
+            contributions = json.loads(value) if isinstance(value, str) else value
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(contributions, Mapping):
+            continue
+        for symbol, contribution in contributions.items():
+            try:
+                numeric = float(contribution)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric) and numeric > 0.0:
+                key = str(symbol).zfill(6)
+                totals[key] = totals.get(key, 0.0) + numeric
+    return totals
+
+
+def calculate_fold_metrics(
+    equity: pd.DataFrame,
+    trades: pd.DataFrame,
+    fold: TradingFold | None = None,
+    *,
+    fold_id: str | None = None,
+) -> FoldMetrics:
+    equity_slice = _slice_fold_rows(equity, fold, "date")
+    if equity_slice.empty:
+        raise ValueError("Fold contains no equity rows")
+    metrics = calculate_segment_metrics(
+        equity_slice,
+        equity_slice["date"].min(),
+        equity_slice["date"].max(),
+        rolling_window_days=max(1, len(equity_slice)),
+    )
+    trades_slice = _slice_fold_rows(trades, fold, "realize_date")
+    positive_contributions = _positive_symbol_contributions(trades_slice)
+    total_positive = sum(positive_contributions.values())
+    concentration = (
+        max(positive_contributions.values()) / total_positive
+        if total_positive > 0.0
+        else math.inf
+    )
+    resolved_fold_id = fold.fold_id if fold is not None else fold_id
+    if not isinstance(resolved_fold_id, str) or not resolved_fold_id:
+        raise ValueError("fold_id must be a non-empty string")
+    return FoldMetrics(
+        fold_id=resolved_fold_id,
+        total_return=metrics["total_return"],
+        max_drawdown=metrics["max_drawdown"],
+        sharpe=metrics["sharpe_like"],
+        filled_trades=len(trades_slice),
+        average_turnover=metrics["avg_turnover"],
+        pnl_concentration=concentration,
+    )
+
+
+def run_strong_pullback_folds(
+    panel: pd.DataFrame,
+    folds: tuple[TradingFold, ...],
+    executor: Callable[[pd.DataFrame, Mapping[str, object]], object],
+    params: Mapping[str, object],
+) -> tuple[tuple[TradingFold, object], ...]:
+    if "date" not in panel:
+        raise ValueError("panel must contain a date column")
+    dates = pd.to_datetime(panel["date"], errors="coerce")
+    if dates.isna().any():
+        raise ValueError("panel contains invalid dates")
+    return tuple(
+        (
+            fold,
+            executor(panel.loc[dates.le(fold.test_end)].copy(), params),
+        )
+        for fold in folds
     )
 
 
