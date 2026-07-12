@@ -10,6 +10,8 @@ import pandas as pd
 import pytest
 import yaml
 
+from strategy_evolution_core import EvolutionState
+
 from strong_pullback_evolution import (
     DEFAULT_STRATEGY_PARAMS,
     TradingFold,
@@ -34,6 +36,7 @@ from run_strong_pullback_evolution import (
     load_price_bundle,
     load_trial_artifacts,
     parse_args,
+    persist_evolution_outcome,
     run_evolution,
     validate_input_schema,
     write_trial_artifacts,
@@ -43,6 +46,22 @@ from run_strong_pullback_evolution import (
 def valid_raw_config() -> dict[str, object]:
     return {
         "strategy": "strong_pullback_satellite",
+        "evolution_core": {
+            "train_days": 504,
+            "validation_days": 126,
+            "test_days": 126,
+            "step_days": 63,
+            "max_candidates_per_group": 8,
+            "random_seed": 20260712,
+            "min_folds": 3,
+            "min_filled_trades_per_fold": 5,
+            "min_positive_fold_ratio": 0.6666666667,
+            "min_mean_return_improvement": 0.01,
+            "max_drawdown_floor": -0.40,
+            "max_drawdown_worsening": 0.05,
+            "max_turnover_ratio": 1.50,
+            "max_pnl_concentration": 0.50,
+        },
         "periods": {
             "research_start": "2022-01-01",
             "train_end": "2024-12-31",
@@ -88,6 +107,26 @@ class EvolutionCliTest(unittest.TestCase):
             ["risk_budget", "entry_depth", "rebound_exit"],
         )
         self.assertEqual(config.selection.max_drawdown_floor, -0.40)
+        self.assertEqual(config.evolution_core.train_days, 504)
+        self.assertEqual(config.evolution_core.random_seed, 20260712)
+        self.assertEqual(config.evolution_core.min_positive_fold_ratio, 0.6666666667)
+
+    def test_cli_defaults_to_dry_run_and_requires_explicit_shadow_promotion(self):
+        args = parse_args([
+            "--config", "configs/evolution_strong_pullback.yaml",
+            "--data", "panel.csv",
+        ])
+
+        self.assertTrue(args.dry_run)
+        self.assertFalse(args.promote_shadow)
+        explicit = parse_args([
+            "--config", "configs/evolution_strong_pullback.yaml",
+            "--data", "panel.csv",
+            "--no-dry-run",
+            "--promote-shadow",
+        ])
+        self.assertFalse(explicit.dry_run)
+        self.assertTrue(explicit.promote_shadow)
 
     def test_real_engine_evolution_writes_versioned_outputs(self):
         dates = pd.bdate_range("2024-01-02", periods=150)
@@ -181,6 +220,49 @@ class EvolutionCliTest(unittest.TestCase):
 
 
 class EvolutionConfigTest(unittest.TestCase):
+    def test_rejects_missing_and_unknown_evolution_core_keys(self):
+        raw = valid_raw_config()
+        del raw["evolution_core"]["train_days"]
+        with self.assertRaisesRegex(ValueError, "Missing evolution_core keys"):
+            parse_evolution_config(raw)
+
+        raw = valid_raw_config()
+        raw["evolution_core"]["future_rule"] = 1
+        with self.assertRaisesRegex(ValueError, "Unknown evolution_core keys"):
+            parse_evolution_config(raw)
+
+    def test_rejects_invalid_evolution_core_values_and_boolean_integers(self):
+        invalid_values = {
+            "train_days": (0, True),
+            "validation_days": (0, True),
+            "test_days": (0, True),
+            "step_days": (0, True),
+            "max_candidates_per_group": (0, True),
+            "random_seed": (True,),
+            "min_folds": (0, True),
+            "min_filled_trades_per_fold": (-1, True),
+            "min_positive_fold_ratio": (-0.01, 1.01, True),
+            "min_mean_return_improvement": (-0.01, 1.01, True),
+            "max_drawdown_floor": (-1.01, 0.01, True),
+            "max_drawdown_worsening": (-0.01, 1.01, True),
+            "max_turnover_ratio": (0.0, True),
+            "max_pnl_concentration": (-0.01, 1.01, True),
+        }
+        for key, values in invalid_values.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    raw = valid_raw_config()
+                    raw["evolution_core"][key] = value
+                    with self.assertRaisesRegex(ValueError, key):
+                        parse_evolution_config(raw)
+
+    def test_rejects_missing_evolution_core_block(self):
+        raw = valid_raw_config()
+        del raw["evolution_core"]
+
+        with self.assertRaisesRegex(ValueError, "evolution_core must be a mapping"):
+            parse_evolution_config(raw)
+
     def test_rejects_overlapping_validation_and_test_periods(self):
         raw = valid_raw_config()
         raw["periods"]["test_start"] = "2025-12-31"
@@ -211,6 +293,26 @@ class EvolutionConfigTest(unittest.TestCase):
         self.assertEqual(generated[1][1]["leverage"], 0.90)
         self.assertEqual(config.baseline["leverage"], 0.60)
         self.assertIsNot(generated[0][1], generated[1][1])
+
+    def test_group_candidates_use_generic_generator_with_explicit_seed_and_limit(self):
+        config = parse_evolution_config(valid_raw_config())
+        group = config.search_groups[0]
+
+        with patch(
+            "strong_pullback_evolution.generate_parameter_candidates",
+            return_value=({**config.baseline, "leverage": 0.90},),
+        ) as generator:
+            generated = build_group_candidates(
+                config.baseline, group, max_candidates=1, seed=12345
+            )
+
+        generator.assert_called_once_with(
+            config.baseline,
+            [candidate.overrides for candidate in group.candidates],
+            max_candidates=1,
+            seed=12345,
+        )
+        self.assertEqual(generated[0][0], "risk_090")
 
     def test_rejects_null_empty_and_non_string_group_ids(self):
         for invalid_id in (None, "", 123):
@@ -320,6 +422,72 @@ class EvolutionConfigTest(unittest.TestCase):
 
 
 class EvolutionAdapterTest(unittest.TestCase):
+    def test_dry_run_writes_snapshot_without_changing_global_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "global" / "strong_pullback.json"
+            run_dir = root / "run"
+            snapshot = EvolutionState.initial(
+                "v1", {"leverage": 0.6}, now="2026-07-12T00:00:00+00:00"
+            )
+
+            changed = persist_evolution_outcome(
+                run_dir=run_dir,
+                snapshot=snapshot,
+                candidate_scores=[{"candidate_id": "c1", "status": "rejected"}],
+                experiments=[{"experiment_id": "e1", "status": "rejected"}],
+                decision_markdown="# 影子决定\n\n纸面研究，未更新全局状态。\n",
+                dry_run=True,
+                promote_shadow=False,
+                state_path=state_path,
+                expected_previous_fingerprint=None,
+            )
+
+            self.assertTrue((run_dir / "evolution_state_snapshot.json").exists())
+            self.assertTrue((run_dir / "candidate_scores.csv").exists())
+            self.assertTrue((run_dir / "experiments" / "e1.json").exists())
+            self.assertTrue((run_dir / "shadow_decision.md").exists())
+            self.assertFalse(state_path.exists())
+            self.assertFalse(changed)
+
+    def test_shadow_state_changes_only_with_both_explicit_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = EvolutionState.initial(
+                "v1", {"leverage": 0.6}, now="2026-07-12T00:00:00+00:00"
+            )
+            state_path = root / "state" / "strong_pullback.json"
+
+            for index, flags in enumerate(((True, True), (False, False))):
+                changed = persist_evolution_outcome(
+                    root / f"run-{index}", snapshot, [], [], "# decision\n",
+                    dry_run=flags[0], promote_shadow=flags[1], state_path=state_path,
+                    expected_previous_fingerprint=None,
+                )
+                self.assertFalse(changed)
+                self.assertFalse(state_path.exists())
+
+            changed = persist_evolution_outcome(
+                root / "run-promote", snapshot, [], [], "# decision\n",
+                dry_run=False, promote_shadow=True, state_path=state_path,
+                expected_previous_fingerprint=None,
+            )
+            self.assertTrue(changed)
+            self.assertTrue(state_path.exists())
+
+    def test_runtime_state_path_cannot_target_configs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = EvolutionState.initial("v1", {"leverage": 0.6})
+
+            with self.assertRaisesRegex(ValueError, "configs"):
+                persist_evolution_outcome(
+                    root / "run", snapshot, [], [], "# decision\n",
+                    dry_run=False, promote_shadow=True,
+                    state_path=root / "configs" / "evolution_strong_pullback.yaml",
+                    expected_previous_fingerprint=None,
+                )
+
     def test_schema_requires_real_ohlcv_and_amount_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "panel.csv"
@@ -711,6 +879,25 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             self.assertTrue((run_dir / "trials.csv").exists())
             self.assertTrue((run_dir / "rounds.csv").exists())
             self.assertTrue((run_dir / "test_comparison.csv").exists())
+            folds = json.loads((run_dir / "folds.json").read_text(encoding="utf-8"))
+            self.assertGreaterEqual(len(folds), config.evolution_core.min_folds)
+            scores = pd.read_csv(run_dir / "candidate_scores.csv")
+            self.assertEqual(set(scores["candidate_id"]), {"risk_075", "risk_090"})
+            self.assertIn("failed_gates", scores.columns)
+            self.assertEqual(len(list((run_dir / "experiments").glob("*.json"))), 2)
+            for experiment_path in (run_dir / "experiments").glob("*.json"):
+                json.loads(
+                    experiment_path.read_text(encoding="utf-8"),
+                    parse_constant=lambda value: (_ for _ in ()).throw(
+                        ValueError(f"non-standard JSON constant: {value}")
+                    ),
+                )
+            snapshot = json.loads(
+                (run_dir / "evolution_state_snapshot.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(snapshot["last_data_fingerprint"], manifest["evidence_fingerprint"])
+            self.assertIn("纸面", (run_dir / "shadow_decision.md").read_text(encoding="utf-8"))
+            self.assertFalse(manifest["global_state_changed"])
             self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
             self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())
             summary = Path(manifest["summary"])
@@ -740,6 +927,69 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 (root / "runs" / "failed-run" / "manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["status"], "failed")
+            self.assertFalse(manifest["global_state_changed"])
+            run_dir = root / "runs" / "failed-run"
+            for relative in (
+                "folds.json",
+                "candidate_scores.csv",
+                "evolution_state_snapshot.json",
+                "shadow_decision.md",
+            ):
+                self.assertTrue((run_dir / relative).exists(), relative)
+            self.assertTrue((run_dir / "experiments").is_dir())
+
+    def test_all_candidate_failures_preserve_every_candidate_experiment(self):
+        config = parse_evolution_config(valid_raw_config())
+
+        def candidate_failure_executor(bundle, params):
+            if float(params["leverage"]) != float(config.baseline["leverage"]):
+                raise RuntimeError("candidate failed")
+            return self._run_for_params(bundle, params)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "All candidates failed"):
+                run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                    root / "runs", "candidate-failures", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    candidate_failure_executor, "test-commit",
+                )
+
+            run_dir = root / "runs" / "candidate-failures"
+            scores = pd.read_csv(run_dir / "candidate_scores.csv")
+            self.assertEqual(set(scores["candidate_id"]), {"risk_075", "risk_090"})
+            self.assertEqual(set(scores["status"]), {"trial_error"})
+            experiments = list((run_dir / "experiments").glob("*.json"))
+            self.assertEqual(len(experiments), 2)
+
+    def test_run_refuses_output_root_under_configs_before_writing_yaml(self):
+        config = parse_evolution_config(valid_raw_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "configs"):
+                run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                    root / "configs", "unsafe-run", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    self._run_for_params, "test-commit",
+                )
+
+            self.assertFalse((root / "configs").exists())
 
     def test_holdout_rollback_preserves_artifacts_but_does_not_publish(self):
         raw = valid_raw_config()

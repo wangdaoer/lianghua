@@ -1,16 +1,20 @@
 import json
+from dataclasses import replace
 
 import pytest
 
 from strategy_evolution_core import (
+    EvolutionStateError,
     FoldMetrics,
     PromotionPolicy,
     EvolutionState,
     evaluate_candidate,
     fingerprint_payload,
     generate_parameter_candidates,
+    load_evolution_state,
     promote_to_shadow,
     rollback_shadow,
+    write_evolution_state_atomic,
 )
 
 
@@ -250,3 +254,63 @@ def test_evolution_state_mappings_are_immutable_and_serializable():
     assert fingerprint_payload(initial.champion_parameters) == fingerprint_payload(
         {"risk": {"leverage": 0.6}, "levels": [1, 2]}
     )
+
+
+def test_atomic_state_write_round_trips_and_checks_previous_fingerprint(tmp_path):
+    path = tmp_path / "state.json"
+    first = EvolutionState.initial(
+        "v1", {"leverage": 0.6}, now="2026-07-12T00:00:00+00:00"
+    )
+
+    first_fp = write_evolution_state_atomic(path, first)
+
+    assert load_evolution_state(path, first) == first
+    second = replace(first, last_completed_run_id="run-2")
+    with pytest.raises(EvolutionStateError, match="previous state fingerprint"):
+        write_evolution_state_atomic(
+            path, second, expected_previous_fingerprint="stale"
+        )
+    assert write_evolution_state_atomic(
+        path, second, expected_previous_fingerprint=first_fp
+    ) == fingerprint_payload(second)
+    assert load_evolution_state(path, first) == second
+
+
+@pytest.mark.parametrize(
+    "mutation, message",
+    [
+        (lambda payload: payload.update({"unknown": True}), "Unknown state fields"),
+        (lambda payload: payload.pop("champion_version"), "Missing state fields"),
+        (lambda payload: payload.update({"schema_version": 2}), "schema_version"),
+    ],
+)
+def test_state_load_rejects_unknown_missing_and_unsupported_schema(
+    tmp_path, mutation, message
+):
+    path = tmp_path / "state.json"
+    state = EvolutionState.initial(
+        "v1", {"leverage": 0.6}, now="2026-07-12T00:00:00+00:00"
+    )
+    payload = json.loads(json.dumps(state.__dict__))
+    mutation(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(EvolutionStateError, match=message):
+        load_evolution_state(path, state)
+
+
+def test_state_load_returns_default_when_file_is_absent(tmp_path):
+    default = EvolutionState.initial(
+        "v1", {"leverage": 0.6}, now="2026-07-12T00:00:00+00:00"
+    )
+
+    assert load_evolution_state(tmp_path / "missing.json", default) is default
+
+
+def test_state_write_rejects_unsupported_schema(tmp_path):
+    state = replace(
+        EvolutionState.initial("v1", {"leverage": 0.6}), schema_version=2
+    )
+
+    with pytest.raises(EvolutionStateError, match="schema_version"):
+        write_evolution_state_atomic(tmp_path / "state.json", state)

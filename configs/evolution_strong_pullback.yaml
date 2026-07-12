@@ -1,5 +1,21 @@
 strategy: strong_pullback_satellite
 
+evolution_core:
+  train_days: 504
+  validation_days: 126
+  test_days: 126
+  step_days: 63
+  max_candidates_per_group: 8
+  random_seed: 20260712
+  min_folds: 3
+  min_filled_trades_per_fold: 5
+  min_positive_fold_ratio: 0.6666666667
+  min_mean_return_improvement: 0.01
+  max_drawdown_floor: -0.40
+  max_drawdown_worsening: 0.05
+  max_turnover_ratio: 1.50
+  max_pnl_concentration: 0.50
+
 periods:
   research_start: 2022-01-01
   train_end: 2024-12-31

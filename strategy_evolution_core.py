@@ -6,11 +6,17 @@ import hashlib
 import json
 import math
 import random
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from numbers import Real
+from pathlib import Path
+
+
+class EvolutionStateError(ValueError):
+    pass
 
 
 class _FrozenDict(dict[str, object]):
@@ -426,6 +432,71 @@ class EvolutionState:
     @property
     def last_run_id(self) -> str | None:
         return self.last_completed_run_id
+
+
+def _state_from_payload(payload: object) -> EvolutionState:
+    if not isinstance(payload, Mapping):
+        raise EvolutionStateError("Evolution state must be a JSON mapping")
+    expected_fields = {field.name for field in dataclasses.fields(EvolutionState)}
+    actual_fields = set(payload)
+    unknown = actual_fields - expected_fields
+    missing = expected_fields - actual_fields
+    if unknown:
+        raise EvolutionStateError(f"Unknown state fields: {sorted(unknown)}")
+    if missing:
+        raise EvolutionStateError(f"Missing state fields: {sorted(missing)}")
+    if type(payload.get("schema_version")) is not int or payload.get("schema_version") != 1:
+        raise EvolutionStateError(
+            f"Unsupported state schema_version: {payload.get('schema_version')!r}"
+        )
+    try:
+        return EvolutionState(**dict(payload))
+    except (TypeError, ValueError) as exc:
+        raise EvolutionStateError(f"Invalid evolution state: {exc}") from exc
+
+
+def load_evolution_state(path: Path, default_state: EvolutionState) -> EvolutionState:
+    path = Path(path)
+    if not path.exists():
+        return default_state
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise EvolutionStateError(f"Could not read evolution state: {exc}") from exc
+    return _state_from_payload(payload)
+
+
+def write_evolution_state_atomic(
+    path: Path,
+    state: EvolutionState,
+    expected_previous_fingerprint: str | None = None,
+) -> str:
+    if not isinstance(state, EvolutionState):
+        raise EvolutionStateError("state must be an EvolutionState")
+    _state_from_payload(_canonicalize(state))
+    path = Path(path)
+    if expected_previous_fingerprint is not None:
+        if not path.exists():
+            raise EvolutionStateError("previous state fingerprint does not match")
+        actual_previous = fingerprint_payload(load_evolution_state(path, state))
+        if actual_previous != expected_previous_fingerprint:
+            raise EvolutionStateError("previous state fingerprint does not match")
+
+    payload = json.dumps(
+        _canonicalize(state), sort_keys=True, ensure_ascii=True
+    )
+    fingerprint = fingerprint_payload(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+            handle.flush()
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return fingerprint
 
 
 def promote_to_shadow(

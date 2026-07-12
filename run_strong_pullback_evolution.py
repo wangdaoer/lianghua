@@ -7,7 +7,7 @@ import math
 import platform
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
@@ -19,10 +19,21 @@ from pandas.errors import EmptyDataError
 
 from run_backtest import load_prices, pivot_prices
 from run_strong_pullback_satellite import run_satellite_walk_forward
+from strategy_evolution_core import (
+    EvolutionState,
+    PromotionPolicy,
+    evaluate_candidate,
+    fingerprint_payload,
+    load_evolution_state,
+    promote_to_shadow,
+    write_evolution_state_atomic,
+)
 from strong_pullback_evolution import (
     EvolutionConfig,
     assess_test_result,
+    build_trading_folds,
     build_group_candidates,
+    calculate_fold_metrics,
     calculate_segment_metrics,
     choose_group_winner,
     load_evolution_config,
@@ -74,6 +85,24 @@ def stable_hash(value: object) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _group_seed(random_seed: int, group_id: str) -> int:
+    return random_seed ^ int(fingerprint_payload({"group_id": group_id})[:16], 16)
+
+
+def _promotion_policy(config: EvolutionConfig) -> PromotionPolicy:
+    core = config.evolution_core
+    return PromotionPolicy(
+        min_folds=core.min_folds,
+        min_filled_trades_per_fold=core.min_filled_trades_per_fold,
+        min_positive_fold_ratio=core.min_positive_fold_ratio,
+        min_mean_return_improvement=core.min_mean_return_improvement,
+        max_drawdown_floor=core.max_drawdown_floor,
+        max_drawdown_worsening=core.max_drawdown_worsening,
+        max_turnover_ratio=core.max_turnover_ratio,
+        max_pnl_concentration=core.max_pnl_concentration,
+    )
+
+
 @dataclass(frozen=True)
 class RunEvidence:
     data_path: str
@@ -120,6 +149,7 @@ def build_run_evidence(
         config_path=str(config_path.resolve()),
         config_hash=stable_hash({
             "strategy": config.strategy,
+            "evolution_core": asdict(config.evolution_core),
             "periods": asdict(config.periods),
             "baseline": config.baseline,
             "search_groups": [asdict(group) for group in config.search_groups],
@@ -132,6 +162,7 @@ def build_run_evidence(
 def resolved_config_dict(config: EvolutionConfig) -> dict[str, object]:
     return {
         "strategy": config.strategy,
+        "evolution_core": asdict(config.evolution_core),
         "periods": {
             key: value.strftime("%Y-%m-%d") if value is not None else None
             for key, value in asdict(config.periods).items()
@@ -164,6 +195,80 @@ def can_resume_trial(
         and trial_state.get("evidence_fingerprint") == evidence_fingerprint
         and trial_state.get("params_hash") == params_hash
     )
+
+
+def _state_path_is_config(path: Path) -> bool:
+    return any(part.lower() == "configs" for part in path.resolve().parts)
+
+
+def _json_safe(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def persist_evolution_outcome(
+    run_dir: Path,
+    snapshot: EvolutionState,
+    candidate_scores: list[dict[str, object]],
+    experiments: list[dict[str, object]],
+    decision_markdown: str,
+    dry_run: bool,
+    promote_shadow: bool,
+    state_path: Path,
+    expected_previous_fingerprint: str | None,
+) -> bool:
+    run_dir = Path(run_dir)
+    state_path = Path(state_path)
+    if _state_path_is_config(state_path):
+        raise ValueError("state_path must not be under configs")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "evolution_state_snapshot.json").write_text(
+        json.dumps(
+            _json_safe(asdict(snapshot)), sort_keys=True, ensure_ascii=True,
+            allow_nan=False, indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    score_frame = pd.DataFrame(candidate_scores)
+    if score_frame.empty:
+        score_frame = pd.DataFrame(columns=(
+            "group_id", "candidate_id", "parent_id", "experiment_id",
+            "status", "failed_gates", "gates",
+        ))
+    score_frame.to_csv(
+        run_dir / "candidate_scores.csv", index=False, encoding="utf-8-sig"
+    )
+    experiments_dir = run_dir / "experiments"
+    experiments_dir.mkdir(parents=True, exist_ok=True)
+    for experiment in experiments:
+        experiment_id = experiment.get("experiment_id")
+        if (
+            not isinstance(experiment_id, str)
+            or not experiment_id
+            or Path(experiment_id).name != experiment_id
+        ):
+            raise ValueError("experiment_id must be a safe non-empty filename")
+        (experiments_dir / f"{experiment_id}.json").write_text(
+            json.dumps(
+                _json_safe(experiment), sort_keys=True, ensure_ascii=True,
+                allow_nan=False, indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+    (run_dir / "shadow_decision.md").write_text(decision_markdown, encoding="utf-8")
+    if dry_run or not promote_shadow:
+        return False
+    write_evolution_state_atomic(
+        state_path,
+        snapshot,
+        expected_previous_fingerprint=expected_previous_fingerprint,
+    )
+    return True
 
 
 def _bundle_has_holdout_dates(bundle: PriceBundle, validation_end: pd.Timestamp) -> bool:
@@ -360,9 +465,25 @@ def run_evolution(
     bundle_loader: Callable = load_price_bundle,
     trial_executor: Callable = execute_strategy_trial,
     git_commit: str = "unknown",
+    dry_run: bool = True,
+    promote_shadow: bool = False,
+    state_path: Path | None = None,
+    expected_previous_fingerprint: str | None = None,
 ) -> EvolutionOutcome:
+    if _state_path_is_config(output_root):
+        raise ValueError("output_root must not be under configs")
     run_dir = output_root / run_id
     evidence = build_run_evidence(data_path, config_path, config, benchmark_path, git_commit)
+    resolved_state_path = (
+        Path(state_path)
+        if state_path is not None
+        else output_root.parent / "evolution_state" / "strong_pullback.json"
+    )
+    default_state = EvolutionState.initial("baseline", config.baseline)
+    input_state = load_evolution_state(resolved_state_path, default_state)
+    previous_fingerprint = expected_previous_fingerprint
+    if resolved_state_path.exists() and previous_fingerprint is None:
+        previous_fingerprint = fingerprint_payload(input_state)
     manifest_path = run_dir / "manifest.json"
     if resume:
         if not manifest_path.exists():
@@ -392,6 +513,27 @@ def run_evolution(
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     try:
+        placeholder_snapshot = replace(
+            input_state,
+            last_completed_run_id=run_id,
+            last_data_fingerprint=evidence.fingerprint,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        (run_dir / "folds.json").write_text("[]\n", encoding="utf-8")
+        persist_evolution_outcome(
+            run_dir=run_dir,
+            snapshot=placeholder_snapshot,
+            candidate_scores=[],
+            experiments=[],
+            decision_markdown=(
+                "# 影子决定\n\n纸面研究尚未完成，未更新全局状态。\n"
+                "正式 YAML 未修改，也未产生任何券商订单。\n"
+            ),
+            dry_run=True,
+            promote_shadow=False,
+            state_path=resolved_state_path,
+            expected_previous_fingerprint=None,
+        )
         (run_dir / "resolved_config.yaml").write_text(
             yaml.safe_dump(resolved_config_dict(config), allow_unicode=True, sort_keys=False),
             encoding="utf-8",
@@ -402,9 +544,40 @@ def run_evolution(
         if _bundle_has_holdout_dates(research_bundle, config.periods.validation_end):
             raise AssertionError("Research bundle contains holdout dates")
 
+        core = config.evolution_core
+        folds = build_trading_folds(
+            research_bundle.close.index,
+            train_days=core.train_days,
+            validation_days=core.validation_days,
+            test_days=core.test_days,
+            step_days=core.step_days,
+        )
+        fold_rows = [
+            {
+                "fold_id": fold.fold_id,
+                "train_start": fold.train_dates[0],
+                "train_end": fold.train_dates[-1],
+                "validation_start": fold.validation_dates[0],
+                "validation_end": fold.validation_dates[-1],
+                "test_start": fold.test_dates[0],
+                "test_end": fold.test_dates[-1],
+                "fingerprint": fingerprint_payload(fold),
+            }
+            for fold in folds
+        ]
+        (run_dir / "folds.json").write_text(
+            json.dumps(fold_rows, default=str, sort_keys=True, ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         trial_rows: list[dict[str, object]] = []
         round_rows: list[dict[str, object]] = []
         trial_metrics: dict[str, dict[str, dict[str, float]]] = {}
+        trial_fold_metrics: dict[str, tuple] = {}
+        candidate_scores: list[dict[str, object]] = []
+        experiments: list[dict[str, object]] = []
+        experiment_ids: dict[str, str] = {}
+        core_decisions: dict[str, object] = {}
         trial_params: dict[str, dict[str, object]] = {"baseline": dict(config.baseline)}
 
         def cached_trial(trial_id: str, params_hash: str) -> StrategyRun | None:
@@ -428,6 +601,10 @@ def run_evolution(
                     "train": dict(metrics["train"]),
                     "validation": dict(metrics["validation"]),
                 }
+                trial_fold_metrics[trial_id] = tuple(
+                    calculate_fold_metrics(run.equity, run.trades, fold)
+                    for fold in folds
+                )
                 return run
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 return None
@@ -448,6 +625,10 @@ def run_evolution(
                 config.selection.rolling_window_days,
             )
             trial_metrics[trial_id] = {"train": train_metrics, "validation": validation_metrics}
+            trial_fold_metrics[trial_id] = tuple(
+                calculate_fold_metrics(run.equity, run.trades, fold)
+                for fold in folds
+            )
             write_trial_artifacts(
                 trial_dir,
                 run,
@@ -482,11 +663,54 @@ def run_evolution(
         incumbent_metrics = trial_metrics["baseline"]["validation"]
         for group in config.search_groups:
             candidate_pairs: list[tuple[str, Mapping[str, float]]] = []
-            for candidate_id, params in build_group_candidates(incumbent_params, group):
+            group_seed = _group_seed(core.random_seed, group.group_id)
+            generated_candidates = build_group_candidates(
+                incumbent_params,
+                group,
+                max_candidates=core.max_candidates_per_group,
+                seed=group_seed,
+            )
+            for candidate_id, params in generated_candidates:
                 trial_params[candidate_id] = params
+                experiment_id = "exp_" + fingerprint_payload({
+                    "group_id": group.group_id,
+                    "candidate_id": candidate_id,
+                    "parent_id": incumbent_id,
+                    "parameters": params,
+                    "data_fingerprint": evidence.fingerprint,
+                    "fold_fingerprints": [row["fingerprint"] for row in fold_rows],
+                })[:20]
+                experiment_ids[candidate_id] = experiment_id
                 try:
                     execute_one(candidate_id, params)
                     candidate_pairs.append((candidate_id, trial_metrics[candidate_id]["validation"]))
+                    core_decision = evaluate_candidate(
+                        trial_fold_metrics[candidate_id],
+                        trial_fold_metrics[incumbent_id],
+                        _promotion_policy(config),
+                    )
+                    core_decisions[candidate_id] = core_decision
+                    candidate_scores.append({
+                        "group_id": group.group_id,
+                        "candidate_id": candidate_id,
+                        "parent_id": incumbent_id,
+                        "experiment_id": experiment_id,
+                        "status": core_decision.status,
+                        "failed_gates": json.dumps(core_decision.failed_gates, ensure_ascii=True),
+                        "gates": json.dumps(core_decision.gates, ensure_ascii=True, sort_keys=True),
+                    })
+                    experiments.append({
+                        "experiment_id": experiment_id,
+                        "group_id": group.group_id,
+                        "candidate_id": candidate_id,
+                        "parent_version": incumbent_id,
+                        "parameters": params,
+                        "data_fingerprint": evidence.fingerprint,
+                        "fold_metrics": [asdict(metric) for metric in trial_fold_metrics[candidate_id]],
+                        "status": core_decision.status,
+                        "failed_gates": core_decision.failed_gates,
+                        "gates": core_decision.gates,
+                    })
                 except Exception as exc:
                     trial_rows.append({
                         "group_id": group.group_id,
@@ -494,6 +718,41 @@ def run_evolution(
                         "status": "trial_error",
                         "reason_cn": str(exc),
                     })
+                    candidate_scores.append({
+                        "group_id": group.group_id,
+                        "candidate_id": candidate_id,
+                        "parent_id": incumbent_id,
+                        "experiment_id": experiment_id,
+                        "status": "trial_error",
+                        "failed_gates": json.dumps(("trial_error",)),
+                        "gates": "{}",
+                    })
+                    experiments.append({
+                        "experiment_id": experiment_id,
+                        "group_id": group.group_id,
+                        "candidate_id": candidate_id,
+                        "parent_version": incumbent_id,
+                        "parameters": params,
+                        "data_fingerprint": evidence.fingerprint,
+                        "fold_metrics": [],
+                        "status": "trial_error",
+                        "failed_gates": ("trial_error",),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+            persist_evolution_outcome(
+                run_dir=run_dir,
+                snapshot=placeholder_snapshot,
+                candidate_scores=candidate_scores,
+                experiments=experiments,
+                decision_markdown=(
+                    "# 影子决定\n\n纸面研究尚未完成，未更新全局状态。\n"
+                    "正式 YAML 未修改，也未产生任何券商订单。\n"
+                ),
+                dry_run=True,
+                promote_shadow=False,
+                state_path=resolved_state_path,
+                expected_previous_fingerprint=None,
+            )
             if not candidate_pairs:
                 raise RuntimeError(f"All candidates failed in group {group.group_id}")
             winner_id, decisions = choose_group_winner(
@@ -560,6 +819,53 @@ def run_evolution(
             final_metrics["baseline"], final_metrics["champion"], config.selection
         )
 
+        selected_experiment_id = experiment_ids.get(champion_id)
+        selected_core_decision = core_decisions.get(champion_id)
+        snapshot = replace(
+            input_state,
+            last_completed_run_id=run_id,
+            last_data_fingerprint=evidence.fingerprint,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        if (
+            selected_experiment_id is not None
+            and selected_core_decision is not None
+            and selected_core_decision.status == "eligible_for_shadow"
+            and test_status == "ready_for_manual_review"
+        ):
+            snapshot = promote_to_shadow(
+                input_state,
+                challenger_version=champion_id,
+                challenger_parameters=champion_params,
+                experiment_id=selected_experiment_id,
+                run_id=run_id,
+                data_fingerprint=evidence.fingerprint,
+            )
+        paper_only = dry_run or not promote_shadow
+        decision_markdown = "\n".join([
+            "# 影子决定",
+            "",
+            f"- 运行：`{run_id}`",
+            f"- 候选：`{champion_id}`",
+            f"- 实验：`{selected_experiment_id or 'none'}`",
+            f"- 状态：`{'paper_only' if paper_only else 'shadow_registry_update'}`",
+            "",
+            "纸面研究，未更新全局状态。" if paper_only else "已按显式授权更新独立影子状态。",
+            "正式 YAML 未修改，也未产生任何券商订单。",
+            "",
+        ])
+        global_state_changed = persist_evolution_outcome(
+            run_dir=run_dir,
+            snapshot=snapshot,
+            candidate_scores=candidate_scores,
+            experiments=experiments,
+            decision_markdown=decision_markdown,
+            dry_run=dry_run,
+            promote_shadow=promote_shadow,
+            state_path=resolved_state_path,
+            expected_previous_fingerprint=previous_fingerprint,
+        )
+
         pd.DataFrame(trial_rows).to_csv(run_dir / "trials.csv", index=False, encoding="utf-8-sig")
         pd.DataFrame(round_rows).to_csv(run_dir / "rounds.csv", index=False, encoding="utf-8-sig")
         pd.DataFrame([
@@ -576,6 +882,13 @@ def run_evolution(
             "test_status": test_status,
             "test_reason": test_reason,
             "summary": str(summary_path),
+            "global_state_changed": global_state_changed,
+            "selected_experiment_id": selected_experiment_id,
+            "failed_gates": (
+                list(selected_core_decision.failed_gates)
+                if selected_core_decision is not None
+                else ["no_selected_experiment"]
+            ),
         })
         if test_status != "ready_for_manual_review":
             raise RuntimeError(f"Holdout test {test_status}: {test_reason}")
@@ -594,6 +907,9 @@ def run_evolution(
     except Exception as exc:
         manifest.update({
             "status": "failed",
+            "global_state_changed": manifest.get("global_state_changed", False),
+            "selected_experiment_id": manifest.get("selected_experiment_id"),
+            "failed_gates": manifest.get("failed_gates", ["run_failed"]),
             "failed_at_utc": datetime.now(timezone.utc).isoformat(),
             "error": f"{type(exc).__name__}: {exc}",
         })
@@ -612,6 +928,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-root", default="outputs/evolution_runs")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--resume", default=None, metavar="RUN_ID")
+    parser.add_argument(
+        "--dry-run", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--promote-shadow", action="store_true", default=False)
+    parser.add_argument(
+        "--state-path", default="outputs/evolution_state/strong_pullback.json"
+    )
     return parser.parse_args(argv)
 
 
@@ -651,6 +974,9 @@ def main(argv: list[str] | None = None) -> None:
         run_id=run_id,
         resume=bool(args.resume),
         git_commit=_git_commit(project_root),
+        dry_run=args.dry_run,
+        promote_shadow=args.promote_shadow,
+        state_path=Path(args.state_path).resolve(),
     )
     print(
         "Strong-pullback evolution completed.\n"

@@ -11,7 +11,11 @@ import pandas as pd
 import yaml
 
 from run_backtest import max_drawdown, sharpe_like
-from strategy_evolution_core import FoldMetrics
+from strategy_evolution_core import (
+    FoldMetrics,
+    fingerprint_payload,
+    generate_parameter_candidates,
+)
 
 
 DEFAULT_STRATEGY_PARAMS: dict[str, object] = {
@@ -72,6 +76,14 @@ SELECTION_KEYS = frozenset({
     "max_negative_window_rate",
 })
 
+EVOLUTION_CORE_KEYS = frozenset({
+    "train_days", "validation_days", "test_days", "step_days",
+    "max_candidates_per_group", "random_seed", "min_folds",
+    "min_filled_trades_per_fold", "min_positive_fold_ratio",
+    "min_mean_return_improvement", "max_drawdown_floor",
+    "max_drawdown_worsening", "max_turnover_ratio", "max_pnl_concentration",
+})
+
 
 @dataclass(frozen=True)
 class EvolutionPeriods:
@@ -96,6 +108,24 @@ class SelectionRules:
 
 
 @dataclass(frozen=True)
+class EvolutionCoreConfig:
+    train_days: int
+    validation_days: int
+    test_days: int
+    step_days: int
+    max_candidates_per_group: int
+    random_seed: int
+    min_folds: int
+    min_filled_trades_per_fold: int
+    min_positive_fold_ratio: float
+    min_mean_return_improvement: float
+    max_drawdown_floor: float
+    max_drawdown_worsening: float
+    max_turnover_ratio: float
+    max_pnl_concentration: float
+
+
+@dataclass(frozen=True)
 class SearchCandidate:
     candidate_id: str
     overrides: dict[str, object]
@@ -111,6 +141,7 @@ class SearchGroup:
 @dataclass(frozen=True)
 class EvolutionConfig:
     strategy: str
+    evolution_core: EvolutionCoreConfig
     periods: EvolutionPeriods
     baseline: dict[str, object]
     search_groups: tuple[SearchGroup, ...]
@@ -223,9 +254,72 @@ def _identifier(value: object, label: str) -> str:
     return value.strip()
 
 
+def _strict_integer(value: object, name: str, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return value
+
+
+def _strict_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError(f"{name} must be finite")
+    return numeric
+
+
+def _parse_evolution_core(value: object) -> EvolutionCoreConfig:
+    if not isinstance(value, Mapping):
+        raise ValueError("evolution_core must be a mapping")
+    raw = dict(value)
+    unknown = set(raw) - EVOLUTION_CORE_KEYS
+    missing = EVOLUTION_CORE_KEYS - set(raw)
+    if unknown:
+        raise ValueError(f"Unknown evolution_core keys: {sorted(unknown)}")
+    if missing:
+        raise ValueError(f"Missing evolution_core keys: {sorted(missing)}")
+
+    integer_values = {
+        name: _strict_integer(raw[name], name, minimum=minimum)
+        for name, minimum in {
+            "train_days": 1,
+            "validation_days": 1,
+            "test_days": 1,
+            "step_days": 1,
+            "max_candidates_per_group": 1,
+            "random_seed": None,
+            "min_folds": 1,
+            "min_filled_trades_per_fold": 1,
+        }.items()
+    }
+    number_values = {
+        name: _strict_number(raw[name], name)
+        for name in (
+            "min_positive_fold_ratio", "min_mean_return_improvement",
+            "max_drawdown_floor", "max_drawdown_worsening",
+            "max_turnover_ratio", "max_pnl_concentration",
+        )
+    }
+    for name in (
+        "min_positive_fold_ratio", "min_mean_return_improvement",
+        "max_drawdown_worsening", "max_pnl_concentration"
+    ):
+        if not 0.0 <= number_values[name] <= 1.0:
+            raise ValueError(f"{name} must be between 0 and 1")
+    if not -1.0 <= number_values["max_drawdown_floor"] <= 0.0:
+        raise ValueError("max_drawdown_floor must be between -1 and 0")
+    if number_values["max_turnover_ratio"] <= 0.0:
+        raise ValueError("max_turnover_ratio must be positive")
+    return EvolutionCoreConfig(**integer_values, **number_values)
+
+
 def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
     if raw.get("strategy") != "strong_pullback_satellite":
         raise ValueError("strategy must be strong_pullback_satellite")
+    evolution_core = _parse_evolution_core(raw.get("evolution_core"))
     period_raw = dict(raw.get("periods") or {})
     periods = EvolutionPeriods(
         research_start=_timestamp(period_raw.get("research_start"), "research_start"),
@@ -296,7 +390,14 @@ def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
         raise ValueError("max_turnover_ratio must be >= 1")
     if not 0.0 <= selection.max_negative_window_rate <= 1.0:
         raise ValueError("max_negative_window_rate must be between 0 and 1")
-    return EvolutionConfig("strong_pullback_satellite", periods, baseline, tuple(groups), selection)
+    return EvolutionConfig(
+        strategy="strong_pullback_satellite",
+        evolution_core=evolution_core,
+        periods=periods,
+        baseline=baseline,
+        search_groups=tuple(groups),
+        selection=selection,
+    )
 
 
 def load_evolution_config(path: Path) -> EvolutionConfig:
@@ -308,11 +409,33 @@ def load_evolution_config(path: Path) -> EvolutionConfig:
 
 
 def build_group_candidates(
-    incumbent: Mapping[str, object], group: SearchGroup
+    incumbent: Mapping[str, object],
+    group: SearchGroup,
+    *,
+    max_candidates: int | None = None,
+    seed: int | None = None,
 ) -> tuple[tuple[str, dict[str, object]], ...]:
-    return tuple(
-        (candidate.candidate_id, {**deepcopy(dict(incumbent)), **deepcopy(candidate.overrides)})
+    if max_candidates is None and seed is None:
+        return tuple(
+            (candidate.candidate_id, {**deepcopy(dict(incumbent)), **deepcopy(candidate.overrides)})
+            for candidate in group.candidates
+        )
+    if max_candidates is None or seed is None:
+        raise ValueError("max_candidates and seed must be provided together")
+    generated = generate_parameter_candidates(
+        incumbent,
+        [candidate.overrides for candidate in group.candidates],
+        max_candidates=max_candidates,
+        seed=seed,
+    )
+    ids_by_fingerprint = {
+        fingerprint_payload({**deepcopy(dict(incumbent)), **deepcopy(candidate.overrides)}):
+        candidate.candidate_id
         for candidate in group.candidates
+    }
+    return tuple(
+        (ids_by_fingerprint[fingerprint_payload(params)], params)
+        for params in generated
     )
 
 
