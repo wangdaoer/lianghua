@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from strategy_evolution_core import (
@@ -142,3 +144,89 @@ def test_candidate_overrides_must_be_unique_non_empty_and_independent():
     )
     candidates[0]["risk"]["leverage"] = 0.1
     assert champion == {"risk": {"leverage": 0.6}}
+
+
+def test_missing_metric_returns_full_insufficient_evidence_audit():
+    challenger = (
+        FoldMetrics(
+            fold_id="f1",
+            total_return=None,
+            max_drawdown=-0.12,
+            sharpe=1.1,
+            filled_trades=20,
+            average_turnover=0.20,
+            pnl_concentration=0.30,
+        ),
+        _fold("f2", 0.08),
+        _fold("f3", 0.08),
+    )
+    champion = tuple(_fold(f"f{i}", 0.04) for i in range(1, 4))
+    decision = evaluate_candidate(challenger, champion, PromotionPolicy())
+    assert decision.status == "insufficient_evidence"
+    assert "finite_metrics" in decision.failed_gates
+    assert {
+        "min_folds",
+        "min_filled_trades",
+        "positive_fold_ratio",
+        "mean_return_improvement",
+        "max_drawdown",
+        "drawdown_worsening",
+        "turnover_ratio",
+        "pnl_concentration",
+        "finite_metrics",
+    } <= set(decision.gates)
+
+
+def test_non_numeric_metric_returns_insufficient_evidence_without_arithmetic_error():
+    challenger = (
+        FoldMetrics(
+            fold_id="f1",
+            total_return=0.08,
+            max_drawdown=-0.12,
+            sharpe=1.1,
+            filled_trades=20,
+            average_turnover="not-a-number",
+            pnl_concentration=0.30,
+        ),
+        _fold("f2", 0.08),
+        _fold("f3", 0.08),
+    )
+    champion = tuple(_fold(f"f{i}", 0.04) for i in range(1, 4))
+    decision = evaluate_candidate(challenger, champion, PromotionPolicy())
+    assert decision.status == "insufficient_evidence"
+    assert "finite_metrics" in decision.failed_gates
+
+
+def test_evolution_state_mappings_are_immutable_and_serializable():
+    initial = EvolutionState.initial(
+        "v1",
+        {"risk": {"leverage": 0.6}, "levels": [1, 2]},
+        now="2026-07-12T00:00:00+00:00",
+    )
+    shadow = promote_to_shadow(
+        initial,
+        challenger_version="v2",
+        challenger_parameters={"risk": {"leverage": 0.75}},
+        experiment_id="exp-1",
+        run_id="run-1",
+        data_fingerprint="data-1",
+        now="2026-07-12T01:00:00+00:00",
+    )
+
+    with pytest.raises(TypeError):
+        initial.champion_parameters["risk"] = {"leverage": 0.1}
+    with pytest.raises(TypeError):
+        initial.champion_parameters["risk"]["leverage"] = 0.1
+    with pytest.raises(TypeError):
+        initial.champion_parameters["levels"].append(3)
+    with pytest.raises(TypeError):
+        shadow.shadow_parameters["risk"]["leverage"] = 0.1
+    with pytest.raises(TypeError):
+        shadow.previous_champion_parameters["risk"]["leverage"] = 0.1
+
+    assert json.dumps(initial.champion_parameters, sort_keys=True) == json.dumps(
+        {"risk": {"leverage": 0.6}, "levels": [1, 2]}, sort_keys=True
+    )
+    assert fingerprint_payload(initial.champion_parameters) == fingerprint_payload(
+        {"risk": {"leverage": 0.6}, "levels": [1, 2]}
+    )

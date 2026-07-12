@@ -12,6 +12,76 @@ from datetime import date, datetime, timezone
 from enum import Enum
 
 
+class _FrozenDict(dict[str, object]):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        source = dict(*args, **kwargs)
+        super().__init__((key, _freeze(value)) for key, value in source.items())
+
+    @staticmethod
+    def _immutable(*args: object, **kwargs: object) -> None:
+        raise TypeError("state mappings are immutable")
+
+    __delitem__ = _immutable
+    __setitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+    def __ior__(self, value: object) -> _FrozenDict:
+        self._immutable(value)
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _FrozenDict:
+        return self
+
+
+class _FrozenList(list[object]):
+    def __init__(self, values: Sequence[object] = ()) -> None:
+        super().__init__(_freeze(value) for value in values)
+
+    @staticmethod
+    def _immutable(*args: object, **kwargs: object) -> None:
+        raise TypeError("state mappings are immutable")
+
+    __delitem__ = _immutable
+    __setitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _FrozenList:
+        return self
+
+
+def _freeze(value: object) -> object:
+    if isinstance(value, (_FrozenDict, _FrozenList)):
+        return value
+    if isinstance(value, Mapping):
+        return _FrozenDict(value)
+    if isinstance(value, list):
+        return _FrozenList(value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze(item) for item in value)
+    return value
+
+
+def _freeze_mapping(value: Mapping[str, object]) -> _FrozenDict:
+    if not isinstance(value, Mapping):
+        raise TypeError("state parameters must be a mapping")
+    return _FrozenDict(value)
+
+
 def _canonicalize(value: object) -> object:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _canonicalize(dataclasses.asdict(value))
@@ -150,6 +220,34 @@ def _gate(passed: bool, value: object, threshold: object) -> dict[str, object]:
     return {"passed": passed, "value": value, "threshold": threshold}
 
 
+def _insufficient_metrics_decision(policy: PromotionPolicy, reason: str) -> PromotionDecision:
+    thresholds = {
+        "min_folds": policy.min_folds,
+        "min_filled_trades": policy.min_filled_trades_per_fold,
+        "positive_fold_ratio": policy.min_positive_fold_ratio,
+        "mean_return_improvement": policy.min_mean_return_improvement,
+        "max_drawdown": policy.max_drawdown_floor,
+        "drawdown_worsening": policy.max_drawdown_worsening,
+        "turnover_ratio": policy.max_turnover_ratio,
+        "pnl_concentration": policy.max_pnl_concentration,
+    }
+    gates = {
+        name: _gate(False, None, threshold)
+        for name, threshold in thresholds.items()
+    }
+    gates["finite_metrics"] = {
+        "passed": False,
+        "value": False,
+        "threshold": True,
+        "reason": reason,
+    }
+    return PromotionDecision(
+        "insufficient_evidence",
+        tuple((*thresholds, "finite_metrics")),
+        gates,
+    )
+
+
 def evaluate_candidate(
     challenger: Sequence[FoldMetrics],
     champion: Sequence[FoldMetrics],
@@ -178,6 +276,8 @@ def evaluate_candidate(
     challenger_folds = tuple(challenger_by_id[fold_id] for fold_id in fold_ids)
     champion_folds = tuple(champion_by_id[fold_id] for fold_id in fold_ids)
     all_finite = all(_finite_metrics(fold) for fold in (*challenger_folds, *champion_folds))
+    if not all_finite:
+        return _insufficient_metrics_decision(policy, "missing, non-numeric, or non-finite metric")
     fold_count = len(fold_ids)
     min_trades = min((fold.filled_trades for fold in challenger_folds), default=0)
     positive_ratio = (
@@ -288,11 +388,11 @@ class EvolutionState:
     updated_at: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "champion_parameters", copy.deepcopy(dict(self.champion_parameters)))
+        object.__setattr__(self, "champion_parameters", _freeze_mapping(self.champion_parameters))
         if self.shadow_parameters is not None:
-            object.__setattr__(self, "shadow_parameters", copy.deepcopy(dict(self.shadow_parameters)))
+            object.__setattr__(self, "shadow_parameters", _freeze_mapping(self.shadow_parameters))
         if self.previous_champion_parameters is not None:
-            object.__setattr__(self, "previous_champion_parameters", copy.deepcopy(dict(self.previous_champion_parameters)))
+            object.__setattr__(self, "previous_champion_parameters", _freeze_mapping(self.previous_champion_parameters))
 
     @classmethod
     def initial(
