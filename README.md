@@ -15,14 +15,32 @@
 
 ## 月度自进化研究
 
+默认演练是只读研究：必须提供沪深 300 基准，并显式使用 `--dry-run`。运行产物只写入本次 `outputs/evolution_runs/<run_id>/` 目录；不会修改全局影子状态、任何正式 YAML 配置，也不会产生券商订单。
+
 ```powershell
 python run_strong_pullback_evolution.py `
   --config configs/evolution_strong_pullback.yaml `
-  --data data_panel_history_main_chinext_20220101_YYYYMMDD.csv `
-  --asof-date YYYY-MM-DD
+  --data data_panel_history_main_chinext_20220101_20260710.csv `
+  --benchmark D:\codex\daily-market-data\benchmarks\510300.csv `
+  --asof-date 2026-07-10 `
+  --dry-run
 ```
 
 该命令仅供人工或每月研究使用，不接入每日默认流水线，也不会自动修改任何生产配置。
+
+若人工复核后需要更新影子注册表，必须单独、显式执行以下研究命令：
+
+```powershell
+python run_strong_pullback_evolution.py `
+  --config configs/evolution_strong_pullback.yaml `
+  --data data_panel_history_main_chinext_20220101_20260710.csv `
+  --benchmark D:\codex\daily-market-data\benchmarks\510300.csv `
+  --asof-date 2026-07-10 `
+  --no-dry-run `
+  --promote-shadow
+```
+
+即使带有 `--no-dry-run --promote-shadow`，它也只会在资格门槛通过时更新影子注册表 `outputs/evolution_state/strong_pullback.json`；不会修改正式 YAML，也不会产生任何券商订单。
 
 ## 使用说明
 
