@@ -31,10 +31,16 @@ python run_daily_model_pipeline.py --asof-date YYYY-MM-DD --skip-train
 python run_strong_pullback_evolution.py `
   --config configs/evolution_strong_pullback.yaml `
   --data data_panel_history_main_chinext_20220101_YYYYMMDD.csv `
-  --asof-date YYYY-MM-DD
+  --benchmark D:\codex\daily-market-data\benchmarks\510300.csv `
+  --asof-date YYYY-MM-DD `
+  --dry-run
 ```
 
-该命令仅供人工或每月研究使用，不接入每日默认流水线，也不会自动修改任何生产配置。
+这是月度复核认可的验证入口：每个通用核心折都会把全部价格矩阵和市场暴露物理截断到该折 `test_end` 后独立重放，旧版整段验证结果不会充当折外测试结果。已有 shadow 会先在新折上重新评估，任何组赢家必须同时通过旧版验证门槛和通用核心门槛，最终累计参数还要直接对比锁定的起始 champion。
+
+CLI 为遗留或一般纸面研究保留可选 `--benchmark`；省略时市场暴露回退为全程 `1.0`，这种结果不能作为基准化验证证据。任何全局 shadow 状态变更都要求同时使用 `--no-dry-run --promote-shadow`、`--asof-date` 等于面板实际最大日期、且基准覆盖到该日期。可写状态只能位于专用 `evolution_state` 目录；正式 YAML、券商和订单路径始终不在该流程内。
+
+全局状态转换使用同目录的 promotion journal 记录 `pending`、`committed` 或 `rejected`。下一次启动会核对 journal 与实际状态，恢复进程中断后的持久化事实；单次运行清单同时记录耗时、峰值内存和策略代码指纹。
 
 运行前必须确认：
 

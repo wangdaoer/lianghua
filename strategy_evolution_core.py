@@ -22,6 +22,23 @@ class EvolutionStateError(ValueError):
     pass
 
 
+class StateWriteExpectation(Enum):
+    ABSENT = "absent"
+
+
+@dataclass(frozen=True)
+class EvolutionTransitionJournal:
+    schema_version: int
+    status: str
+    operation: str
+    run_id: str
+    experiment_id: str | None
+    target_state_fingerprint: str
+    target_data_asof_date: str | None
+    updated_at: str
+    reason: str | None = None
+
+
 @contextmanager
 def _exclusive_file_lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,6 +232,39 @@ class PromotionPolicy:
     max_drawdown_worsening: float = 0.05
     max_turnover_ratio: float = 1.50
     max_pnl_concentration: float = 0.50
+
+    def __post_init__(self) -> None:
+        for name in ("min_folds", "min_filled_trades_per_fold"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in (
+            "min_positive_fold_ratio",
+            "min_mean_return_improvement",
+            "max_drawdown_floor",
+            "max_drawdown_worsening",
+            "max_turnover_ratio",
+            "max_pnl_concentration",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(f"{name} must be a finite number")
+        if not 0.0 <= self.min_positive_fold_ratio <= 1.0:
+            raise ValueError("min_positive_fold_ratio must be between 0 and 1")
+        if not 0.0 <= self.min_mean_return_improvement <= 1.0:
+            raise ValueError("min_mean_return_improvement must be between 0 and 1")
+        if not -1.0 <= self.max_drawdown_floor <= 0.0:
+            raise ValueError("max_drawdown_floor must be between -1 and 0")
+        if not 0.0 <= self.max_drawdown_worsening <= 1.0:
+            raise ValueError("max_drawdown_worsening must be between 0 and 1")
+        if self.max_turnover_ratio <= 0.0:
+            raise ValueError("max_turnover_ratio must be positive")
+        if not 0.0 <= self.max_pnl_concentration <= 1.0:
+            raise ValueError("max_pnl_concentration must be between 0 and 1")
 
 
 @dataclass(frozen=True)
@@ -411,6 +461,217 @@ def _state_time(now: object | None) -> str:
     raise ValueError("now must be a non-empty string or datetime")
 
 
+def _transition_journal_path(state_path: Path) -> Path:
+    path = Path(state_path)
+    return path.with_name(f"{path.stem}.promotion_journal.json")
+
+
+def _transition_lock_path(state_path: Path) -> Path:
+    path = Path(state_path)
+    return path.with_name(f".{path.name}.transition.lock")
+
+
+def _write_json_atomic(path: Path, payload: object) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    content = json.dumps(
+        _canonicalize(payload), sort_keys=True, ensure_ascii=True, allow_nan=False
+    )
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _journal_from_payload(payload: object) -> EvolutionTransitionJournal:
+    if not isinstance(payload, Mapping):
+        raise EvolutionStateError("Evolution transition journal must be a JSON mapping")
+    expected = {field.name for field in dataclasses.fields(EvolutionTransitionJournal)}
+    actual = set(payload)
+    if actual - expected:
+        raise EvolutionStateError(
+            f"Unknown transition journal fields: {sorted(actual - expected)}"
+        )
+    if expected - actual:
+        raise EvolutionStateError(
+            f"Missing transition journal fields: {sorted(expected - actual)}"
+        )
+    if type(payload.get("schema_version")) is not int or payload.get("schema_version") != 1:
+        raise EvolutionStateError("Unsupported transition journal schema_version")
+    if payload.get("status") not in {"pending", "committed", "rejected"}:
+        raise EvolutionStateError("Invalid transition journal status")
+    if payload.get("operation") not in {"promote", "rollback"}:
+        raise EvolutionStateError("Invalid transition journal operation")
+    for name in ("run_id", "target_state_fingerprint", "updated_at"):
+        value = payload.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise EvolutionStateError(f"Invalid transition journal {name}")
+    experiment_id = payload.get("experiment_id")
+    if experiment_id is not None and (
+        not isinstance(experiment_id, str) or not experiment_id.strip()
+    ):
+        raise EvolutionStateError("Invalid transition journal experiment_id")
+    reason = payload.get("reason")
+    if reason is not None and (not isinstance(reason, str) or not reason.strip()):
+        raise EvolutionStateError("Invalid transition journal reason")
+    try:
+        return EvolutionTransitionJournal(**dict(payload))
+    except TypeError as exc:
+        raise EvolutionStateError(f"Invalid evolution transition journal: {exc}") from exc
+
+
+def load_evolution_transition_journal(
+    state_path: Path,
+) -> EvolutionTransitionJournal | None:
+    journal_path = _transition_journal_path(state_path)
+    if not journal_path.exists():
+        return None
+    try:
+        payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise EvolutionStateError(f"Could not read evolution transition journal: {exc}") from exc
+    return _journal_from_payload(payload)
+
+
+def _stage_evolution_transition_unlocked(
+    state_path: Path,
+    target_state: EvolutionState,
+    *,
+    operation: str,
+    run_id: str,
+    experiment_id: str | None,
+    now: object | None,
+) -> EvolutionTransitionJournal:
+    journal = EvolutionTransitionJournal(
+        schema_version=1,
+        status="pending",
+        operation=operation,
+        run_id=run_id,
+        experiment_id=experiment_id,
+        target_state_fingerprint=fingerprint_payload(target_state),
+        target_data_asof_date=target_state.data_asof_date,
+        updated_at=_state_time(now),
+        reason=None,
+    )
+    journal = _journal_from_payload(_canonicalize(journal))
+    _write_json_atomic(_transition_journal_path(state_path), journal)
+    return journal
+
+
+def stage_evolution_transition(
+    state_path: Path,
+    target_state: EvolutionState,
+    *,
+    operation: str,
+    run_id: str,
+    experiment_id: str | None = None,
+    now: object | None = None,
+) -> EvolutionTransitionJournal:
+    with _exclusive_file_lock(_transition_lock_path(state_path)):
+        return _stage_evolution_transition_unlocked(
+            state_path,
+            target_state,
+            operation=operation,
+            run_id=run_id,
+            experiment_id=experiment_id,
+            now=now,
+        )
+
+
+def _reconcile_evolution_transition_unlocked(
+    state_path: Path,
+    default_state: EvolutionState,
+    *,
+    now: object | None,
+) -> EvolutionTransitionJournal | None:
+    journal = load_evolution_transition_journal(state_path)
+    if journal is None or journal.status != "pending":
+        return journal
+    committed = False
+    if Path(state_path).exists():
+        actual_state = load_evolution_state(Path(state_path), default_state)
+        committed = (
+            fingerprint_payload(actual_state) == journal.target_state_fingerprint
+        )
+    reconciled = dataclasses.replace(
+        journal,
+        status="committed" if committed else "rejected",
+        updated_at=_state_time(now),
+        reason=(
+            "target state fingerprint is committed"
+            if committed
+            else "target state was not committed"
+        ),
+    )
+    _write_json_atomic(_transition_journal_path(state_path), reconciled)
+    return reconciled
+
+
+def reconcile_evolution_transition(
+    state_path: Path,
+    default_state: EvolutionState,
+    *,
+    now: object | None = None,
+) -> EvolutionTransitionJournal | None:
+    with _exclusive_file_lock(_transition_lock_path(state_path)):
+        return _reconcile_evolution_transition_unlocked(
+            state_path, default_state, now=now
+        )
+
+
+def commit_evolution_state_transition(
+    state_path: Path,
+    target_state: EvolutionState,
+    *,
+    operation: str,
+    run_id: str,
+    experiment_id: str | None,
+    expected_previous_fingerprint: str | StateWriteExpectation | None,
+    now: object | None = None,
+) -> str:
+    with _exclusive_file_lock(_transition_lock_path(state_path)):
+        _reconcile_evolution_transition_unlocked(
+            state_path, target_state, now=now
+        )
+        pending = _stage_evolution_transition_unlocked(
+            state_path,
+            target_state,
+            operation=operation,
+            run_id=run_id,
+            experiment_id=experiment_id,
+            now=now,
+        )
+        try:
+            fingerprint = write_evolution_state_atomic(
+                state_path,
+                target_state,
+                expected_previous_fingerprint=expected_previous_fingerprint,
+            )
+        except Exception as exc:
+            rejected = dataclasses.replace(
+                pending,
+                status="rejected",
+                updated_at=_state_time(now),
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+            _write_json_atomic(_transition_journal_path(state_path), rejected)
+            raise
+        committed = dataclasses.replace(
+            pending,
+            status="committed",
+            updated_at=_state_time(now),
+            reason="state CAS committed",
+        )
+        _write_json_atomic(_transition_journal_path(state_path), committed)
+        return fingerprint
+
+
 @dataclass(frozen=True)
 class EvolutionState:
     schema_version: int
@@ -428,13 +689,88 @@ class EvolutionState:
     last_data_fingerprint: str | None = None
     blocked_reason: str | None = None
     updated_at: str | None = None
+    data_asof_date: str | None = None
 
     def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise EvolutionStateError("schema_version must be 1")
+        if not isinstance(self.champion_version, str) or not self.champion_version.strip():
+            raise EvolutionStateError("champion_version must be a non-empty string")
+        if self.shadow_status not in {"none", "shadow", "rolled_back"}:
+            raise EvolutionStateError("shadow_status is invalid")
+        optional_identifiers = (
+            "shadow_version",
+            "shadow_experiment_id",
+            "shadow_run_id",
+            "shadow_data_fingerprint",
+            "previous_champion_version",
+            "last_completed_run_id",
+            "last_data_fingerprint",
+            "blocked_reason",
+        )
+        for name in optional_identifiers:
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise EvolutionStateError(f"{name} must be a non-empty string or null")
+        if not isinstance(self.updated_at, str) or not self.updated_at.strip():
+            raise EvolutionStateError("updated_at must be an aware ISO timestamp")
+        try:
+            parsed_updated_at = datetime.fromisoformat(self.updated_at)
+        except ValueError as exc:
+            raise EvolutionStateError("updated_at must be an aware ISO timestamp") from exc
+        if parsed_updated_at.tzinfo is None or parsed_updated_at.utcoffset() is None:
+            raise EvolutionStateError("updated_at must be an aware ISO timestamp")
+        if self.data_asof_date is not None:
+            try:
+                parsed_asof = date.fromisoformat(self.data_asof_date)
+            except (TypeError, ValueError) as exc:
+                raise EvolutionStateError("data_asof_date must be an ISO date") from exc
+            if parsed_asof.isoformat() != self.data_asof_date:
+                raise EvolutionStateError("data_asof_date must be an ISO date")
+
         object.__setattr__(self, "champion_parameters", _freeze_mapping(self.champion_parameters))
         if self.shadow_parameters is not None:
             object.__setattr__(self, "shadow_parameters", _freeze_mapping(self.shadow_parameters))
         if self.previous_champion_parameters is not None:
             object.__setattr__(self, "previous_champion_parameters", _freeze_mapping(self.previous_champion_parameters))
+        shadow_fields = (
+            self.shadow_version,
+            self.shadow_parameters,
+            self.shadow_experiment_id,
+            self.shadow_run_id,
+            self.shadow_data_fingerprint,
+        )
+        if self.shadow_status == "none":
+            if any(value is not None for value in shadow_fields) or any(
+                value is not None
+                for value in (
+                    self.previous_champion_version,
+                    self.previous_champion_parameters,
+                    self.blocked_reason,
+                )
+            ):
+                raise EvolutionStateError("none state cannot contain shadow lifecycle fields")
+        elif self.shadow_status == "shadow":
+            if any(value is None for value in shadow_fields) or any(
+                value is None
+                for value in (
+                    self.previous_champion_version,
+                    self.previous_champion_parameters,
+                    self.data_asof_date,
+                )
+            ):
+                raise EvolutionStateError("shadow state requires complete lifecycle fields")
+            if self.blocked_reason is not None:
+                raise EvolutionStateError("shadow state cannot contain blocked_reason")
+        else:
+            if any(value is None for value in shadow_fields) or self.blocked_reason is None:
+                raise EvolutionStateError("rolled_back state requires shadow fields and reason")
+            if self.previous_champion_version is not None or self.previous_champion_parameters is not None:
+                raise EvolutionStateError("rolled_back state cannot retain previous champion fields")
+            if self.data_asof_date is None:
+                raise EvolutionStateError("rolled_back state requires data_asof_date")
 
     @classmethod
     def initial(
@@ -504,7 +840,7 @@ def load_evolution_state(path: Path, default_state: EvolutionState) -> Evolution
 def write_evolution_state_atomic(
     path: Path,
     state: EvolutionState,
-    expected_previous_fingerprint: str | None = None,
+    expected_previous_fingerprint: str | StateWriteExpectation | None = None,
 ) -> str:
     if not isinstance(state, EvolutionState):
         raise EvolutionStateError("state must be an EvolutionState")
@@ -517,18 +853,37 @@ def write_evolution_state_atomic(
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f".{path.name}.lock")
     with _exclusive_file_lock(lock_path):
-        if expected_previous_fingerprint is not None:
+        existing_state = load_evolution_state(path, state) if path.exists() else None
+        if expected_previous_fingerprint is StateWriteExpectation.ABSENT:
+            if path.exists():
+                raise EvolutionStateError("expected evolution state to be absent")
+        elif expected_previous_fingerprint is not None:
+            if not isinstance(expected_previous_fingerprint, str):
+                raise EvolutionStateError("invalid previous state expectation")
             if not path.exists():
                 raise EvolutionStateError("previous state fingerprint does not match")
-            actual_previous = fingerprint_payload(load_evolution_state(path, state))
+            assert existing_state is not None
+            actual_previous = fingerprint_payload(existing_state)
             if actual_previous != expected_previous_fingerprint:
                 raise EvolutionStateError("previous state fingerprint does not match")
+        if existing_state is not None and existing_state.data_asof_date is not None:
+            if state.data_asof_date is None:
+                raise EvolutionStateError(
+                    "data_asof_date cannot be removed from evolution state"
+                )
+            if date.fromisoformat(state.data_asof_date) < date.fromisoformat(
+                existing_state.data_asof_date
+            ):
+                raise EvolutionStateError(
+                    "data_asof_date cannot be older than the current evolution state"
+                )
 
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
             with temporary.open("w", encoding="utf-8", newline="\n") as handle:
                 handle.write(payload)
                 handle.flush()
+                os.fsync(handle.fileno())
             temporary.replace(path)
         except Exception:
             temporary.unlink(missing_ok=True)
@@ -543,6 +898,7 @@ def promote_to_shadow(
     experiment_id: str,
     run_id: str,
     data_fingerprint: str,
+    data_asof_date: str,
     now: object | None = None,
 ) -> EvolutionState:
     return EvolutionState(
@@ -561,12 +917,14 @@ def promote_to_shadow(
         last_data_fingerprint=data_fingerprint,
         blocked_reason=None,
         updated_at=_state_time(now),
+        data_asof_date=data_asof_date,
     )
 
 
 def rollback_shadow(
     state: EvolutionState,
     reason: str,
+    data_asof_date: str | None = None,
     now: object | None = None,
 ) -> EvolutionState:
     if not isinstance(reason, str) or not reason.strip():
@@ -593,4 +951,5 @@ def rollback_shadow(
         last_data_fingerprint=state.last_data_fingerprint,
         blocked_reason=reason,
         updated_at=_state_time(now),
+        data_asof_date=data_asof_date or state.data_asof_date,
     )

@@ -15,7 +15,7 @@
 
 ## 月度自进化研究
 
-本验证流程是只读研究：必须显式提供沪深 300 基准并使用 `--dry-run`，不接受省略 `--benchmark` 的验证结果。CLI 本身仍为遗留/一般研究用途保留可选的 `--benchmark`；省略时会回退为全程满仓市场暴露。运行专属产物写入 `<output-root>/<run_id>`（默认 `outputs/evolution_runs/<run_id>`）；成功完成的运行还可能更新 output root 下的 `latest.json` 和 `evolution_registry.jsonl`。即使是 `--dry-run`，它也绝不修改全局影子状态、正式配置或券商/订单。
+本验证流程是只读研究：必须显式提供沪深 300 基准并使用 `--dry-run`，不接受省略 `--benchmark` 的验证结果。CLI 本身仍为遗留/一般纸面研究保留可选的 `--benchmark`；省略时会回退为全程满仓市场暴露，但不能据此更新 shadow。每个通用核心折都会把价格和市场暴露物理截断到该折 `test_end` 后独立重放，折外指标只来自该折测试期。运行专属产物写入 `<output-root>/<run_id>`（默认 `outputs/evolution_runs/<run_id>`）；成功完成的运行还会在跨进程锁下原子更新 output root 下的 `latest.json` 和去重后的 `evolution_registry.jsonl`。即使是 `--dry-run`，它也绝不修改全局影子状态、正式配置或券商/订单。
 
 ```powershell
 python run_strong_pullback_evolution.py `
@@ -40,7 +40,7 @@ python run_strong_pullback_evolution.py `
   --promote-shadow
 ```
 
-即使带有 `--no-dry-run --promote-shadow`，它也只会在资格门槛通过时更新影子注册表 `outputs/evolution_state/strong_pullback.json`；不会修改正式 YAML，也不会产生任何券商订单。
+即使带有 `--no-dry-run --promote-shadow`，它也只会在资格门槛通过、`--asof-date` 等于面板实际最大日期、且基准覆盖该日期时更新影子注册表 `outputs/evolution_state/strong_pullback.json`；自定义状态路径也必须是专用 `evolution_state` 目录下的 JSON。已有 shadow 会先重新评估，失败时按同一 CAS 与审计机制回滚。状态旁的 `strong_pullback.promotion_journal.json` 记录 `pending`、`committed` 或 `rejected`，供下次启动恢复中断事实。该流程不会修改正式 YAML，也不会产生任何券商订单。
 
 ## 使用说明
 

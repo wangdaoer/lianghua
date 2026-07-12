@@ -6,13 +6,73 @@ import pandas as pd
 
 from run_strong_pullback_satellite import (
     apply_rebound_exit,
+    observable_ic_training_window,
     run_satellite_walk_forward,
     select_target_weights,
     should_apply_rebound_exit,
 )
+from execution_rules import next_open_return_label
+from train_next_open_rank_model import daily_ic, normalize_weights
 
 
 class StrongPullbackSatelliteTest(unittest.TestCase):
+    def test_signal_close_ic_fit_excludes_unobservable_future_open_labels(self):
+        dates = pd.bdate_range("2026-01-05", periods=16)
+        symbols = pd.Index([f"{index + 1:06d}" for index in range(40)])
+        symbol_axis = np.arange(len(symbols), dtype=float)
+        open_px = pd.DataFrame(
+            [10.0 + symbol_axis * 0.05 + day * (0.01 + symbol_axis * 0.0002)
+             for day in range(len(dates))],
+            index=dates,
+            columns=symbols,
+        )
+        features = {
+            "ascending": pd.DataFrame(
+                np.tile(symbol_axis, (len(dates), 1)), index=dates, columns=symbols
+            ),
+            "alternating": pd.DataFrame(
+                np.tile((symbol_axis * 17.0) % 41.0, (len(dates), 1)),
+                index=dates,
+                columns=symbols,
+            ),
+        }
+        signal_index = 10
+        train_days = 5
+
+        changed_open = open_px.copy()
+        changed_open.iloc[signal_index + 1] *= pd.Series(
+            np.linspace(1.15, 0.85, len(symbols)), index=symbols
+        )
+        changed_open.iloc[signal_index + 2 :] *= pd.Series(
+            np.linspace(0.80, 1.20, len(symbols)), index=symbols
+        )
+        base_ic = daily_ic(features, next_open_return_label(open_px))
+        changed_ic = daily_ic(features, next_open_return_label(changed_open))
+
+        base_window = observable_ic_training_window(
+            base_ic, signal_index=signal_index, train_days=train_days
+        )
+        changed_window = observable_ic_training_window(
+            changed_ic, signal_index=signal_index, train_days=train_days
+        )
+        base_weights = normalize_weights(base_window.mean())
+        changed_weights = normalize_weights(changed_window.mean())
+        base_signal = sum(
+            features[name].iloc[signal_index] * weight
+            for name, weight in base_weights.items()
+        )
+        changed_signal = sum(
+            features[name].iloc[signal_index] * weight
+            for name, weight in changed_weights.items()
+        )
+
+        self.assertEqual(len(base_window), train_days)
+        self.assertEqual(base_window.index[-1], dates[signal_index - 2])
+        self.assertFalse(base_ic.iloc[signal_index - 1].equals(changed_ic.iloc[signal_index - 1]))
+        pd.testing.assert_frame_equal(base_window, changed_window)
+        pd.testing.assert_series_equal(base_weights, changed_weights)
+        pd.testing.assert_series_equal(base_signal, changed_signal)
+
     def test_trade_audit_symbol_contributions_sum_to_gross_return(self):
         dates = pd.bdate_range("2025-01-01", periods=90)
         symbols = pd.Index(["000001", "000002"])

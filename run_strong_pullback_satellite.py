@@ -199,6 +199,26 @@ def build_daily_candidates(
     )
 
 
+def observable_ic_training_window(
+    ic: pd.DataFrame,
+    *,
+    signal_index: int,
+    train_days: int,
+) -> pd.DataFrame:
+    if isinstance(signal_index, bool) or not isinstance(signal_index, int):
+        raise ValueError("signal_index must be an integer")
+    if isinstance(train_days, bool) or not isinstance(train_days, int) or train_days <= 0:
+        raise ValueError("train_days must be a positive integer")
+    start = signal_index - train_days - 1
+    end = signal_index - 1
+    if start < 0 or end > len(ic):
+        raise ValueError("not enough observable IC rows for signal close")
+    window = ic.iloc[start:end]
+    if len(window) != train_days:
+        raise ValueError("observable IC window does not contain train_days rows")
+    return window
+
+
 def run_satellite_walk_forward(
     close: pd.DataFrame,
     open_px: pd.DataFrame,
@@ -247,15 +267,19 @@ def run_satellite_walk_forward(
         "avg_distance_ma60": np.nan,
     }
 
-    for i in range(train_days, len(close.index) - 2):
+    for i in range(train_days + 1, len(close.index) - 2):
         date = close.index[i]
         rebound_hits: dict[str, str] = {}
-        if (i - train_days) % retrain_frequency == 0:
-            current_weights = normalize_weights(ic.iloc[i - train_days : i].mean())
+        if (i - train_days - 1) % retrain_frequency == 0:
+            current_weights = normalize_weights(
+                observable_ic_training_window(
+                    ic, signal_index=i, train_days=train_days
+                ).mean()
+            )
             weight_rows.append({"date": date.strftime("%Y-%m-%d"), **current_weights.to_dict()})
 
         candidates = pd.DataFrame()
-        if (i - train_days) % rebalance_frequency == 0:
+        if (i - train_days - 1) % rebalance_frequency == 0:
             candidates = build_daily_candidates(
                 features,
                 raw_metrics,

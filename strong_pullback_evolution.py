@@ -316,6 +316,46 @@ def _parse_evolution_core(value: object) -> EvolutionCoreConfig:
     return EvolutionCoreConfig(**integer_values, **number_values)
 
 
+def _parse_selection(value: object) -> SelectionRules:
+    if not isinstance(value, Mapping):
+        raise ValueError("selection must be a mapping")
+    raw = dict(value)
+    unknown = set(raw) - SELECTION_KEYS
+    missing = SELECTION_KEYS - set(raw)
+    if unknown:
+        raise ValueError(f"Unknown selection keys: {sorted(unknown)}")
+    if missing:
+        raise ValueError(f"Missing selection keys: {sorted(missing)}")
+
+    integer_values = {
+        name: _strict_integer(raw[name], name, minimum=1)
+        for name in (
+            "min_validation_days",
+            "min_test_days",
+            "rolling_window_days",
+        )
+    }
+    number_values = {
+        name: _strict_number(raw[name], name)
+        for name in (
+            "max_drawdown_floor",
+            "min_annualized_return_delta",
+            "min_sharpe_delta",
+            "max_turnover_ratio",
+            "max_negative_window_rate",
+        )
+    }
+    if not -1.0 <= number_values["max_drawdown_floor"] <= 0.0:
+        raise ValueError("max_drawdown_floor must be between -1 and 0")
+    if number_values["min_annualized_return_delta"] < 0.0:
+        raise ValueError("min_annualized_return_delta must be non-negative")
+    if number_values["max_turnover_ratio"] < 1.0:
+        raise ValueError("max_turnover_ratio must be >= 1")
+    if not 0.0 <= number_values["max_negative_window_rate"] <= 1.0:
+        raise ValueError("max_negative_window_rate must be between 0 and 1")
+    return SelectionRules(**integer_values, **number_values)
+
+
 def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
     if raw.get("strategy") != "strong_pullback_satellite":
         raise ValueError("strategy must be strong_pullback_satellite")
@@ -371,25 +411,7 @@ def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
             raise ValueError(f"Search group {group_id!r} has no candidates")
         groups.append(SearchGroup(group_id, str(group_raw.get("hypothesis_cn", "")).strip(), tuple(candidates)))
 
-    selection_value = raw.get("selection")
-    if not isinstance(selection_value, Mapping):
-        raise ValueError("selection must be a mapping")
-    selection_raw = dict(selection_value)
-    unknown_selection = set(selection_raw) - SELECTION_KEYS
-    if unknown_selection:
-        raise ValueError(f"Unknown selection keys: {sorted(unknown_selection)}")
-    missing_selection = SELECTION_KEYS - set(selection_raw)
-    if missing_selection:
-        raise ValueError(f"Missing selection keys: {sorted(missing_selection)}")
-    selection = SelectionRules(**selection_raw)
-    if selection.min_validation_days <= 0 or selection.min_test_days <= 0:
-        raise ValueError("minimum period days must be positive")
-    if not -1.0 <= selection.max_drawdown_floor <= 0.0:
-        raise ValueError("max_drawdown_floor must be between -1 and 0")
-    if selection.max_turnover_ratio < 1.0:
-        raise ValueError("max_turnover_ratio must be >= 1")
-    if not 0.0 <= selection.max_negative_window_rate <= 1.0:
-        raise ValueError("max_negative_window_rate must be between 0 and 1")
+    selection = _parse_selection(raw.get("selection"))
     return EvolutionConfig(
         strategy="strong_pullback_satellite",
         evolution_core=evolution_core,
@@ -487,32 +509,39 @@ def build_trading_folds(
 
 
 def _slice_fold_rows(frame: pd.DataFrame, fold: TradingFold | None, date_column: str) -> pd.DataFrame:
-    if fold is None or date_column not in frame:
+    if date_column not in frame:
+        raise ValueError(f"Fold evidence requires {date_column}")
+    if fold is None:
         return frame.copy()
     dates = pd.to_datetime(frame[date_column], errors="coerce")
+    if dates.isna().any():
+        raise ValueError(f"Fold evidence contains invalid {date_column}")
     return frame.loc[dates.isin(fold.test_dates)].copy()
 
 
 def _positive_symbol_contributions(trades: pd.DataFrame) -> dict[str, float]:
     if "symbol_contributions_json" not in trades:
-        return {}
+        raise ValueError("Fold evidence requires symbol_contributions_json")
     totals: dict[str, float] = {}
     for value in trades["symbol_contributions_json"]:
         try:
             contributions = json.loads(value) if isinstance(value, str) else value
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("Malformed symbol_contributions_json") from exc
         if not isinstance(contributions, Mapping):
-            continue
+            raise ValueError("symbol_contributions_json must decode to a mapping")
         for symbol, contribution in contributions.items():
-            try:
-                numeric = float(contribution)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(numeric) and numeric > 0.0:
-                key = str(symbol).zfill(6)
-                totals[key] = totals.get(key, 0.0) + numeric
-    return totals
+            if (
+                isinstance(contribution, bool)
+                or not isinstance(contribution, (int, float))
+                or not math.isfinite(float(contribution))
+            ):
+                raise ValueError(
+                    "symbol_contributions_json values must be finite numbers"
+                )
+            key = str(symbol).zfill(6)
+            totals[key] = totals.get(key, 0.0) + float(contribution)
+    return {symbol: value for symbol, value in totals.items() if value > 0.0}
 
 
 def calculate_fold_metrics(
@@ -525,14 +554,20 @@ def calculate_fold_metrics(
     equity_slice = _slice_fold_rows(equity, fold, "date")
     if equity_slice.empty:
         raise ValueError("Fold contains no equity rows")
+    trades_slice = _slice_fold_rows(trades, fold, "realize_date")
+    if "turnover" not in trades_slice:
+        raise ValueError("Fold evidence requires turnover")
+    turnover = pd.to_numeric(trades_slice["turnover"], errors="coerce")
+    if turnover.isna().any() or not all(math.isfinite(float(value)) for value in turnover):
+        raise ValueError("Fold evidence turnover must contain finite numbers")
+    filled_trades = int(turnover.abs().gt(1e-12).sum())
+    positive_contributions = _positive_symbol_contributions(trades_slice)
     metrics = calculate_segment_metrics(
         equity_slice,
         equity_slice["date"].min(),
         equity_slice["date"].max(),
         rolling_window_days=max(1, len(equity_slice)),
     )
-    trades_slice = _slice_fold_rows(trades, fold, "realize_date")
-    positive_contributions = _positive_symbol_contributions(trades_slice)
     total_positive = sum(positive_contributions.values())
     concentration = (
         max(positive_contributions.values()) / total_positive
@@ -547,27 +582,36 @@ def calculate_fold_metrics(
         total_return=metrics["total_return"],
         max_drawdown=metrics["max_drawdown"],
         sharpe=metrics["sharpe_like"],
-        filled_trades=len(trades_slice),
+        filled_trades=filled_trades,
         average_turnover=metrics["avg_turnover"],
         pnl_concentration=concentration,
     )
 
 
 def run_strong_pullback_folds(
-    panel: pd.DataFrame,
+    panel: object,
     folds: tuple[TradingFold, ...],
-    executor: Callable[[pd.DataFrame, Mapping[str, object]], object],
+    executor: Callable[[object, Mapping[str, object]], object],
     params: Mapping[str, object],
+    *,
+    slicer: Callable[[object, pd.Timestamp], object] | None = None,
 ) -> tuple[tuple[TradingFold, object], ...]:
-    if "date" not in panel:
-        raise ValueError("panel must contain a date column")
-    dates = pd.to_datetime(panel["date"], errors="coerce")
-    if dates.isna().any():
-        raise ValueError("panel contains invalid dates")
+    if slicer is None:
+        if not isinstance(panel, pd.DataFrame) or "date" not in panel:
+            raise ValueError("panel must contain a date column")
+        dates = pd.to_datetime(panel["date"], errors="coerce")
+        if dates.isna().any():
+            raise ValueError("panel contains invalid dates")
+
+        def slice_to_end(value: object, test_end: pd.Timestamp) -> object:
+            assert isinstance(value, pd.DataFrame)
+            return value.loc[dates.le(test_end)].copy()
+    else:
+        slice_to_end = slicer
     return tuple(
         (
             fold,
-            executor(panel.loc[dates.le(fold.test_end)].copy(), params),
+            executor(slice_to_end(panel, fold.test_end), params),
         )
         for fold in folds
     )
@@ -579,6 +623,9 @@ def calculate_segment_metrics(
     end: str | pd.Timestamp,
     rolling_window_days: int,
 ) -> dict[str, float]:
+    rolling_window_days = _positive_window_size(
+        rolling_window_days, "rolling_window_days"
+    )
     frame = equity.copy()
     frame["date"] = pd.to_datetime(frame["date"])
     frame = frame[frame["date"].between(pd.Timestamp(start), pd.Timestamp(end))].sort_values("date")
@@ -592,7 +639,7 @@ def calculate_segment_metrics(
     nav = (1.0 + returns).cumprod()
     total_return = float(nav.iloc[-1] - 1.0)
     annualized = float((1.0 + total_return) ** (252.0 / len(nav)) - 1.0)
-    rolling = nav / nav.shift(int(rolling_window_days)) - 1.0
+    rolling = nav / nav.shift(rolling_window_days) - 1.0
     completed = rolling.dropna()
     negative_rate = float(completed.lt(0.0).mean()) if not completed.empty else 0.0
     worst_rolling = float(completed.min()) if not completed.empty else total_return
