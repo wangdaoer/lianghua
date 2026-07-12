@@ -40,7 +40,7 @@ python run_strong_pullback_evolution.py `
   --promote-shadow
 ```
 
-即使带有 `--no-dry-run --promote-shadow`，它也只会在资格门槛通过、`--asof-date` 等于面板实际最大日期、且基准覆盖该日期时更新影子注册表 `outputs/evolution_state/strong_pullback.json`；自定义状态路径也必须是专用 `evolution_state` 目录下的 JSON。已有 shadow 会先重新评估，失败时按同一 CAS 与审计机制回滚。状态旁的 `strong_pullback.promotion_journal.json` 记录 `pending`、`committed` 或 `rejected`，供下次启动恢复中断事实。该流程不会修改正式 YAML，也不会产生任何券商订单。
+即使带有 `--no-dry-run --promote-shadow`，它也只会在资格门槛通过、`--asof-date` 等于面板实际最大日期、且基准覆盖该日期时更新影子注册表 `outputs/evolution_state/strong_pullback.json`；自定义状态路径也必须是专用 `evolution_state` 目录下的 JSON。已有 shadow 会先重新评估，失败时按同一 CAS 与审计机制回滚。状态旁的 `strong_pullback.promotion_journal.json` 记录 `pending`、`committed` 或 `rejected`，供下次启动恢复中断事实。状态 schema v2 强制保存语义数据日期；缺少该字段的旧 v1 状态会被明确拒绝，必须先人工复核并重建。该流程不会修改正式 YAML，也不会产生任何券商订单。
 
 ## 使用说明
 

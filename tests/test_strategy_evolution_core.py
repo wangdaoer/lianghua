@@ -326,7 +326,7 @@ def test_atomic_state_write_round_trips_and_checks_previous_fingerprint(tmp_path
     [
         (lambda payload: payload.update({"unknown": True}), "Unknown state fields"),
         (lambda payload: payload.pop("champion_version"), "Missing state fields"),
-        (lambda payload: payload.update({"schema_version": 2}), "schema_version"),
+        (lambda payload: payload.update({"schema_version": 1}), "schema_version"),
     ],
 )
 def test_state_load_rejects_unknown_missing_and_unsupported_schema(
@@ -354,7 +354,15 @@ def test_state_load_returns_default_when_file_is_absent(tmp_path):
 
 def test_state_write_rejects_unsupported_schema(tmp_path):
     with pytest.raises(EvolutionStateError, match="schema_version"):
-        replace(EvolutionState.initial("v1", {"leverage": 0.6}), schema_version=2)
+        replace(EvolutionState.initial("v1", {"leverage": 0.6}), schema_version=1)
+
+
+def test_evolution_state_schema_v2_marks_semantic_data_date_contract():
+    state = EvolutionState.initial(
+        "v1", {"leverage": 0.6}, now="2026-07-12T00:00:00+00:00"
+    )
+
+    assert state.schema_version == 2
 
 
 def test_concurrent_writers_with_same_previous_fingerprint_reject_lost_update(tmp_path):

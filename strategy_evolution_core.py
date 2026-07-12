@@ -22,6 +22,9 @@ class EvolutionStateError(ValueError):
     pass
 
 
+EVOLUTION_STATE_SCHEMA_VERSION = 2
+
+
 class StateWriteExpectation(Enum):
     ABSENT = "absent"
 
@@ -692,8 +695,13 @@ class EvolutionState:
     data_asof_date: str | None = None
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
-            raise EvolutionStateError("schema_version must be 1")
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != EVOLUTION_STATE_SCHEMA_VERSION
+        ):
+            raise EvolutionStateError(
+                f"schema_version must be {EVOLUTION_STATE_SCHEMA_VERSION}"
+            )
         if not isinstance(self.champion_version, str) or not self.champion_version.strip():
             raise EvolutionStateError("champion_version must be a non-empty string")
         if self.shadow_status not in {"none", "shadow", "rolled_back"}:
@@ -781,7 +789,7 @@ class EvolutionState:
         now: object | None = None,
     ) -> EvolutionState:
         return cls(
-            schema_version=1,
+            schema_version=EVOLUTION_STATE_SCHEMA_VERSION,
             champion_version=champion_version,
             champion_parameters=_copy_parameters(champion_parameters, "champion_parameters"),
             shadow_status="none",
@@ -816,7 +824,10 @@ def _state_from_payload(payload: object) -> EvolutionState:
         raise EvolutionStateError(f"Unknown state fields: {sorted(unknown)}")
     if missing:
         raise EvolutionStateError(f"Missing state fields: {sorted(missing)}")
-    if type(payload.get("schema_version")) is not int or payload.get("schema_version") != 1:
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != EVOLUTION_STATE_SCHEMA_VERSION
+    ):
         raise EvolutionStateError(
             f"Unsupported state schema_version: {payload.get('schema_version')!r}"
         )
