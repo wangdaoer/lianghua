@@ -15,7 +15,7 @@
 
 ## 月度自进化研究
 
-默认演练是只读研究：必须提供沪深 300 基准，并显式使用 `--dry-run`。运行产物只写入本次 `outputs/evolution_runs/<run_id>/` 目录；不会修改全局影子状态、任何正式 YAML 配置，也不会产生券商订单。
+本验证流程是只读研究：必须显式提供沪深 300 基准并使用 `--dry-run`，不接受省略 `--benchmark` 的验证结果。CLI 本身仍为遗留/一般研究用途保留可选的 `--benchmark`；省略时会回退为全程满仓市场暴露。运行专属产物写入 `<output-root>/<run_id>`（默认 `outputs/evolution_runs/<run_id>`）；成功完成的运行还可能更新 output root 下的 `latest.json` 和 `evolution_registry.jsonl`。即使是 `--dry-run`，它也绝不修改全局影子状态、正式配置或券商/订单。
 
 ```powershell
 python run_strong_pullback_evolution.py `
