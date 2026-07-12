@@ -11,7 +11,12 @@ import pandas as pd
 import pytest
 import yaml
 
-from strategy_evolution_core import EvolutionState, promote_to_shadow
+from strategy_evolution_core import (
+    EvolutionState,
+    load_evolution_state,
+    promote_to_shadow,
+    write_evolution_state_atomic,
+)
 
 from strong_pullback_evolution import (
     DEFAULT_STRATEGY_PARAMS,
@@ -660,6 +665,113 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             "gross_exposure": float(params["leverage"]),
         })
         return StrategyRun(equity, pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+
+    @staticmethod
+    def _eligible_run_for_params(bundle: PriceBundle, params: dict[str, object]) -> StrategyRun:
+        run = EvolutionOrchestrationTest._run_for_params(bundle, params)
+        trades = pd.DataFrame({
+            "symbol_contributions_json": [
+                '{"000001": 0.01, "000002": 0.01}'
+                for _ in range(6)
+            ]
+        })
+        return StrategyRun(run.equity, run.weights, trades, run.candidates)
+
+    @staticmethod
+    def _eligible_config():
+        raw = valid_raw_config()
+        raw["evolution_core"]["min_mean_return_improvement"] = 0.0
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+        })
+        return parse_evolution_config(raw)
+
+    def _run_eligible_promotion(self, root, run_id, **kwargs):
+        data = root / f"{run_id}-panel.csv"
+        config_path = root / f"{run_id}-config.yaml"
+        data.write_text("evidence", encoding="utf-8")
+        config_path.write_text("evidence", encoding="utf-8")
+        return run_evolution(
+            self._eligible_config(), data, config_path, None, pd.Timestamp("2026-07-09"),
+            root / "runs", run_id, False,
+            lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                pd.Timestamp(end_date)
+            ),
+            self._eligible_run_for_params, "test-commit",
+            dry_run=False,
+            promote_shadow=True,
+            state_path=root / "state" / "strong_pullback.json",
+            **kwargs,
+        )
+
+    def test_stale_cas_marks_decision_and_manifest_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", self._eligible_config().baseline,
+                now="2026-07-12T00:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, initial)
+
+            with self.assertRaisesRegex(Exception, "previous state fingerprint"):
+                self._run_eligible_promotion(
+                    root, "stale-cas", expected_previous_fingerprint="stale"
+                )
+
+            run_dir = root / "runs" / "stale-cas"
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            decision = (run_dir / "shadow_decision.md").read_text(encoding="utf-8")
+            self.assertEqual(manifest["promotion_persistence_status"], "rejected")
+            self.assertFalse(manifest["global_state_changed"])
+            self.assertIn("previous state fingerprint", manifest["error"])
+            self.assertIn("rejected", decision)
+            self.assertIn("previous state fingerprint", decision)
+            self.assertEqual(load_evolution_state(state_path, initial), initial)
+
+    def test_eligible_holdout_approved_promotion_commits_audit_and_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            outcome = self._run_eligible_promotion(root, "committed-run")
+
+            state_path = root / "state" / "strong_pullback.json"
+            state = load_evolution_state(
+                state_path, EvolutionState.initial("unused", {"leverage": 0.1})
+            )
+            manifest = json.loads((outcome.run_dir / "manifest.json").read_text(encoding="utf-8"))
+            decision = (outcome.run_dir / "shadow_decision.md").read_text(encoding="utf-8")
+            self.assertEqual(manifest["promotion_persistence_status"], "committed")
+            self.assertTrue(manifest["global_state_changed"])
+            self.assertEqual(state.shadow_run_id, "committed-run")
+            self.assertEqual(state.shadow_experiment_id, manifest["selected_experiment_id"])
+            self.assertIn("committed", decision)
+
+    def test_post_cas_artifact_failure_reconciles_committed_state_truth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            with patch(
+                "run_strong_pullback_evolution.write_chinese_summary",
+                side_effect=RuntimeError("post-CAS artifact failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "post-CAS artifact failed"):
+                    self._run_eligible_promotion(root, "post-cas-failure")
+
+            run_dir = root / "runs" / "post-cas-failure"
+            state_path = root / "state" / "strong_pullback.json"
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            decision = (run_dir / "shadow_decision.md").read_text(encoding="utf-8")
+            state = load_evolution_state(
+                state_path, EvolutionState.initial("unused", {"leverage": 0.1})
+            )
+            self.assertEqual(state.shadow_run_id, "post-cas-failure")
+            self.assertEqual(manifest["promotion_persistence_status"], "committed")
+            self.assertTrue(manifest["global_state_changed"])
+            self.assertIn("post-CAS artifact failed", manifest["error"])
+            self.assertIn("committed", decision)
+            self.assertIn("post-CAS artifact failed", decision)
 
     def test_research_load_finishes_at_validation_end_before_test_load(self):
         config = parse_evolution_config(valid_raw_config())

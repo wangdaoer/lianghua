@@ -7,6 +7,7 @@ import math
 import platform
 import subprocess
 import sys
+import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
@@ -257,6 +258,68 @@ def _json_safe(value: object) -> object:
     return value
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
+    _atomic_write_text(
+        path,
+        json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False, indent=2) + "\n",
+    )
+
+
+def _promotion_decision_markdown(
+    run_id: str,
+    champion_id: str,
+    selected_experiment_id: str | None,
+    persistence_status: str,
+    reason: str,
+) -> str:
+    return "\n".join([
+        "# 影子决定",
+        "",
+        f"- 运行：`{run_id}`",
+        f"- 候选：`{champion_id}`",
+        f"- 实验：`{selected_experiment_id or 'none'}`",
+        f"- 持久化状态：`{persistence_status}`",
+        f"- 全局状态已改变：`{'true' if persistence_status == 'committed' else 'false'}`",
+        f"- 原因：{reason}",
+        "",
+        "正式 YAML 未修改，也未产生任何券商订单。",
+        "",
+    ])
+
+
+def _state_records_promotion(
+    state_path: Path,
+    default_state: EvolutionState,
+    run_id: str,
+    selected_experiment_id: str | None,
+) -> bool:
+    if not selected_experiment_id or not Path(state_path).exists():
+        return False
+    try:
+        state = load_evolution_state(Path(state_path), default_state)
+    except (OSError, ValueError):
+        return False
+    return (
+        state.shadow_status == "shadow"
+        and state.shadow_run_id == run_id
+        and state.shadow_experiment_id == selected_experiment_id
+    )
+
+
 def persist_evolution_outcome(
     run_dir: Path,
     snapshot: EvolutionState,
@@ -306,7 +369,7 @@ def persist_evolution_outcome(
             ) + "\n",
             encoding="utf-8",
         )
-    (run_dir / "shadow_decision.md").write_text(decision_markdown, encoding="utf-8")
+    _atomic_write_text(run_dir / "shadow_decision.md", decision_markdown)
     selected_experiment_id = snapshot.shadow_experiment_id
     eligible_selected_score = any(
         score.get("experiment_id") == selected_experiment_id
@@ -539,6 +602,8 @@ def run_evolution(
     )
     default_state = EvolutionState.initial("baseline", config.baseline)
     input_state = load_evolution_state(resolved_state_path, default_state)
+    selected_experiment_id: str | None = None
+    champion_id = "unselected"
     previous_fingerprint = expected_previous_fingerprint
     if resolved_state_path.exists() and previous_fingerprint is None:
         previous_fingerprint = fingerprint_payload(input_state)
@@ -568,8 +633,11 @@ def run_evolution(
         },
         "benchmark": str(benchmark_path.resolve()) if benchmark_path else None,
         "asof_date": asof_date.strftime("%Y-%m-%d"),
+        "global_state_changed": False,
+        "promotion_persistence_status": "not_started",
+        "selected_experiment_id": None,
     }
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(manifest_path, manifest)
 
     try:
         placeholder_snapshot = replace(
@@ -584,9 +652,8 @@ def run_evolution(
             snapshot=placeholder_snapshot,
             candidate_scores=[],
             experiments=[],
-            decision_markdown=(
-                "# 影子决定\n\n纸面研究尚未完成，未更新全局状态。\n"
-                "正式 YAML 未修改，也未产生任何券商订单。\n"
+            decision_markdown=_promotion_decision_markdown(
+                run_id, champion_id, None, "not_started", "纸面研究尚未完成。"
             ),
             dry_run=True,
             promote_shadow=False,
@@ -901,19 +968,34 @@ def run_evolution(
                 run_id=run_id,
                 data_fingerprint=evidence.data_fingerprint,
             )
-        paper_only = dry_run or not promote_shadow or not shadow_eligible
-        decision_markdown = "\n".join([
-            "# 影子决定",
-            "",
-            f"- 运行：`{run_id}`",
-            f"- 候选：`{champion_id}`",
-            f"- 实验：`{selected_experiment_id or 'none'}`",
-            f"- 状态：`{'paper_only' if paper_only else 'shadow_registry_update'}`",
-            "",
-            "纸面研究，未更新全局状态。" if paper_only else "已按显式授权更新独立影子状态。",
-            "正式 YAML 未修改，也未产生任何券商订单。",
-            "",
-        ])
+        promotion_pending = not dry_run and promote_shadow and shadow_eligible
+        persistence_status = "pending" if promotion_pending else "not_changed"
+        persistence_reason = (
+            "等待影子状态的原子比较并替换。"
+            if promotion_pending
+            else "纸面研究；未满足显式影子晋级持久化条件。"
+        )
+        manifest.update({
+            "champion_id": champion_id,
+            "test_status": test_status,
+            "test_reason": test_reason,
+            "global_state_changed": False,
+            "promotion_persistence_status": persistence_status,
+            "selected_experiment_id": selected_experiment_id,
+            "failed_gates": (
+                list(selected_core_decision.failed_gates)
+                if selected_core_decision is not None
+                else ["no_selected_experiment"]
+            ),
+        })
+        _atomic_write_json(manifest_path, manifest)
+        decision_markdown = _promotion_decision_markdown(
+            run_id,
+            champion_id,
+            selected_experiment_id,
+            persistence_status,
+            persistence_reason,
+        )
         global_state_changed = persist_evolution_outcome(
             run_dir=run_dir,
             snapshot=snapshot,
@@ -925,6 +1007,24 @@ def run_evolution(
             state_path=resolved_state_path,
             expected_previous_fingerprint=previous_fingerprint,
         )
+        if global_state_changed:
+            persistence_status = "committed"
+            persistence_reason = "影子状态 CAS 已提交。"
+        manifest.update({
+            "global_state_changed": global_state_changed,
+            "promotion_persistence_status": persistence_status,
+        })
+        _atomic_write_text(
+            run_dir / "shadow_decision.md",
+            _promotion_decision_markdown(
+                run_id,
+                champion_id,
+                selected_experiment_id,
+                persistence_status,
+                persistence_reason,
+            ),
+        )
+        _atomic_write_json(manifest_path, manifest)
 
         pd.DataFrame(trial_rows).to_csv(run_dir / "trials.csv", index=False, encoding="utf-8-sig")
         pd.DataFrame(round_rows).to_csv(run_dir / "rounds.csv", index=False, encoding="utf-8-sig")
@@ -937,19 +1037,7 @@ def run_evolution(
         summary_path = write_chinese_summary(
             run_dir, asof_date, champion_id, round_rows, final_metrics, test_status, test_reason
         )
-        manifest.update({
-            "champion_id": champion_id,
-            "test_status": test_status,
-            "test_reason": test_reason,
-            "summary": str(summary_path),
-            "global_state_changed": global_state_changed,
-            "selected_experiment_id": selected_experiment_id,
-            "failed_gates": (
-                list(selected_core_decision.failed_gates)
-                if selected_core_decision is not None
-                else ["no_selected_experiment"]
-            ),
-        })
+        manifest["summary"] = str(summary_path)
         if test_status != "ready_for_manual_review":
             raise RuntimeError(f"Holdout test {test_status}: {test_reason}")
 
@@ -957,7 +1045,7 @@ def run_evolution(
             "status": "success",
             "completed_at_utc": datetime.now(timezone.utc).isoformat(),
         })
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(manifest_path, manifest)
         (output_root / "latest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -965,15 +1053,45 @@ def run_evolution(
             handle.write(json.dumps(manifest, ensure_ascii=False) + "\n")
         return EvolutionOutcome(run_id, run_dir, champion_id, champion_params, test_status, test_reason)
     except Exception as exc:
+        error_text = f"{type(exc).__name__}: {exc}"
+        committed = _state_records_promotion(
+            resolved_state_path,
+            input_state,
+            run_id,
+            selected_experiment_id,
+        )
+        prior_persistence_status = str(
+            manifest.get("promotion_persistence_status", "not_started")
+        )
+        if committed:
+            persistence_status = "committed"
+            persistence_reason = f"全局影子状态已提交；后续运行产物失败：{error_text}"
+        elif prior_persistence_status in {"pending", "committed"}:
+            persistence_status = "rejected"
+            persistence_reason = f"影子状态未提交：{error_text}"
+        else:
+            persistence_status = prior_persistence_status
+            persistence_reason = error_text
         manifest.update({
             "status": "failed",
-            "global_state_changed": manifest.get("global_state_changed", False),
-            "selected_experiment_id": manifest.get("selected_experiment_id"),
+            "global_state_changed": committed,
+            "promotion_persistence_status": persistence_status,
+            "selected_experiment_id": selected_experiment_id,
             "failed_gates": manifest.get("failed_gates", ["run_failed"]),
             "failed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": error_text,
         })
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_text(
+            run_dir / "shadow_decision.md",
+            _promotion_decision_markdown(
+                run_id,
+                champion_id,
+                selected_experiment_id,
+                persistence_status,
+                persistence_reason,
+            ),
+        )
+        _atomic_write_json(manifest_path, manifest)
         raise
 
 
