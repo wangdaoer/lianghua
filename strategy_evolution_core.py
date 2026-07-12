@@ -5,9 +5,12 @@ import dataclasses
 import hashlib
 import json
 import math
+import os
 import random
+import time
 import uuid
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -17,6 +20,38 @@ from pathlib import Path
 
 class EvolutionStateError(ValueError):
     pass
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class _FrozenDict(dict[str, object]):
@@ -475,27 +510,29 @@ def write_evolution_state_atomic(
         raise EvolutionStateError("state must be an EvolutionState")
     _state_from_payload(_canonicalize(state))
     path = Path(path)
-    if expected_previous_fingerprint is not None:
-        if not path.exists():
-            raise EvolutionStateError("previous state fingerprint does not match")
-        actual_previous = fingerprint_payload(load_evolution_state(path, state))
-        if actual_previous != expected_previous_fingerprint:
-            raise EvolutionStateError("previous state fingerprint does not match")
-
     payload = json.dumps(
         _canonicalize(state), sort_keys=True, ensure_ascii=True
     )
     fingerprint = fingerprint_payload(state)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-            handle.write(payload)
-            handle.flush()
-        temporary.replace(path)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _exclusive_file_lock(lock_path):
+        if expected_previous_fingerprint is not None:
+            if not path.exists():
+                raise EvolutionStateError("previous state fingerprint does not match")
+            actual_previous = fingerprint_payload(load_evolution_state(path, state))
+            if actual_previous != expected_previous_fingerprint:
+                raise EvolutionStateError("previous state fingerprint does not match")
+
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+                handle.flush()
+            temporary.replace(path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
     return fingerprint
 
 

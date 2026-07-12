@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,7 @@ import pandas as pd
 import pytest
 import yaml
 
-from strategy_evolution_core import EvolutionState
+from strategy_evolution_core import EvolutionState, promote_to_shadow
 
 from strong_pullback_evolution import (
     DEFAULT_STRATEGY_PARAMS,
@@ -468,7 +469,26 @@ class EvolutionAdapterTest(unittest.TestCase):
                 self.assertFalse(state_path.exists())
 
             changed = persist_evolution_outcome(
-                root / "run-promote", snapshot, [], [], "# decision\n",
+                root / "run-ineligible", snapshot,
+                [{"experiment_id": "e1", "status": "rejected"}], [], "# decision\n",
+                dry_run=False, promote_shadow=True, state_path=state_path,
+                expected_previous_fingerprint=None,
+            )
+            self.assertFalse(changed)
+            self.assertFalse(state_path.exists())
+
+            promoted = promote_to_shadow(
+                snapshot,
+                challenger_version="v2",
+                challenger_parameters={"leverage": 0.75},
+                experiment_id="e1",
+                run_id="run-promote",
+                data_fingerprint="data-1",
+            )
+            changed = persist_evolution_outcome(
+                root / "run-promote", promoted,
+                [{"experiment_id": "e1", "status": "eligible_for_shadow"}],
+                [], "# decision\n",
                 dry_run=False, promote_shadow=True, state_path=state_path,
                 expected_previous_fingerprint=None,
             )
@@ -895,13 +915,43 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             snapshot = json.loads(
                 (run_dir / "evolution_state_snapshot.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(snapshot["last_data_fingerprint"], manifest["evidence_fingerprint"])
+            self.assertEqual(snapshot["last_data_fingerprint"], manifest["data_fingerprint"])
             self.assertIn("纸面", (run_dir / "shadow_decision.md").read_text(encoding="utf-8"))
             self.assertFalse(manifest["global_state_changed"])
             self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
             self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())
             summary = Path(manifest["summary"])
             self.assertIn("风险提示", summary.read_text(encoding="utf-8"))
+
+    def test_both_flags_do_not_write_state_for_core_ineligible_challenger(self):
+        raw = valid_raw_config()
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+        })
+        config = parse_evolution_config(raw)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            state_path = root / "state" / "strong_pullback.json"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"), root / "runs",
+                "ineligible-run", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                self._run_for_params, "test-commit",
+                dry_run=False, promote_shadow=True, state_path=state_path,
+            )
+
+            manifest = json.loads((outcome.run_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse(state_path.exists())
+            self.assertFalse(manifest["global_state_changed"])
+            self.assertIn(manifest["failed_gates"][0], {"min_folds", "min_filled_trades", "finite_metrics"})
 
     def test_failed_run_does_not_update_latest_pointer_and_marks_manifest_failed(self):
         config = parse_evolution_config(valid_raw_config())
@@ -970,6 +1020,57 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             experiments = list((run_dir / "experiments").glob("*.json"))
             self.assertEqual(len(experiments), 2)
 
+    def test_content_identical_copied_and_touched_inputs_keep_semantic_identity(self):
+        config = parse_evolution_config(valid_raw_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            first_data = first / "panel.csv"
+            second_data = second / "copied-panel.csv"
+            first_config = first / "config.yaml"
+            second_config = second / "copied-config.yaml"
+            for path, content in (
+                (first_data, "identical panel bytes\n"),
+                (second_data, "identical panel bytes\n"),
+                (first_config, "identical config bytes\n"),
+                (second_config, "identical config bytes\n"),
+            ):
+                path.write_text(content, encoding="utf-8")
+            future = first_data.stat().st_mtime + 3600
+            os.utime(second_data, (future, future))
+            os.utime(second_config, (future, future))
+
+            outcomes = []
+            for label, data_path, config_path in (
+                ("first", first_data, first_config),
+                ("second", second_data, second_config),
+            ):
+                outcomes.append(run_evolution(
+                    config, data_path, config_path, None, pd.Timestamp("2026-07-09"),
+                    root / f"runs-{label}", f"{label}-run", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    self._run_for_params, "test-commit",
+                ))
+
+            manifests = [
+                json.loads((outcome.run_dir / "manifest.json").read_text(encoding="utf-8"))
+                for outcome in outcomes
+            ]
+            self.assertNotEqual(
+                manifests[0]["evidence_fingerprint"], manifests[1]["evidence_fingerprint"]
+            )
+            self.assertEqual(manifests[0]["data_fingerprint"], manifests[1]["data_fingerprint"])
+            experiment_names = [
+                sorted(path.name for path in (outcome.run_dir / "experiments").glob("*.json"))
+                for outcome in outcomes
+            ]
+            self.assertEqual(experiment_names[0], experiment_names[1])
+
     def test_run_refuses_output_root_under_configs_before_writing_yaml(self):
         config = parse_evolution_config(valid_raw_config())
         with tempfile.TemporaryDirectory() as tmp:
@@ -990,6 +1091,51 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 )
 
             self.assertFalse((root / "configs").exists())
+
+    def test_run_rejects_unsafe_run_ids_before_creating_output(self):
+        config = parse_evolution_config(valid_raw_config())
+        unsafe_ids = ("", ".", "..", "../escape", "..\\escape", "nested/run", "nested\\run")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            for run_id in unsafe_ids:
+                with self.subTest(run_id=run_id):
+                    output_root = root / f"runs-{len(run_id)}-{run_id.count('.') }"
+                    with self.assertRaisesRegex(ValueError, "run_id"):
+                        run_evolution(
+                            config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                            output_root, run_id, False,
+                            lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                                pd.Timestamp(end_date)
+                            ),
+                            self._run_for_params, "test-commit",
+                        )
+                    self.assertFalse(output_root.exists())
+
+    def test_run_rejects_absolute_run_id_before_creating_output(self):
+        config = parse_evolution_config(valid_raw_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            output_root = root / "runs"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "run_id"):
+                run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                    output_root, str(root / "absolute-run"), False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    self._run_for_params, "test-commit",
+                )
+            self.assertFalse(output_root.exists())
 
     def test_holdout_rollback_preserves_artifacts_but_does_not_publish(self):
         raw = valid_raw_config()
@@ -1038,6 +1184,9 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                     run_id="rollback-run",
                     resume=False,
                     trial_executor=rollback_executor,
+                    dry_run=False,
+                    promote_shadow=True,
+                    state_path=root / "state" / "strong_pullback.json",
                     **common,
                 )
 
@@ -1045,6 +1194,8 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "failed")
             self.assertEqual(manifest["test_status"], "rollback_recommended")
+            self.assertFalse(manifest["global_state_changed"])
+            self.assertFalse((root / "state" / "strong_pullback.json").exists())
             self.assertTrue((run_dir / "test_comparison.csv").exists())
             self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
             self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())
@@ -1094,6 +1245,9 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                     config=warning_config,
                     run_id="warning-run",
                     resume=False,
+                    dry_run=False,
+                    promote_shadow=True,
+                    state_path=root / "state" / "strong_pullback.json",
                     **common,
                 )
 
@@ -1101,6 +1255,8 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "failed")
             self.assertEqual(manifest["test_status"], "test_warning")
+            self.assertFalse(manifest["global_state_changed"])
+            self.assertFalse((root / "state" / "strong_pullback.json").exists())
             self.assertTrue((run_dir / "test_comparison.csv").exists())
             self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
             self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())

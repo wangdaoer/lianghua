@@ -9,7 +9,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Mapping
 
 import numpy as np
@@ -85,6 +85,14 @@ def stable_hash(value: object) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _file_content_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _group_seed(random_seed: int, group_id: str) -> int:
     return random_seed ^ int(fingerprint_payload({"group_id": group_id})[:16], 16)
 
@@ -108,16 +116,27 @@ class RunEvidence:
     data_path: str
     data_size: int
     data_mtime_ns: int
+    data_content_hash: str
     benchmark_path: str | None
     benchmark_size: int | None
     benchmark_mtime_ns: int | None
+    benchmark_content_hash: str | None
     config_path: str
+    config_content_hash: str
     config_hash: str
     git_commit: str
 
     @property
     def fingerprint(self) -> str:
         return stable_hash(asdict(self))
+
+    @property
+    def data_fingerprint(self) -> str:
+        return stable_hash({
+            "data_content_hash": self.data_content_hash,
+            "benchmark_content_hash": self.benchmark_content_hash,
+            "config_hash": self.config_hash,
+        })
 
 
 @dataclass(frozen=True)
@@ -143,10 +162,13 @@ def build_run_evidence(
         data_path=str(data_path.resolve()),
         data_size=int(stat.st_size),
         data_mtime_ns=int(stat.st_mtime_ns),
+        data_content_hash=_file_content_hash(data_path),
         benchmark_path=str(benchmark_path.resolve()) if benchmark_path else None,
         benchmark_size=int(benchmark_stat.st_size) if benchmark_stat else None,
         benchmark_mtime_ns=int(benchmark_stat.st_mtime_ns) if benchmark_stat else None,
+        benchmark_content_hash=_file_content_hash(benchmark_path) if benchmark_path else None,
         config_path=str(config_path.resolve()),
+        config_content_hash=_file_content_hash(config_path),
         config_hash=stable_hash({
             "strategy": config.strategy,
             "evolution_core": asdict(config.evolution_core),
@@ -199,6 +221,30 @@ def can_resume_trial(
 
 def _state_path_is_config(path: Path) -> bool:
     return any(part.lower() == "configs" for part in path.resolve().parts)
+
+
+def _resolve_run_dir(output_root: Path, run_id: str) -> tuple[Path, Path]:
+    if (
+        not isinstance(run_id, str)
+        or not run_id.strip()
+        or run_id in {".", ".."}
+        or "/" in run_id
+        or "\\" in run_id
+        or Path(run_id).is_absolute()
+        or PureWindowsPath(run_id).is_absolute()
+    ):
+        raise ValueError("run_id must be a non-empty single relative path component")
+    resolved_root = Path(output_root).resolve()
+    resolved_run_dir = (resolved_root / run_id).resolve()
+    try:
+        relative = resolved_run_dir.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError("run_id resolves outside output_root") from exc
+    if len(relative.parts) != 1 or relative.parts[0] in {"", ".", ".."}:
+        raise ValueError("run_id must resolve to one child of output_root")
+    if _state_path_is_config(resolved_run_dir):
+        raise ValueError("run_dir must remain outside configs")
+    return resolved_root, resolved_run_dir
 
 
 def _json_safe(value: object) -> object:
@@ -261,7 +307,19 @@ def persist_evolution_outcome(
             encoding="utf-8",
         )
     (run_dir / "shadow_decision.md").write_text(decision_markdown, encoding="utf-8")
-    if dry_run or not promote_shadow:
+    selected_experiment_id = snapshot.shadow_experiment_id
+    eligible_selected_score = any(
+        score.get("experiment_id") == selected_experiment_id
+        and score.get("status") == "eligible_for_shadow"
+        for score in candidate_scores
+    )
+    if (
+        dry_run
+        or not promote_shadow
+        or snapshot.shadow_status != "shadow"
+        or not selected_experiment_id
+        or not eligible_selected_score
+    ):
         return False
     write_evolution_state_atomic(
         state_path,
@@ -472,7 +530,7 @@ def run_evolution(
 ) -> EvolutionOutcome:
     if _state_path_is_config(output_root):
         raise ValueError("output_root must not be under configs")
-    run_dir = output_root / run_id
+    output_root, run_dir = _resolve_run_dir(output_root, run_id)
     evidence = build_run_evidence(data_path, config_path, config, benchmark_path, git_commit)
     resolved_state_path = (
         Path(state_path)
@@ -500,6 +558,7 @@ def run_evolution(
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "evidence": asdict(evidence),
         "evidence_fingerprint": evidence.fingerprint,
+        "data_fingerprint": evidence.data_fingerprint,
         "python": sys.version,
         "platform": platform.platform(),
         "dependencies": {
@@ -516,7 +575,7 @@ def run_evolution(
         placeholder_snapshot = replace(
             input_state,
             last_completed_run_id=run_id,
-            last_data_fingerprint=evidence.fingerprint,
+            last_data_fingerprint=evidence.data_fingerprint,
             updated_at=datetime.now(timezone.utc).isoformat(),
         )
         (run_dir / "folds.json").write_text("[]\n", encoding="utf-8")
@@ -677,7 +736,7 @@ def run_evolution(
                     "candidate_id": candidate_id,
                     "parent_id": incumbent_id,
                     "parameters": params,
-                    "data_fingerprint": evidence.fingerprint,
+                    "data_fingerprint": evidence.data_fingerprint,
                     "fold_fingerprints": [row["fingerprint"] for row in fold_rows],
                 })[:20]
                 experiment_ids[candidate_id] = experiment_id
@@ -705,7 +764,7 @@ def run_evolution(
                         "candidate_id": candidate_id,
                         "parent_version": incumbent_id,
                         "parameters": params,
-                        "data_fingerprint": evidence.fingerprint,
+                        "data_fingerprint": evidence.data_fingerprint,
                         "fold_metrics": [asdict(metric) for metric in trial_fold_metrics[candidate_id]],
                         "status": core_decision.status,
                         "failed_gates": core_decision.failed_gates,
@@ -733,7 +792,7 @@ def run_evolution(
                         "candidate_id": candidate_id,
                         "parent_version": incumbent_id,
                         "parameters": params,
-                        "data_fingerprint": evidence.fingerprint,
+                        "data_fingerprint": evidence.data_fingerprint,
                         "fold_metrics": [],
                         "status": "trial_error",
                         "failed_gates": ("trial_error",),
@@ -824,24 +883,25 @@ def run_evolution(
         snapshot = replace(
             input_state,
             last_completed_run_id=run_id,
-            last_data_fingerprint=evidence.fingerprint,
+            last_data_fingerprint=evidence.data_fingerprint,
             updated_at=datetime.now(timezone.utc).isoformat(),
         )
-        if (
-            selected_experiment_id is not None
+        shadow_eligible = (
+            bool(selected_experiment_id)
             and selected_core_decision is not None
             and selected_core_decision.status == "eligible_for_shadow"
             and test_status == "ready_for_manual_review"
-        ):
+        )
+        if shadow_eligible:
             snapshot = promote_to_shadow(
                 input_state,
                 challenger_version=champion_id,
                 challenger_parameters=champion_params,
                 experiment_id=selected_experiment_id,
                 run_id=run_id,
-                data_fingerprint=evidence.fingerprint,
+                data_fingerprint=evidence.data_fingerprint,
             )
-        paper_only = dry_run or not promote_shadow
+        paper_only = dry_run or not promote_shadow or not shadow_eligible
         decision_markdown = "\n".join([
             "# 影子决定",
             "",
@@ -860,7 +920,7 @@ def run_evolution(
             candidate_scores=candidate_scores,
             experiments=experiments,
             decision_markdown=decision_markdown,
-            dry_run=dry_run,
+            dry_run=dry_run or not shadow_eligible,
             promote_shadow=promote_shadow,
             state_path=resolved_state_path,
             expected_previous_fingerprint=previous_fingerprint,

@@ -1,5 +1,7 @@
 import json
+import multiprocessing
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +30,23 @@ def _fold(fold_id: str, total_return: float, *, trades: int = 20) -> FoldMetrics
         average_turnover=0.20,
         pnl_concentration=0.30,
     )
+
+
+def _concurrent_state_writer(path, expected_fingerprint, run_id, barrier, results):
+    state = EvolutionState.initial(
+        "v1",
+        {"blob": "x" * 8_000_000},
+        now="2026-07-12T00:00:00+00:00",
+    )
+    state = replace(state, last_completed_run_id=run_id)
+    barrier.wait()
+    try:
+        write_evolution_state_atomic(
+            Path(path), state, expected_previous_fingerprint=expected_fingerprint
+        )
+        results.put(("written", run_id))
+    except EvolutionStateError:
+        results.put(("rejected", run_id))
 
 
 def test_fingerprint_is_canonical_and_sensitive():
@@ -314,3 +333,33 @@ def test_state_write_rejects_unsupported_schema(tmp_path):
 
     with pytest.raises(EvolutionStateError, match="schema_version"):
         write_evolution_state_atomic(tmp_path / "state.json", state)
+
+
+def test_concurrent_writers_with_same_previous_fingerprint_reject_lost_update(tmp_path):
+    path = tmp_path / "state.json"
+    initial = EvolutionState.initial(
+        "v1",
+        {"blob": "x" * 8_000_000},
+        now="2026-07-12T00:00:00+00:00",
+    )
+    previous_fingerprint = write_evolution_state_atomic(path, initial)
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_concurrent_state_writer,
+            args=(str(path), previous_fingerprint, run_id, barrier, results),
+        )
+        for run_id in ("run-a", "run-b")
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+
+    outcomes = sorted(results.get(timeout=5)[0] for _ in processes)
+    assert outcomes == ["rejected", "written"]
+    assert load_evolution_state(path, initial).last_completed_run_id in {"run-a", "run-b"}
