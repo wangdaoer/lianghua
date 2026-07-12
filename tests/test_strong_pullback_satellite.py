@@ -1,6 +1,7 @@
 import json
 import unittest
 
+import numpy as np
 import pandas as pd
 
 from run_strong_pullback_satellite import (
@@ -13,19 +14,24 @@ from run_strong_pullback_satellite import (
 
 class StrongPullbackSatelliteTest(unittest.TestCase):
     def test_trade_audit_symbol_contributions_sum_to_gross_return(self):
-        dates = pd.bdate_range("2025-01-01", periods=8)
+        dates = pd.bdate_range("2025-01-01", periods=90)
         symbols = pd.Index(["000001", "000002"])
-        close = pd.DataFrame(10.0, index=dates, columns=symbols)
-        open_px = close.copy()
+        rising = 10.0 * np.power(1.02, np.arange(61))
+        pullback = rising[-1] * np.power(0.99, np.arange(1, 30))
+        close = pd.DataFrame(
+            {"000001": np.concatenate((rising, pullback)), "000002": np.concatenate((rising * 1.01, pullback * 1.01))},
+            index=dates,
+        )
+        open_px = close * 0.998
         high = close * 1.01
         low = close * 0.99
-        amount = close * 1_000_000.0
+        amount = pd.DataFrame(50_000_000.0, index=dates, columns=symbols)
         market_exposure = pd.Series(1.0, index=dates)
 
         _, _, trades, _ = run_satellite_walk_forward(
             close, open_px, high, low, amount,
-            train_days=1,
-            retrain_frequency=1,
+            train_days=65,
+            retrain_frequency=5,
             top_n=1,
             rebalance_frequency=1,
             max_position_weight=0.6,
@@ -33,26 +39,17 @@ class StrongPullbackSatelliteTest(unittest.TestCase):
             min_score=None,
             commission_bps=0.0,
             impact_bps=0.0,
-            max_buy_open_gap=1.0,
+            max_buy_open_gap=0.05,
             limit_buffer=1.0,
             market_exposure=market_exposure,
             initial_capital=1_000_000.0,
-            filter_kwargs={
-                "min_close": 0.0,
-                "min_avg_amount_20d": 0.0,
-                "min_pullback_5d": -1.0,
-                "max_pullback_5d": 1.0,
-                "min_prior_return_20": -1.0,
-                "min_prior_return_60": -1.0,
-                "min_return_20d": -1.0,
-                "min_return_60d": -1.0,
-                "min_distance_ma60": -1.0,
-                "max_intraday_return": 1.0,
-            },
+            filter_kwargs={},
         )
 
-        for row in trades.itertuples():
-            self.assertAlmostEqual(sum(json.loads(row.symbol_contributions_json).values()), row.gross_return)
+        contributions = [json.loads(row.symbol_contributions_json) for row in trades.itertuples()]
+        self.assertTrue(any(any(value != 0.0 for value in row.values()) for row in contributions))
+        for row, contribution in zip(trades.itertuples(), contributions):
+            self.assertAlmostEqual(sum(contribution.values()), row.gross_return)
 
     def test_selects_top_candidates_with_leverage_cap(self):
         candidates = pd.DataFrame(
