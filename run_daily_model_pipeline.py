@@ -18,7 +18,7 @@ DEFAULT_DAILY_DATA_DIR = Path(r"D:\codex\daily-market-data")
 DEFAULT_FALLBACK_DATA_DIR = Path(r"D:\codex\2026-06-15-exchange-data-ingest")
 DEFAULT_DAILY_NORMALIZED_DIR = DEFAULT_DAILY_DATA_DIR / "ths_exports" / "normalized"
 DEFAULT_FETCH_STATUS_UTILS = DEFAULT_FALLBACK_DATA_DIR / "scripts" / "market_data_utils.py"
-DEFAULT_BENCHMARK = Path(r"D:\codex\量化\data\processed\510300.csv")
+DEFAULT_BENCHMARK = DEFAULT_DAILY_DATA_DIR / "benchmarks" / "510300.csv"
 DEFAULT_ALLOWED_TREND_STATES = "趋势确认,生命线健康,回调可观察"
 
 
@@ -59,6 +59,9 @@ class PipelineConfig:
     allowed_trend_states: str = DEFAULT_ALLOWED_TREND_STATES
     include_strategy_stability_report: bool = True
     include_strategy_family_forward_report: bool = True
+    include_regime_shadow_compare: bool = True
+    regime_shadow_config: Path = Path("configs/evolution_strong_pullback.yaml")
+    regime_shadow_candidate_id: str = "regime_090_balanced"
 
 
 def _date_token(asof_date: str) -> str:
@@ -82,6 +85,15 @@ def _read_csv_rows(path: Path) -> list[dict[str, str]]:
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected JSON object: {path}")
+    return value
 
 
 def _value_counts(rows: list[dict[str, str]], column: str) -> dict[str, int]:
@@ -138,6 +150,14 @@ def fetch_status_summary(fetch_status_utils: Path) -> dict[str, object]:
         return result if isinstance(result, dict) else {"status": "ok", "value": result}
     except Exception as exc:
         return {"status": "status_error", "path": str(fetch_status_utils), "message": str(exc)}
+
+
+def ensure_fetch_status_ok(status: dict[str, object]) -> None:
+    if status.get("status") != "ok":
+        raise RuntimeError(
+            "Daily market data fetch status is not ready: "
+            + json.dumps(status, ensure_ascii=False, default=str)
+        )
 
 
 def latest_daily_date(files: list[Path]) -> str:
@@ -218,6 +238,9 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "rules": _resolve(root, config.rules),
         "strategy_stability_prefix": output_root / f"core_risk_filter_finalist_stability_{token}",
         "strategy_stability_report": output_root / f"core_risk_filter_finalist_stability_{token}.md",
+        "regime_shadow_dir": output_root / f"regime_shadow_compare_{token}",
+        "regime_shadow_report": output_root / f"regime_shadow_compare_{token}" / "report.md",
+        "regime_shadow_comparison": output_root / f"regime_shadow_compare_{token}" / "comparison.json",
     }
 
 
@@ -259,6 +282,30 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
             ),
         ),
     ]
+    if config.include_regime_shadow_compare:
+        steps.append(
+            PipelineStep(
+                "regime_shadow_compare",
+                (
+                    config.python_exe,
+                    str(config.project_root / "run_daily_regime_shadow_compare.py"),
+                    "--config",
+                    str(_resolve(config.project_root, config.regime_shadow_config)),
+                    "--data",
+                    str(paths["panel"]),
+                    "--benchmark",
+                    str(config.benchmark),
+                    "--output-dir",
+                    str(paths["regime_shadow_dir"]),
+                    "--asof-date",
+                    config.asof_date,
+                    "--candidate-id",
+                    config.regime_shadow_candidate_id,
+                    "--python",
+                    config.python_exe,
+                ),
+            )
+        )
     if config.train_model:
         steps.append(
             PipelineStep(
@@ -516,6 +563,15 @@ def build_daily_run_state(
     strategy_family_health_rows = _read_csv_rows(strategy_family_health_path)
     selected_rows = _read_csv_rows(selected_path)
     change_rows = _read_csv_rows(changes_path)
+    regime_shadow = _read_json_object(paths["regime_shadow_comparison"])
+    regime_delta = regime_shadow.get("delta")
+    if not isinstance(regime_delta, dict):
+        regime_delta = {}
+    regime_latest = regime_shadow.get("latest_dynamic_state")
+    if not isinstance(regime_latest, dict):
+        regime_latest = {}
+    if regime_shadow.get("benchmark_fresh") is not True:
+        regime_latest = {}
     return {
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
         "asof_date": config.asof_date,
@@ -543,6 +599,13 @@ def build_daily_run_state(
             "strategy_family_health_counts": _value_counts(strategy_family_health_rows, "family_health_status"),
             "selected_rows": len(selected_rows),
             "change_rows": len(change_rows),
+            "regime_shadow_decision": regime_shadow.get("decision"),
+            "regime_shadow_risk_regime": regime_latest.get("risk_regime"),
+            "regime_shadow_target_leverage": regime_latest.get("target_leverage"),
+            "regime_shadow_total_return_delta": regime_delta.get("total_return"),
+            "regime_shadow_max_drawdown_delta": regime_delta.get("max_drawdown"),
+            "regime_shadow_benchmark_last_date": regime_shadow.get("benchmark_last_date"),
+            "regime_shadow_benchmark_fresh": regime_shadow.get("benchmark_fresh"),
         },
         "top10": _top_rows(priority_rows, ["symbol", "stock_name", "strategy_family", "priority_bucket"]),
         "artifacts": {
@@ -558,6 +621,8 @@ def build_daily_run_state(
             "strategy_family_forward_summary": str(strategy_family_summary_path),
             "strategy_family_health": str(strategy_family_health_path),
             "stability_report": str(_latest_artifact(paths["strategy_stability_report"])),
+            "regime_shadow_report": str(_latest_artifact(paths["regime_shadow_report"])),
+            "regime_shadow_comparison": str(_latest_artifact(paths["regime_shadow_comparison"])),
         },
     }
 
@@ -586,6 +651,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-strategy-family-forward", action="store_true")
     parser.add_argument("--skip-strategy-stability", action="store_true")
+    parser.add_argument("--skip-regime-shadow-compare", action="store_true")
+    parser.add_argument("--regime-shadow-config", default="configs/evolution_strong_pullback.yaml")
+    parser.add_argument("--regime-shadow-candidate-id", default="regime_090_balanced")
     parser.add_argument("--state-log", default="daily_run_state.jsonl")
     parser.add_argument("--state-test-status", default="not_run_by_pipeline")
     parser.add_argument("--skip-state-log", action="store_true")
@@ -616,7 +684,15 @@ def main() -> None:
         train_model=not args.skip_train,
         include_strategy_family_forward_report=not args.skip_strategy_family_forward,
         include_strategy_stability_report=not args.skip_strategy_stability,
+        include_regime_shadow_compare=not args.skip_regime_shadow_compare,
+        regime_shadow_config=Path(args.regime_shadow_config),
+        regime_shadow_candidate_id=args.regime_shadow_candidate_id,
     )
+    fetch_status = fetch_status_summary(config.fetch_status_utils)
+    print("Daily market data fetch status:")
+    print(json.dumps(fetch_status, ensure_ascii=False, indent=2, default=str))
+    if not args.dry_run:
+        ensure_fetch_status_ok(fetch_status)
     steps = build_daily_pipeline_steps(config)
     run_steps(steps, project_root, dry_run=args.dry_run)
     state_log = _resolve(project_root, Path(args.state_log))
@@ -642,6 +718,8 @@ def main() -> None:
         print(output_root / f"strategy_family_forward_report_{token}.md")
     if config.include_strategy_stability_report:
         print(output_root / f"core_risk_filter_finalist_stability_{token}.md")
+    if config.include_regime_shadow_compare:
+        print(output_root / f"regime_shadow_compare_{token}" / "report.md")
     if not args.dry_run and not args.skip_state_log:
         print("Daily run state:")
         print(state_log)
