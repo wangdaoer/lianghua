@@ -13,6 +13,35 @@
 
 > 说明：本框架为研究用途示例，不构成投资建议；请先在纸面环境复核。
 
+## 月度自进化研究
+
+本验证流程是只读研究：必须显式提供沪深 300 基准并使用 `--dry-run`，不接受省略 `--benchmark` 的验证结果。CLI 本身仍为遗留/一般纸面研究保留可选的 `--benchmark`；省略时会回退为全程满仓市场暴露，但不能据此更新 shadow。默认时间契约把参数选择限制在 2025-01-01 至 2025-06-30；该区间按实际 A 股日历有 117 个交易日，因此整段选择门槛使用 `min_validation_days: 100`，允许少量停牌或数据缺口，同时使用 `rolling_window_days: 63` 产生 54 个完整滚动窗口。回撤、Sharpe、换手率、负窗口率以及通用核心门槛均未因可行性修正而降低。每个组赢家必须同时通过整段旧版选择门槛和仅使用该选择期非重叠分段的通用硬门槛，才能成为下一组父参数。候选路径锁定后，才在 2025-07-01 至 2025-12-31 的独立非重叠核心测试段上直接比较锁定候选与起始 champion；只有核心门槛通过后才打开 2026-01-01 起的最终保留集。每个选择/核心测试段都会把价格和市场暴露物理截断到该段 `test_end` 后独立重放，指标只来自该段日期。时间划分只由 `periods` 中的互斥日期边界决定；旧 `evolution_core.train_days`、`validation_days`、`test_days`、`step_days` 字段已从严格 schema 删除，继续提供会被明确拒绝。运行专属产物写入 `<output-root>/<run_id>`（默认 `outputs/evolution_runs/<run_id>`）；成功完成的运行还会在跨进程锁下原子更新 output root 下的 `latest.json` 和去重后的 `evolution_registry.jsonl`。即使是 `--dry-run`，它也绝不修改全局影子状态、正式配置或券商/订单。
+
+```powershell
+python run_strong_pullback_evolution.py `
+  --config configs/evolution_strong_pullback.yaml `
+  --data data_panel_history_main_chinext_20220101_20260710.csv `
+  --benchmark D:\codex\daily-market-data\benchmarks\510300.csv `
+  --asof-date 2026-07-10 `
+  --dry-run
+```
+
+该命令仅供人工或每月研究使用，不接入每日默认流水线，也不会自动修改任何生产配置。
+
+若人工复核后需要更新影子注册表，必须单独、显式执行以下研究命令：
+
+```powershell
+python run_strong_pullback_evolution.py `
+  --config configs/evolution_strong_pullback.yaml `
+  --data data_panel_history_main_chinext_20220101_20260710.csv `
+  --benchmark D:\codex\daily-market-data\benchmarks\510300.csv `
+  --asof-date 2026-07-10 `
+  --no-dry-run `
+  --promote-shadow
+```
+
+即使带有 `--no-dry-run --promote-shadow`，它也只会在资格门槛通过、`--asof-date` 等于面板原始最大日期、且清洗后的全部价格矩阵和基准有效序列都以有限数值实际到达该日期时更新影子注册表 `outputs/evolution_state/strong_pullback.json`；状态保存的是这个有效加载日期。自定义状态路径也必须是专用 `evolution_state` 目录下的 JSON。已有 shadow 会先重新评估；选择期、锁定核心测试或最终保留集给出失败结论时，按适用阶段先以独立 CAS/journal 事件持久化回滚并立即结束本次运行，替代候选不能在同一运行晋级。状态旁的 `strong_pullback.promotion_journal.json` 记录 `pending`、`committed` 或 `rejected`；下次启动会恢复 pending 事实，也会把已 committed 但尚未完成清单/决定发布的运行幂等收尾。状态 schema v2 强制保存语义数据日期；缺少该字段的旧 v1 状态会被明确拒绝，必须先人工复核并重建。该流程不会修改正式 YAML，也不会产生任何券商订单。
+
 ## 使用说明
 
 1. 准备日线数据文件 `csv`，至少包含：

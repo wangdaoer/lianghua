@@ -1,0 +1,4216 @@
+import copy
+import json
+import multiprocessing
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
+import pytest
+import yaml
+
+import run_strong_pullback_evolution as evolution_runner
+import strategy_evolution_core as evolution_core
+import strong_pullback_evolution as evolution_adapter
+
+from strategy_evolution_core import (
+    EvolutionState,
+    PromotionPolicy as CorePromotionPolicy,
+    evaluate_candidate as evaluate_core_candidate,
+    load_evolution_state,
+    load_evolution_transition_journal,
+    promote_to_shadow,
+    stage_evolution_transition,
+    write_evolution_state_atomic,
+)
+
+from strong_pullback_evolution import (
+    DEFAULT_STRATEGY_PARAMS,
+    TradingFold,
+    assess_test_result,
+    SearchCandidate,
+    SearchGroup,
+    build_trading_folds,
+    build_group_candidates,
+    calculate_fold_metrics,
+    calculate_segment_metrics,
+    choose_group_winner,
+    evaluate_promotion,
+    load_evolution_config,
+    parse_evolution_config,
+    run_strong_pullback_folds,
+)
+from run_strong_pullback_evolution import (
+    PriceBundle,
+    StrategyRun,
+    can_resume_trial,
+    evaluate_strategy_folds,
+    execute_strategy_trial,
+    load_price_bundle,
+    load_trial_artifacts,
+    parse_args,
+    persist_evolution_outcome,
+    publish_run_metadata,
+    run_evolution,
+    validate_input_schema,
+    write_trial_artifacts,
+)
+
+
+def _publish_metadata_worker(output_root, run_id, barrier):
+    barrier.wait()
+    publish_run_metadata(
+        Path(output_root),
+        {
+            "run_id": run_id,
+            "status": "success",
+            "completed_at_utc": f"2026-07-12T00:00:0{run_id[-1]}+00:00",
+        },
+    )
+
+
+def valid_raw_config() -> dict[str, object]:
+    return {
+        "strategy": "strong_pullback_satellite",
+        "evolution_core": {
+            "max_candidates_per_group": 8,
+            "random_seed": 20260712,
+            "min_folds": 3,
+            "min_filled_trades_per_fold": 5,
+            "min_positive_fold_ratio": 0.6666666667,
+            "min_mean_return_improvement": 0.01,
+            "max_drawdown_floor": -0.40,
+            "max_drawdown_worsening": 0.05,
+            "max_turnover_ratio": 1.50,
+            "max_pnl_concentration": 0.50,
+        },
+        "periods": {
+            "research_start": "2022-01-01",
+            "train_end": "2024-12-31",
+            "validation_start": "2025-01-01",
+            "validation_end": "2025-06-30",
+            "core_test_start": "2025-07-01",
+            "core_test_end": "2025-12-31",
+            "test_start": "2026-01-01",
+            "test_end": None,
+        },
+        "baseline": {"top_n": 8, "leverage": 0.60, "max_position_weight": 0.08},
+        "search_groups": [
+            {
+                "id": "risk_budget",
+                "hypothesis_cn": "扩大风险预算",
+                "candidates": [
+                    {"id": "risk_075", "overrides": {"leverage": 0.75}},
+                    {"id": "risk_090", "overrides": {"leverage": 0.90}},
+                ],
+            }
+        ],
+        "selection": {
+            "min_validation_days": 120,
+            "min_test_days": 60,
+            "max_drawdown_floor": -0.40,
+            "min_annualized_return_delta": 0.01,
+            "min_sharpe_delta": -0.10,
+            "max_turnover_ratio": 1.50,
+            "rolling_window_days": 126,
+            "max_negative_window_rate": 0.60,
+        },
+    }
+
+
+class EvolutionCliTest(unittest.TestCase):
+    def test_cli_requires_explicit_data_path(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--config", "configs/evolution_strong_pullback.yaml"])
+
+    def test_default_config_parses_and_has_three_hypothesis_groups(self):
+        config = load_evolution_config(Path("configs/evolution_strong_pullback.yaml"))
+
+        self.assertEqual(
+            [group.group_id for group in config.search_groups],
+            ["risk_budget", "entry_depth", "rebound_exit"],
+        )
+        self.assertEqual(config.selection.max_drawdown_floor, -0.40)
+        self.assertEqual(config.selection.min_validation_days, 100)
+        self.assertEqual(config.selection.rolling_window_days, 63)
+        for removed_field in (
+            "train_days", "validation_days", "test_days", "step_days"
+        ):
+            self.assertFalse(hasattr(config.evolution_core, removed_field))
+        self.assertEqual(config.evolution_core.random_seed, 20260712)
+        self.assertEqual(config.evolution_core.min_positive_fold_ratio, 0.6666666667)
+        self.assertEqual(config.periods.validation_end, pd.Timestamp("2025-06-30"))
+        self.assertEqual(config.periods.core_test_start, pd.Timestamp("2025-07-01"))
+        self.assertEqual(config.periods.core_test_end, pd.Timestamp("2025-12-31"))
+
+    def test_cli_defaults_to_dry_run_and_requires_explicit_shadow_promotion(self):
+        args = parse_args([
+            "--config", "configs/evolution_strong_pullback.yaml",
+            "--data", "panel.csv",
+        ])
+
+        self.assertTrue(args.dry_run)
+        self.assertFalse(args.promote_shadow)
+        explicit = parse_args([
+            "--config", "configs/evolution_strong_pullback.yaml",
+            "--data", "panel.csv",
+            "--no-dry-run",
+            "--promote-shadow",
+        ])
+        self.assertFalse(explicit.dry_run)
+        self.assertTrue(explicit.promote_shadow)
+
+    def test_real_engine_evolution_writes_versioned_outputs(self):
+        dates = pd.bdate_range("2024-01-02", periods=150)
+        raw = valid_raw_config()
+        raw["periods"] = {
+            "research_start": dates[0].strftime("%Y-%m-%d"),
+            "train_end": dates[89].strftime("%Y-%m-%d"),
+            "validation_start": dates[90].strftime("%Y-%m-%d"),
+            "validation_end": dates[109].strftime("%Y-%m-%d"),
+            "core_test_start": dates[110].strftime("%Y-%m-%d"),
+            "core_test_end": dates[129].strftime("%Y-%m-%d"),
+            "test_start": dates[130].strftime("%Y-%m-%d"),
+            "test_end": dates[-1].strftime("%Y-%m-%d"),
+        }
+        raw["baseline"].update({
+            "train_days": 65,
+            "retrain_frequency": 10,
+            "top_n": 4,
+            "rebalance_frequency": 5,
+            "max_position_weight": 0.20,
+            "leverage": 0.60,
+            "min_avg_amount_20d": 1.0,
+            "min_pullback_5d": 0.0,
+            "max_pullback_5d": 1.0,
+            "min_prior_return_20": -1.0,
+            "min_prior_return_60": -1.0,
+            "min_return_20d": -1.0,
+            "min_return_60d": -1.0,
+            "min_distance_ma60": -1.0,
+            "max_intraday_return": 1.0,
+        })
+        raw["search_groups"] = [{
+            "id": "risk_budget",
+            "hypothesis_cn": "合成样本风险预算测试",
+            "candidates": [{"id": "risk_065", "overrides": {"leverage": 0.65}}],
+        }]
+        raw["selection"].update({
+            "min_validation_days": 20,
+            "min_test_days": 15,
+            "max_drawdown_floor": -0.90,
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 10.0,
+            "rolling_window_days": 10,
+            "max_negative_window_rate": 1.0,
+        })
+        rows: list[dict[str, object]] = []
+        for symbol_index in range(32):
+            symbol = f"{symbol_index + 1:06d}"
+            for day_index, date in enumerate(dates):
+                base = 8.0 + symbol_index * 0.08
+                close = base * (1.0 + day_index * 0.001) * (
+                    1.0 + 0.03 * np.sin(day_index / 6.0 + symbol_index * 0.2)
+                )
+                open_price = close * (1.0 - 0.002 * np.cos(day_index / 5.0))
+                volume = 1_000_000.0 + symbol_index * 1_000.0
+                rows.append({
+                    "date": date,
+                    "symbol": symbol,
+                    "open": open_price,
+                    "high": max(open_price, close) * 1.01,
+                    "low": min(open_price, close) * 0.99,
+                    "close": close,
+                    "volume": volume,
+                    "amount": volume * close,
+                })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_path = root / "panel.csv"
+            config_path = root / "evolution.yaml"
+            pd.DataFrame(rows).to_csv(data_path, index=False)
+            config_path.write_text(
+                yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
+            )
+            config = load_evolution_config(config_path)
+            outcome = run_evolution(
+                config=config,
+                data_path=data_path,
+                config_path=config_path,
+                benchmark_path=None,
+                asof_date=dates[-1],
+                output_root=root / "runs",
+                run_id="real-engine-smoke",
+                resume=False,
+                git_commit="test-commit",
+            )
+
+            self.assertTrue((outcome.run_dir / "manifest.json").exists())
+            self.assertTrue((outcome.run_dir / "champion_candidate.yaml").exists())
+            self.assertTrue((outcome.run_dir / "test_comparison.csv").exists())
+            if outcome.test_status == "ready_for_manual_review":
+                self.assertTrue(
+                    (outcome.run_dir / "final" / "baseline" / "equity_curve.csv").exists()
+                )
+            else:
+                self.assertTrue(outcome.test_status.startswith("not_opened_"))
+
+
+class EvolutionConfigTest(unittest.TestCase):
+    def test_rejects_unknown_fields_at_every_config_mapping_level(self):
+        mutations = {
+            "top_level": lambda raw: raw.__setitem__("future_top", True),
+            "periods": lambda raw: raw["periods"].__setitem__("future_period", True),
+            "baseline": lambda raw: raw["baseline"].__setitem__("future_baseline", True),
+            "selection": lambda raw: raw["selection"].__setitem__("future_selection", True),
+            "evolution_core": lambda raw: raw["evolution_core"].__setitem__("future_core", True),
+            "search_group": lambda raw: raw["search_groups"][0].__setitem__("future_group", True),
+            "candidate": lambda raw: raw["search_groups"][0]["candidates"][0].__setitem__(
+                "future_candidate", True
+            ),
+        }
+        for level, mutate in mutations.items():
+            with self.subTest(level=level):
+                raw = valid_raw_config()
+                mutate(raw)
+                with self.assertRaisesRegex(ValueError, "Unknown"):
+                    parse_evolution_config(raw)
+
+    def test_rejects_windows_reserved_device_names_with_extensions_and_trailing_forms(self):
+        device_names = (
+            "CON", "con.txt", "PRN.log", "AUX ", "NUL.",
+            "COM1", "com9.json", "LPT1", "lpt9.tmp",
+        )
+        for field, label in (("group", "Group id"), ("candidate", "Candidate id")):
+            for device_name in device_names:
+                with self.subTest(field=field, device_name=device_name):
+                    raw = valid_raw_config()
+                    if field == "group":
+                        raw["search_groups"][0]["id"] = device_name
+                    else:
+                        raw["search_groups"][0]["candidates"][0]["id"] = device_name
+                    with self.assertRaisesRegex(ValueError, label):
+                        parse_evolution_config(raw)
+
+    def test_requires_disjoint_selection_core_and_holdout_periods(self):
+        raw = valid_raw_config()
+        raw["periods"].update({
+            "validation_end": "2025-06-30",
+            "core_test_start": "2025-07-01",
+            "core_test_end": "2025-12-31",
+        })
+
+        periods = parse_evolution_config(raw).periods
+
+        self.assertEqual(periods.validation_end, pd.Timestamp("2025-06-30"))
+        self.assertEqual(periods.core_test_start, pd.Timestamp("2025-07-01"))
+        self.assertEqual(periods.core_test_end, pd.Timestamp("2025-12-31"))
+
+        raw["periods"]["core_test_start"] = "2025-06-30"
+        with self.assertRaisesRegex(
+            ValueError,
+            "validation_end < core_test_start <= core_test_end < test_start",
+        ):
+            parse_evolution_config(raw)
+
+    def test_rejects_missing_and_unknown_evolution_core_keys(self):
+        raw = valid_raw_config()
+        del raw["evolution_core"]["max_candidates_per_group"]
+        with self.assertRaisesRegex(ValueError, "Missing evolution_core keys"):
+            parse_evolution_config(raw)
+
+        raw = valid_raw_config()
+        raw["evolution_core"]["future_rule"] = 1
+        with self.assertRaisesRegex(ValueError, "Unknown evolution_core keys"):
+            parse_evolution_config(raw)
+
+    def test_period_driven_core_schema_rejects_removed_walk_forward_fields(self):
+        removed_fields = {
+            "train_days": 504,
+            "validation_days": 126,
+            "test_days": 126,
+            "step_days": 63,
+        }
+        raw = valid_raw_config()
+        for field in removed_fields:
+            raw["evolution_core"].pop(field, None)
+
+        config = parse_evolution_config(raw)
+        resolved_core = evolution_runner.resolved_config_dict(config)["evolution_core"]
+
+        for field, value in removed_fields.items():
+            with self.subTest(field=field):
+                self.assertFalse(hasattr(config.evolution_core, field))
+                self.assertNotIn(field, resolved_core)
+                legacy = copy.deepcopy(raw)
+                legacy["evolution_core"][field] = value
+                with self.assertRaisesRegex(ValueError, "Unknown evolution_core keys"):
+                    parse_evolution_config(legacy)
+
+    def test_rejects_invalid_evolution_core_values_and_boolean_integers(self):
+        invalid_values = {
+            "max_candidates_per_group": (0, True),
+            "random_seed": (True,),
+            "min_folds": (0, True),
+            "min_filled_trades_per_fold": (-1, True),
+            "min_positive_fold_ratio": (-0.01, 1.01, True),
+            "min_mean_return_improvement": (-0.01, 1.01, True),
+            "max_drawdown_floor": (-1.01, 0.01, True),
+            "max_drawdown_worsening": (-0.01, 1.01, True),
+            "max_turnover_ratio": (0.0, True),
+            "max_pnl_concentration": (-0.01, 1.01, True),
+        }
+        for key, values in invalid_values.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    raw = valid_raw_config()
+                    raw["evolution_core"][key] = value
+                    with self.assertRaisesRegex(ValueError, key):
+                        parse_evolution_config(raw)
+
+    def test_rejects_missing_evolution_core_block(self):
+        raw = valid_raw_config()
+        del raw["evolution_core"]
+
+        with self.assertRaisesRegex(ValueError, "evolution_core must be a mapping"):
+            parse_evolution_config(raw)
+
+    def test_rejects_overlapping_validation_and_test_periods(self):
+        raw = valid_raw_config()
+        raw["periods"]["test_start"] = "2025-12-31"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "validation_end < core_test_start <= core_test_end < test_start",
+        ):
+            parse_evolution_config(raw)
+
+    def test_rejects_unknown_strategy_override(self):
+        raw = valid_raw_config()
+        raw["search_groups"][0]["candidates"][0]["overrides"] = {"future_leak": 1}
+
+        with self.assertRaisesRegex(ValueError, "Unknown strategy parameters"):
+            parse_evolution_config(raw)
+
+    def test_rejects_duplicate_candidate_ids_across_groups(self):
+        raw = valid_raw_config()
+        raw["search_groups"].append(copy.deepcopy(raw["search_groups"][0]))
+        raw["search_groups"][1]["id"] = "entry_depth"
+
+        with self.assertRaisesRegex(ValueError, "Duplicate candidate id"):
+            parse_evolution_config(raw)
+
+    def test_group_candidates_share_incumbent_but_not_each_other(self):
+        config = parse_evolution_config(valid_raw_config())
+        generated = build_group_candidates(config.baseline, config.search_groups[0])
+
+        self.assertEqual(generated[0][1]["leverage"], 0.75)
+        self.assertEqual(generated[1][1]["leverage"], 0.90)
+        self.assertEqual(config.baseline["leverage"], 0.60)
+        self.assertIsNot(generated[0][1], generated[1][1])
+
+    def test_group_candidates_use_generic_generator_with_explicit_seed_and_limit(self):
+        config = parse_evolution_config(valid_raw_config())
+        group = config.search_groups[0]
+
+        with patch(
+            "strong_pullback_evolution.generate_parameter_candidates",
+            return_value=({**config.baseline, "leverage": 0.90},),
+        ) as generator:
+            generated = build_group_candidates(
+                config.baseline, group, max_candidates=1, seed=12345
+            )
+
+        generator.assert_called_once_with(
+            config.baseline,
+            [candidate.overrides for candidate in group.candidates],
+            max_candidates=1,
+            seed=12345,
+        )
+        self.assertEqual(generated[0][0], "risk_090")
+
+    def test_rejects_null_empty_and_non_string_group_ids(self):
+        for invalid_id in (None, "", 123):
+            with self.subTest(invalid_id=invalid_id):
+                raw = valid_raw_config()
+                raw["search_groups"][0]["id"] = invalid_id
+
+                with self.assertRaisesRegex(ValueError, "Group id must be a non-empty string"):
+                    parse_evolution_config(raw)
+
+    def test_rejects_null_empty_and_non_string_candidate_ids(self):
+        for invalid_id in (None, "", 123):
+            with self.subTest(invalid_id=invalid_id):
+                raw = valid_raw_config()
+                raw["search_groups"][0]["candidates"][0]["id"] = invalid_id
+
+                with self.assertRaisesRegex(ValueError, "Candidate id must be a non-empty string"):
+                    parse_evolution_config(raw)
+
+    def test_rejects_unsafe_reserved_and_case_colliding_group_candidate_ids(self):
+        unsafe_ids = (
+            ".", "..", "../escape", "..\\escape", "/absolute", "C:\\absolute",
+            "nested/name", "nested\\name", "baseline", "Champion", "FINAL",
+            "experiments", "control\x01name", "unsafe:name", "trailing.",
+        )
+        for field, label in (("group", "Group id"), ("candidate", "Candidate id")):
+            for unsafe_id in unsafe_ids:
+                with self.subTest(field=field, unsafe_id=unsafe_id):
+                    raw = valid_raw_config()
+                    if field == "group":
+                        raw["search_groups"][0]["id"] = unsafe_id
+                    else:
+                        raw["search_groups"][0]["candidates"][0]["id"] = unsafe_id
+                    with self.assertRaisesRegex(ValueError, label):
+                        parse_evolution_config(raw)
+
+        raw = valid_raw_config()
+        raw["search_groups"].append(copy.deepcopy(raw["search_groups"][0]))
+        raw["search_groups"][1]["id"] = "RISK_BUDGET"
+        raw["search_groups"][1]["candidates"][0]["id"] = "other_candidate"
+        raw["search_groups"][1]["candidates"][1]["id"] = "another_candidate"
+        with self.assertRaisesRegex(ValueError, "Duplicate group id"):
+            parse_evolution_config(raw)
+
+        raw = valid_raw_config()
+        raw["search_groups"][0]["candidates"][1]["id"] = "RISK_075"
+        with self.assertRaisesRegex(ValueError, "Duplicate candidate id"):
+            parse_evolution_config(raw)
+
+    def test_group_candidates_are_deeply_independent(self):
+        incumbent = {"nested": {"values": ["incumbent"]}}
+        group = SearchGroup(
+            "nested",
+            "nested values",
+            (
+                SearchCandidate("first", {"nested": {"values": ["first"]}}),
+                SearchCandidate("second", {"nested": {"values": ["second"]}}),
+            ),
+        )
+
+        generated = build_group_candidates(incumbent, group)
+        generated[0][1]["nested"]["values"].append("changed")
+
+        self.assertEqual(generated[1][1]["nested"]["values"], ["second"])
+        self.assertEqual(incumbent["nested"]["values"], ["incumbent"])
+
+    def test_rejects_malformed_search_group_entries(self):
+        raw = valid_raw_config()
+        raw["search_groups"] = [None]
+
+        with self.assertRaisesRegex(ValueError, "search_groups entries must be mappings"):
+            parse_evolution_config(raw)
+
+    def test_rejects_malformed_search_candidate_entries(self):
+        raw = valid_raw_config()
+        raw["search_groups"][0]["candidates"] = [None]
+
+        with self.assertRaisesRegex(ValueError, "candidates entries must be mappings"):
+            parse_evolution_config(raw)
+
+    def test_rejects_unknown_selection_keys(self):
+        raw = valid_raw_config()
+        raw["selection"]["future_rule"] = True
+
+        with self.assertRaisesRegex(ValueError, "Unknown selection keys"):
+            parse_evolution_config(raw)
+
+    def test_rejects_missing_selection_keys(self):
+        raw = valid_raw_config()
+        del raw["selection"]["min_test_days"]
+
+        with self.assertRaisesRegex(ValueError, "Missing selection keys"):
+            parse_evolution_config(raw)
+
+    def test_selection_rules_reject_boolean_nan_and_wrong_runtime_types(self):
+        invalid_values = {
+            "min_validation_days": (True, 120.0),
+            "min_test_days": (False, 60.0),
+            "rolling_window_days": (True, 126.0),
+            "max_drawdown_floor": (True, float("nan")),
+            "min_annualized_return_delta": (False, float("nan")),
+            "min_sharpe_delta": (True, float("nan")),
+            "max_turnover_ratio": (False, float("nan")),
+            "max_negative_window_rate": (True, float("nan")),
+        }
+
+        for key, values in invalid_values.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    raw = valid_raw_config()
+                    raw["selection"][key] = value
+                    with self.assertRaisesRegex(ValueError, key):
+                        parse_evolution_config(raw)
+
+    def test_selection_rules_reject_non_logical_ranges(self):
+        invalid_values = {
+            "min_validation_days": 0,
+            "min_test_days": -1,
+            "rolling_window_days": -5,
+            "max_drawdown_floor": (0.01, -1.01),
+            "min_annualized_return_delta": -0.01,
+            "max_turnover_ratio": 0.99,
+            "max_negative_window_rate": (-0.01, 1.01),
+        }
+
+        for key, values in invalid_values.items():
+            for value in values if isinstance(values, tuple) else (values,):
+                with self.subTest(key=key, value=value):
+                    raw = valid_raw_config()
+                    raw["selection"][key] = value
+                    with self.assertRaisesRegex(ValueError, key):
+                        parse_evolution_config(raw)
+
+    def test_selection_rules_accept_exact_boundaries(self):
+        raw = valid_raw_config()
+        raw["selection"].update({
+            "min_validation_days": 1,
+            "min_test_days": 1,
+            "rolling_window_days": 1,
+            "max_drawdown_floor": 0.0,
+            "min_annualized_return_delta": 0.0,
+            "max_turnover_ratio": 1.0,
+            "max_negative_window_rate": 1.0,
+        })
+
+        selection = parse_evolution_config(raw).selection
+
+        self.assertEqual(selection.rolling_window_days, 1)
+        self.assertEqual(selection.max_drawdown_floor, 0.0)
+
+    def test_rejects_unsafe_execution_and_exposure_parameters(self):
+        invalid_values = {
+            "commission_bps": -0.01,
+            "impact_bps": -0.01,
+            "limit_buffer": (-0.01, 1.01),
+            "rebound_exit_scale": (-0.01, 1.01),
+            "max_buy_open_gap": -0.01,
+            "market_below_ma_exposure": (-0.01, 1.01),
+            "market_crash_exposure": (-0.01, 1.01),
+            "basket_guard_scale": (-0.01, 1.01),
+            "rebound_exit_market_exposure_max": (-0.01, 1.01),
+            "rebound_exit_market_exposure_min": (-0.01, 1.01),
+        }
+
+        for key, values in invalid_values.items():
+            for value in values if isinstance(values, tuple) else (values,):
+                with self.subTest(key=key, value=value):
+                    raw = valid_raw_config()
+                    raw["baseline"][key] = value
+
+                    with self.assertRaisesRegex(ValueError, key):
+                        parse_evolution_config(raw)
+
+    def test_rejects_invalid_remaining_baseline_controls(self):
+        invalid_values = {
+            "market_ma_window": 0,
+            "market_risk_off_drawdown_20d": (-1.01, 0.01),
+            "max_abs_daily_return": (0.0, 1.01),
+            "initial_capital": 0.0,
+            "basket_guard_return_20d_min": (-1.01, 1.01),
+            "basket_guard_distance_ma60_min": (-1.01, 1.01),
+            "rebound_exit_return": (-0.01, 1.01),
+        }
+
+        for key, values in invalid_values.items():
+            for value in values if isinstance(values, tuple) else (values,):
+                with self.subTest(key=key, value=value):
+                    raw = valid_raw_config()
+                    raw["baseline"][key] = value
+
+                    with self.assertRaisesRegex(ValueError, key):
+                        parse_evolution_config(raw)
+
+    def test_baseline_and_overrides_require_exact_parameter_runtime_types(self):
+        integer_controls = {
+            "train_days", "retrain_frequency", "top_n",
+            "rebalance_frequency", "market_ma_window",
+        }
+        numeric_controls = {
+            "max_position_weight", "leverage", "commission_bps", "impact_bps",
+            "max_buy_open_gap", "limit_buffer", "initial_capital",
+            "max_abs_daily_return", "min_close", "min_avg_amount_20d",
+            "min_pullback_5d", "max_pullback_5d", "min_prior_return_20",
+            "min_prior_return_60", "min_return_20d", "min_return_60d",
+            "min_distance_ma60", "max_intraday_return",
+            "market_risk_off_drawdown_20d", "market_below_ma_exposure",
+            "market_crash_exposure", "basket_guard_scale", "rebound_exit_scale",
+        }
+        optional_numeric_controls = {
+            "min_score", "basket_guard_return_20d_min",
+            "basket_guard_distance_ma60_min", "rebound_exit_return",
+            "rebound_exit_market_exposure_max",
+            "rebound_exit_market_exposure_min",
+        }
+        all_controls = integer_controls | numeric_controls | optional_numeric_controls
+        self.assertEqual(all_controls, set(DEFAULT_STRATEGY_PARAMS))
+        self.assertTrue(evolution_adapter.ALLOWED_OVERRIDE_PARAMS <= all_controls)
+
+        invalid_by_category = (
+            (integer_controls, (True, 1.5, "5", float("nan"), float("inf"))),
+            (
+                numeric_controls,
+                (True, "0.5", float("nan"), float("inf"), float("-inf")),
+            ),
+            (
+                optional_numeric_controls,
+                (True, "0.5", float("nan"), float("inf"), float("-inf")),
+            ),
+        )
+        for source in ("baseline", "override"):
+            for controls, invalid_values in invalid_by_category:
+                tested_controls = (
+                    controls
+                    if source == "baseline"
+                    else controls & evolution_adapter.ALLOWED_OVERRIDE_PARAMS
+                )
+                for key in sorted(tested_controls):
+                    for value in invalid_values:
+                        with self.subTest(source=source, key=key, value=value):
+                            raw = valid_raw_config()
+                            if source == "baseline":
+                                raw["baseline"][key] = value
+                            else:
+                                raw["search_groups"][0]["candidates"][0][
+                                    "overrides"
+                                ] = {key: value}
+                            with self.assertRaisesRegex(ValueError, key):
+                                parse_evolution_config(raw)
+
+        for source in ("baseline", "override"):
+            tested_controls = (
+                optional_numeric_controls
+                if source == "baseline"
+                else optional_numeric_controls & evolution_adapter.ALLOWED_OVERRIDE_PARAMS
+            )
+            for key in sorted(tested_controls):
+                for value in (None, 0.25):
+                    with self.subTest(
+                        source=source, key=key, accepted_value=value
+                    ):
+                        raw = valid_raw_config()
+                        if source == "baseline":
+                            raw["baseline"][key] = value
+                        else:
+                            raw["search_groups"][0]["candidates"][0][
+                                "overrides"
+                            ] = {key: value}
+                        parse_evolution_config(raw)
+
+
+class EvolutionAdapterTest(unittest.TestCase):
+    def test_effective_loaded_freshness_rejects_non_finite_latest_values(self):
+        anomalies = ("amount_inf", "price_neg_inf", "benchmark_inf")
+        for anomaly in anomalies:
+            with self.subTest(anomaly=anomaly), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data = root / "panel.csv"
+                benchmark = root / "benchmark.csv"
+                latest_price = -np.inf if anomaly == "price_neg_inf" else 10.1
+                latest_amount = np.inf if anomaly == "amount_inf" else 10_100.0
+                pd.DataFrame([
+                    {
+                        "date": "2026-07-08", "symbol": "000001", "open": 10.0,
+                        "high": 10.2, "low": 9.8, "close": 10.0,
+                        "volume": 1000.0, "amount": 10_000.0,
+                    },
+                    {
+                        "date": "2026-07-09", "symbol": "000001",
+                        "open": latest_price, "high": latest_price,
+                        "low": latest_price, "close": latest_price,
+                        "volume": 1000.0, "amount": latest_amount,
+                    },
+                ]).to_csv(data, index=False)
+                pd.DataFrame({
+                    "date": ["2026-07-08", "2026-07-09"],
+                    "close": [100.0, np.inf if anomaly == "benchmark_inf" else 101.0],
+                }).to_csv(benchmark, index=False)
+
+                bundle = load_price_bundle(
+                    data,
+                    pd.Timestamp("2026-07-09"),
+                    benchmark,
+                    DEFAULT_STRATEGY_PARAMS,
+                )
+
+                with self.assertRaisesRegex(ValueError, "finite|asof_date"):
+                    evolution_runner.validate_loaded_bundle_freshness(
+                        bundle, pd.Timestamp("2026-07-09")
+                    )
+
+    def test_effective_loaded_freshness_rejects_raw_latest_row_dropped_by_cleaning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            pd.DataFrame([
+                {
+                    "date": "2026-07-08", "symbol": "000001", "open": 10.0,
+                    "high": 10.2, "low": 9.8, "close": 10.0, "volume": 1000.0,
+                    "amount": 10_000.0,
+                },
+                {
+                    "date": "2026-07-09", "symbol": "000001", "open": "invalid",
+                    "high": "invalid", "low": "invalid", "close": "invalid",
+                    "volume": 1000.0, "amount": 10_000.0,
+                },
+            ]).to_csv(data, index=False)
+            pd.DataFrame({
+                "date": ["2026-07-08", "2026-07-09"],
+                "close": [100.0, 101.0],
+            }).to_csv(benchmark, index=False)
+
+            bundle = load_price_bundle(
+                data,
+                pd.Timestamp("2026-07-09"),
+                benchmark,
+                DEFAULT_STRATEGY_PARAMS,
+            )
+
+            self.assertEqual(bundle.close.index.max(), pd.Timestamp("2026-07-08"))
+            with self.assertRaisesRegex(ValueError, "effective.*asof_date"):
+                evolution_runner.validate_loaded_bundle_freshness(
+                    bundle, pd.Timestamp("2026-07-09")
+                )
+
+    def test_effective_loaded_freshness_rejects_invalid_latest_benchmark_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            pd.DataFrame([
+                {
+                    "date": date, "symbol": "000001", "open": price,
+                    "high": price * 1.01, "low": price * 0.99, "close": price,
+                    "volume": 1000.0, "amount": price * 1000.0,
+                }
+                for date, price in (("2026-07-08", 10.0), ("2026-07-09", 10.1))
+            ]).to_csv(data, index=False)
+            pd.DataFrame({
+                "date": ["2026-07-08", "2026-07-09"],
+                "close": [100.0, "invalid"],
+            }).to_csv(benchmark, index=False)
+
+            bundle = load_price_bundle(
+                data,
+                pd.Timestamp("2026-07-09"),
+                benchmark,
+                DEFAULT_STRATEGY_PARAMS,
+            )
+
+            with self.assertRaisesRegex(ValueError, "effective loaded.*asof_date"):
+                evolution_runner.validate_loaded_bundle_freshness(
+                    bundle, pd.Timestamp("2026-07-09")
+                )
+
+    def test_effective_loaded_freshness_requires_common_valid_price_observation(self):
+        dates = pd.DatetimeIndex(["2026-07-08", "2026-07-09"])
+        close = pd.DataFrame(
+            {"000001": [10.0, 10.1], "000002": [20.0, np.nan]}, index=dates
+        )
+        open_px = pd.DataFrame(
+            {"000001": [10.0, np.nan], "000002": [20.0, 20.1]}, index=dates
+        )
+        high = pd.DataFrame(
+            {"000001": [10.1, 10.2], "000002": [20.1, np.nan]}, index=dates
+        )
+        low = pd.DataFrame(
+            {"000001": [9.9, np.nan], "000002": [19.9, 20.0]}, index=dates
+        )
+        amount = pd.DataFrame(
+            {"000001": [1000.0, 1010.0], "000002": [2000.0, np.nan]}, index=dates
+        )
+        bundle = PriceBundle(
+            close, open_px, high, low, amount, pd.Series(1.0, index=dates)
+        )
+
+        with self.assertRaisesRegex(ValueError, "common.*asof_date"):
+            evolution_runner.validate_loaded_bundle_freshness(
+                bundle, pd.Timestamp("2026-07-09")
+            )
+
+    def test_transitive_strategy_dependencies_change_code_and_resume_identity(self):
+        required_dependencies = {
+            "strategy_evolution_core.py",
+            "strong_pullback_evolution.py",
+            "run_strong_pullback_evolution.py",
+            "run_strong_pullback_satellite.py",
+            "train_next_open_rank_model.py",
+            "run_backtest.py",
+            "execution_rules.py",
+            "generate_strong_pullback_candidates.py",
+        }
+        self.assertTrue(
+            required_dependencies.issubset(evolution_runner.STRATEGY_CODE_DEPENDENCIES)
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for filename in evolution_runner.STRATEGY_CODE_DEPENDENCIES:
+                (root / filename).write_text(f"{filename}:v1\n", encoding="utf-8")
+            baseline = evolution_runner.build_code_fingerprint(root)
+            for filename in evolution_runner.STRATEGY_CODE_DEPENDENCIES:
+                path = root / filename
+                original = path.read_text(encoding="utf-8")
+                path.write_text(original + "changed\n", encoding="utf-8")
+                with self.subTest(filename=filename):
+                    self.assertNotEqual(
+                        evolution_runner.build_code_fingerprint(root), baseline
+                    )
+                path.write_text(original, encoding="utf-8")
+
+            config = parse_evolution_config(valid_raw_config())
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("panel", encoding="utf-8")
+            config_path.write_text("config", encoding="utf-8")
+            with patch.object(
+                evolution_runner, "build_code_fingerprint", return_value="a" * 64
+            ):
+                first = evolution_runner.build_run_evidence(
+                    data, config_path, config, None, "commit"
+                )
+            with patch.object(
+                evolution_runner, "build_code_fingerprint", return_value="b" * 64
+            ):
+                second = evolution_runner.build_run_evidence(
+                    data, config_path, config, None, "commit"
+                )
+            self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+    def test_trial_path_resolver_keeps_every_trial_as_a_direct_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            trial_dir = evolution_runner._resolve_trial_dir(run_dir, "safe_trial")
+
+            self.assertEqual(trial_dir.parent, (run_dir / "trials").resolve())
+            self.assertEqual(trial_dir.name, "safe_trial")
+            for unsafe_id in (".", "..", "../escape", "..\\escape", "/absolute", "C:\\absolute"):
+                with self.subTest(unsafe_id=unsafe_id):
+                    with self.assertRaisesRegex(ValueError, "trial_id"):
+                        evolution_runner._resolve_trial_dir(run_dir, unsafe_id)
+
+    def test_default_core_test_segments_are_complete_disjoint_and_non_overlapping(self):
+        config = load_evolution_config(Path("configs/evolution_strong_pullback.yaml"))
+        dates = pd.bdate_range(
+            config.periods.validation_start,
+            config.periods.core_test_end,
+        )
+
+        segments = evolution_adapter.build_core_test_segments(
+            dates,
+            config.periods.core_test_start,
+            config.periods.core_test_end,
+            config.evolution_core.min_folds,
+        )
+
+        self.assertGreaterEqual(len(segments), config.evolution_core.min_folds)
+        core_dates = set(dates[dates >= config.periods.core_test_start])
+        segment_dates = [set(segment.test_dates) for segment in segments]
+        self.assertEqual(set().union(*segment_dates), core_dates)
+        self.assertTrue(all(
+            left.isdisjoint(right)
+            for index, left in enumerate(segment_dates)
+            for right in segment_dates[index + 1:]
+        ))
+        self.assertTrue(all(
+            date > config.periods.validation_end
+            for segment in segments
+            for date in segment.test_dates
+        ))
+        self.assertEqual(
+            [segment.test_start for segment in segments],
+            sorted(segment.test_start for segment in segments),
+        )
+
+    def test_dry_run_writes_snapshot_without_changing_global_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "global" / "strong_pullback.json"
+            run_dir = root / "run"
+            snapshot = EvolutionState.initial(
+                "v1", {"leverage": 0.6}, now="2026-07-12T00:00:00+00:00"
+            )
+
+            changed = persist_evolution_outcome(
+                run_dir=run_dir,
+                snapshot=snapshot,
+                candidate_scores=[{"candidate_id": "c1", "status": "rejected"}],
+                experiments=[{"experiment_id": "e1", "status": "rejected"}],
+                decision_markdown="# 影子决定\n\n纸面研究，未更新全局状态。\n",
+                dry_run=True,
+                promote_shadow=False,
+                state_path=state_path,
+                expected_previous_fingerprint=None,
+            )
+
+            self.assertTrue((run_dir / "evolution_state_snapshot.json").exists())
+            self.assertTrue((run_dir / "candidate_scores.csv").exists())
+            self.assertTrue((run_dir / "experiments" / "e1.json").exists())
+            self.assertTrue((run_dir / "shadow_decision.md").exists())
+            self.assertFalse(state_path.exists())
+            self.assertFalse(changed)
+
+    def test_shadow_state_changes_only_with_both_explicit_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = EvolutionState.initial(
+                "v1", {"leverage": 0.6}, now="2026-07-12T00:00:00+00:00"
+            )
+            state_path = root / "evolution_state" / "strong_pullback.json"
+
+            for index, flags in enumerate(((True, True), (False, False))):
+                changed = persist_evolution_outcome(
+                    root / f"run-{index}", snapshot, [], [], "# decision\n",
+                    dry_run=flags[0], promote_shadow=flags[1], state_path=state_path,
+                    expected_previous_fingerprint=None,
+                )
+                self.assertFalse(changed)
+                self.assertFalse(state_path.exists())
+
+            changed = persist_evolution_outcome(
+                root / "run-ineligible", snapshot,
+                [{"experiment_id": "e1", "status": "rejected"}], [], "# decision\n",
+                dry_run=False, promote_shadow=True, state_path=state_path,
+                expected_previous_fingerprint=None,
+            )
+            self.assertFalse(changed)
+            self.assertFalse(state_path.exists())
+
+            promoted = promote_to_shadow(
+                snapshot,
+                challenger_version="v2",
+                challenger_parameters={"leverage": 0.75},
+                experiment_id="e1",
+                run_id="run-promote",
+                data_fingerprint="data-1",
+                data_asof_date="2026-07-12",
+            )
+            changed = persist_evolution_outcome(
+                root / "run-promote", promoted,
+                [{"experiment_id": "e1", "status": "eligible_for_shadow"}],
+                [], "# decision\n",
+                dry_run=False, promote_shadow=True, state_path=state_path,
+                expected_previous_fingerprint=None,
+            )
+            self.assertTrue(changed)
+            self.assertTrue(state_path.exists())
+
+    def test_runtime_state_path_cannot_target_configs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = EvolutionState.initial("v1", {"leverage": 0.6})
+
+            with self.assertRaisesRegex(ValueError, "configs"):
+                persist_evolution_outcome(
+                    root / "run", snapshot, [], [], "# decision\n",
+                    dry_run=False, promote_shadow=True,
+                    state_path=root / "configs" / "evolution_strong_pullback.yaml",
+                    expected_previous_fingerprint=None,
+                )
+
+    def test_run_state_path_requires_dedicated_evolution_state_directory(self):
+        config = parse_evolution_config(valid_raw_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "evolution_state"):
+                run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                    root / "runs", "unsafe-state-root", False,
+                    lambda data_path, end_date, benchmark_path, params: EvolutionOrchestrationTest._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    EvolutionOrchestrationTest._run_for_params, "test-commit",
+                    state_path=root / "arbitrary" / "strong_pullback.json",
+                )
+
+    def test_concurrent_run_metadata_publication_is_atomic_and_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "runs"
+            context = multiprocessing.get_context("spawn")
+            barrier = context.Barrier(2)
+            processes = [
+                context.Process(
+                    target=_publish_metadata_worker,
+                    args=(str(output_root), run_id, barrier),
+                )
+                for run_id in ("run-1", "run-2")
+            ]
+
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=30)
+                self.assertEqual(process.exitcode, 0)
+
+            publish_run_metadata(
+                output_root,
+                {
+                    "run_id": "run-1",
+                    "status": "success",
+                    "completed_at_utc": "2026-07-12T00:00:03+00:00",
+                    "revision": 2,
+                },
+            )
+            registry_lines = (output_root / "evolution_registry.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            registry = [json.loads(line) for line in registry_lines]
+            latest = json.loads(
+                (output_root / "latest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual({row["run_id"] for row in registry}, {"run-1", "run-2"})
+        self.assertEqual(len(registry), 2)
+        self.assertEqual(
+            next(row for row in registry if row["run_id"] == "run-1")["revision"],
+            2,
+        )
+        self.assertEqual(latest["run_id"], "run-1")
+
+    def test_schema_requires_real_ohlcv_and_amount_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "panel.csv"
+            pd.DataFrame({"date": ["2025-01-01"], "symbol": ["000001"], "close": [10.0]}).to_csv(path, index=False)
+
+            with self.assertRaisesRegex(ValueError, "Missing evolution input columns"):
+                validate_input_schema(path)
+
+    def test_price_bundle_is_physically_truncated_at_requested_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "panel.csv"
+            rows = []
+            for date in pd.date_range("2025-01-01", periods=4, freq="B"):
+                rows.append({
+                    "date": date, "symbol": "000001", "open": 10.0, "high": 11.0,
+                    "low": 9.0, "close": 10.0, "volume": 1000.0, "amount": 10_000.0,
+                })
+            pd.DataFrame(rows).to_csv(path, index=False)
+
+            bundle = load_price_bundle(
+                path, pd.Timestamp("2025-01-03"), None,
+                {**DEFAULT_STRATEGY_PARAMS, "max_abs_daily_return": 0.22},
+            )
+
+            self.assertEqual(bundle.close.index.max(), pd.Timestamp("2025-01-03"))
+
+    def test_trial_artifacts_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trial_dir = Path(tmp) / "trial"
+            run = StrategyRun(
+                equity=pd.DataFrame({"date": ["2025-01-02"], "equity": [1_010_000.0], "gross_return": [0.01], "cost": [0.0], "turnover": [0.1], "gross_exposure": [0.6]}),
+                weights=pd.DataFrame({"date": ["2025-01-01"], "momentum_20": [1.0]}),
+                trades=pd.DataFrame({"signal_date": ["2025-01-01"], "gross_return": [0.01]}),
+                candidates=pd.DataFrame({"signal_date": ["2025-01-01"], "symbol": ["000001"]}),
+            )
+
+            write_trial_artifacts(trial_dir, run, {"validation": {"total_return": 0.01}}, {"status": "completed"})
+            loaded = load_trial_artifacts(trial_dir)
+
+            self.assertEqual(float(loaded.equity.loc[0, "equity"]), 1_010_000.0)
+            self.assertEqual(str(loaded.candidates.loc[0, "symbol"]), "000001")
+
+    def test_execute_strategy_trial_forwards_engine_boundary(self):
+        bundle = StrategyRun(
+            equity=pd.DataFrame(), weights=pd.DataFrame(), trades=pd.DataFrame(), candidates=pd.DataFrame()
+        )
+        price_bundle = type("PriceBundleStub", (), {
+            "close": pd.DataFrame({"000001": [10.0]}),
+            "open_px": pd.DataFrame({"000001": [10.0]}),
+            "high": pd.DataFrame({"000001": [10.0]}),
+            "low": pd.DataFrame({"000001": [10.0]}),
+            "amount": pd.DataFrame({"000001": [1_000.0]}),
+            "market_exposure": pd.Series([0.6]),
+        })()
+        params = {
+            **DEFAULT_STRATEGY_PARAMS,
+            "train_days": 111,
+            "top_n": 3,
+            "leverage": 0.75,
+            "min_score": 0.42,
+            "commission_bps": 1.2,
+            "impact_bps": 0.8,
+            "initial_capital": 123_456.0,
+            "basket_guard_return_20d_min": 0.05,
+            "basket_guard_distance_ma60_min": -0.02,
+            "basket_guard_scale": 0.7,
+            "rebound_exit_return": 0.12,
+            "rebound_exit_scale": 0.25,
+            "rebound_exit_market_exposure_max": 0.4,
+            "rebound_exit_market_exposure_min": 0.1,
+        }
+        captured = {}
+
+        def spy(**kwargs):
+            captured.update(kwargs)
+            return (
+                pd.DataFrame({"date": ["2025-01-01"], "equity": [1.0]}),
+                pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+            )
+
+        with patch("run_strong_pullback_evolution.run_satellite_walk_forward", side_effect=spy):
+            result = execute_strategy_trial(price_bundle, params)
+
+        self.assertIsInstance(result, StrategyRun)
+        self.assertIs(captured["close"], price_bundle.close)
+        self.assertIs(captured["open_px"], price_bundle.open_px)
+        self.assertIs(captured["high"], price_bundle.high)
+        self.assertIs(captured["low"], price_bundle.low)
+        self.assertIs(captured["amount"], price_bundle.amount)
+        self.assertEqual(captured["train_days"], 111)
+        self.assertEqual(captured["retrain_frequency"], params["retrain_frequency"])
+        self.assertEqual(captured["top_n"], 3)
+        self.assertEqual(captured["rebalance_frequency"], params["rebalance_frequency"])
+        self.assertEqual(captured["max_position_weight"], params["max_position_weight"])
+        self.assertEqual(captured["leverage"], 0.75)
+        self.assertEqual(captured["min_score"], 0.42)
+        self.assertEqual(captured["commission_bps"], 1.2)
+        self.assertEqual(captured["impact_bps"], 0.8)
+        self.assertEqual(captured["max_buy_open_gap"], params["max_buy_open_gap"])
+        self.assertEqual(captured["limit_buffer"], params["limit_buffer"])
+        self.assertIs(captured["market_exposure"], price_bundle.market_exposure)
+        self.assertEqual(captured["initial_capital"], 123_456.0)
+        self.assertEqual(captured["filter_kwargs"], {key: float(params[key]) for key in (
+            "min_close", "min_avg_amount_20d", "min_pullback_5d", "max_pullback_5d",
+            "min_prior_return_20", "min_prior_return_60", "min_return_20d",
+            "min_return_60d", "min_distance_ma60", "max_intraday_return",
+        )})
+        self.assertEqual(captured["basket_guard_return_20d_min"], 0.05)
+        self.assertEqual(captured["basket_guard_distance_ma60_min"], -0.02)
+        self.assertEqual(captured["basket_guard_scale"], 0.7)
+        self.assertEqual(captured["rebound_exit_return"], 0.12)
+        self.assertEqual(captured["rebound_exit_scale"], 0.25)
+        self.assertEqual(captured["rebound_exit_market_exposure_max"], 0.4)
+        self.assertEqual(captured["rebound_exit_market_exposure_min"], 0.1)
+
+    def test_execute_strategy_trial_rejects_empty_equity(self):
+        price_bundle = type("PriceBundleStub", (), {
+            "close": pd.DataFrame(), "open_px": pd.DataFrame(), "high": pd.DataFrame(),
+            "low": pd.DataFrame(), "amount": pd.DataFrame(), "market_exposure": pd.Series(dtype=float),
+        })()
+
+        with patch(
+            "run_strong_pullback_evolution.run_satellite_walk_forward",
+            return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
+        ):
+            with self.assertRaisesRegex(ValueError, "Trial generated no equity rows"):
+                execute_strategy_trial(price_bundle, DEFAULT_STRATEGY_PARAMS)
+
+
+class EvolutionOrchestrationTest(unittest.TestCase):
+    @staticmethod
+    def _flat_bundle(end_date: pd.Timestamp) -> PriceBundle:
+        dates = pd.date_range("2022-01-03", end=end_date, freq="B")
+        frame = pd.DataFrame({"000001": 10.0}, index=dates)
+        return PriceBundle(
+            frame, frame.copy(), frame.copy(), frame.copy(), frame * 1_000_000,
+            pd.Series(1.0, index=dates),
+        )
+
+    @staticmethod
+    def _run_for_params(bundle: PriceBundle, params: dict[str, object]) -> StrategyRun:
+        dates = bundle.close.index[bundle.close.index >= pd.Timestamp("2024-01-01")]
+        daily = 0.0002 + float(params["leverage"]) * 0.0001
+        equity = pd.DataFrame({
+            "date": dates,
+            "equity": 1_000_000.0 * (1.0 + daily) ** pd.RangeIndex(1, len(dates) + 1),
+            "gross_return": daily,
+            "cost": 0.0,
+            "turnover": 0.10,
+            "gross_exposure": float(params["leverage"]),
+        })
+        trades = pd.DataFrame(
+            columns=("realize_date", "turnover", "symbol_contributions_json")
+        )
+        return StrategyRun(equity, pd.DataFrame(), trades, pd.DataFrame())
+
+    @staticmethod
+    def _eligible_run_for_params(bundle: PriceBundle, params: dict[str, object]) -> StrategyRun:
+        run = EvolutionOrchestrationTest._run_for_params(bundle, params)
+        trades = pd.DataFrame({
+            "realize_date": run.equity["date"],
+            "turnover": 0.1,
+            "symbol_contributions_json": [
+                '{"000001": 0.01, "000002": 0.01}'
+                for _ in range(len(run.equity))
+            ]
+        })
+        return StrategyRun(run.equity, run.weights, trades, run.candidates)
+
+    @staticmethod
+    def _eligible_config():
+        raw = valid_raw_config()
+        raw["evolution_core"]["min_mean_return_improvement"] = 0.0
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+        })
+        return parse_evolution_config(raw)
+
+    @staticmethod
+    def _controlled_run(
+        bundle: PriceBundle,
+        *,
+        daily_return: float,
+        turnover: float,
+    ) -> StrategyRun:
+        dates = bundle.close.index[bundle.close.index >= pd.Timestamp("2024-01-01")]
+        returns = np.array(
+            [daily_return if index % 2 == 0 else daily_return * 0.8 for index in range(len(dates))]
+        )
+        equity = pd.DataFrame(
+            {
+                "date": dates,
+                "equity": 1_000_000.0 * np.cumprod(1.0 + returns),
+                "gross_return": returns,
+                "cost": 0.0,
+                "turnover": turnover,
+                "gross_exposure": 0.6,
+            }
+        )
+        contributions = (
+            {"000001": daily_return / 2.0, "000002": daily_return / 2.0}
+            if daily_return > 0.0
+            else {"000001": daily_return}
+        )
+        trades = pd.DataFrame(
+            {
+                "realize_date": dates,
+                "turnover": turnover,
+                "symbol_contributions_json": [
+                    json.dumps(contributions) for _ in dates
+                ],
+            }
+        )
+        return StrategyRun(equity, pd.DataFrame(), trades, pd.DataFrame())
+
+    def _run_eligible_promotion(self, root, run_id, **kwargs):
+        data = root / f"{run_id}-panel.csv"
+        benchmark = root / f"{run_id}-benchmark.csv"
+        config_path = root / f"{run_id}-config.yaml"
+        pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+        pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+            benchmark, index=False
+        )
+        config_path.write_text("evidence", encoding="utf-8")
+        return run_evolution(
+            self._eligible_config(), data, config_path, benchmark, pd.Timestamp("2026-07-09"),
+            root / "runs", run_id, False,
+            lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                pd.Timestamp(end_date)
+            ),
+            self._eligible_run_for_params, "test-commit",
+            dry_run=False,
+            promote_shadow=True,
+            state_path=root / "evolution_state" / "strong_pullback.json",
+            **kwargs,
+        )
+
+    def _prepare_committed_success_recovery(self, root, run_id):
+        config = self._eligible_config()
+        output_root = root / "runs"
+        state_path = root / "evolution_state" / "strong_pullback.json"
+        initial = EvolutionState.initial(
+            "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+        )
+        target = promote_to_shadow(
+            initial,
+            challenger_version="prior-shadow",
+            challenger_parameters={**config.baseline, "leverage": 0.75},
+            experiment_id="prior-exp",
+            run_id=run_id,
+            data_fingerprint="prior-data",
+            data_asof_date="2026-07-08",
+            now="2026-07-08T01:00:00+00:00",
+        )
+        evolution_runner.commit_evolution_state_transition(
+            state_path,
+            target,
+            operation="promote",
+            run_id=run_id,
+            experiment_id="prior-exp",
+            expected_previous_fingerprint=evolution_runner.StateWriteExpectation.ABSENT,
+            now="2026-07-08T01:00:00+00:00",
+        )
+        run_dir = output_root / run_id
+        run_dir.mkdir(parents=True)
+        manifest = {
+            "run_id": run_id,
+            "status": "success",
+            "champion_id": "prior-shadow",
+            "selected_experiment_id": "prior-exp",
+            "test_status": "ready_for_manual_review",
+            "promotion_persistence_status": "committed",
+            "global_state_changed": True,
+            "completed_at_utc": "2026-07-08T01:00:00+00:00",
+        }
+        (run_dir / "manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        (run_dir / "shadow_decision.md").write_text(
+            "# committed\n", encoding="utf-8"
+        )
+        return output_root, state_path, initial, run_dir, manifest
+
+    def test_core_rejection_keeps_final_holdout_untouched_after_selection_lock(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.6666666667,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [{
+            "id": "selection_only",
+            "hypothesis_cn": "selection winner must fail locked core tests",
+            "candidates": [{"id": "selection_winner", "overrides": {"leverage": 0.75}}],
+        }]
+        config = parse_evolution_config(raw)
+        requested_ends: list[pd.Timestamp] = []
+
+        def loader(data_path, end_date, benchmark_path, params):
+            requested_ends.append(pd.Timestamp(end_date))
+            return self._flat_bundle(pd.Timestamp(end_date))
+
+        def executor(bundle, params):
+            end = pd.Timestamp(bundle.close.index.max())
+            is_candidate = float(params["leverage"]) == 0.75
+            if end <= config.periods.validation_end:
+                daily = 0.0004 if is_candidate else 0.0002
+            elif end <= config.periods.core_test_end:
+                daily = 0.0001 if is_candidate else 0.0002
+            else:
+                raise AssertionError("final holdout opened before core gates passed")
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                root / "runs", "core-rejected", False, loader, executor, "test-commit",
+            )
+            rounds = pd.read_csv(outcome.run_dir / "rounds.csv")
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(rounds.loc[0, "winner_id"], "selection_winner")
+        self.assertEqual(outcome.champion_id, "selection_winner")
+        self.assertEqual(outcome.test_status, "not_opened_core_rejected")
+        self.assertEqual(manifest["core_test_status"], "rejected")
+        self.assertTrue(all(end <= config.periods.core_test_end for end in requested_ends))
+
+    def test_core_and_holdout_changes_cannot_reopen_locked_selection_path(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [{
+            "id": "locked_group",
+            "hypothesis_cn": "lock before later evidence",
+            "candidates": [{"id": "locked_candidate", "overrides": {"leverage": 0.75}}],
+        }]
+        config = parse_evolution_config(raw)
+
+        def run_variant(root: Path, label: str, core_daily: float, holdout_daily: float):
+            data = root / f"{label}-panel.csv"
+            config_path = root / f"{label}-config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            requested_ends: list[pd.Timestamp] = []
+
+            def loader(data_path, end_date, benchmark_path, params):
+                requested_ends.append(pd.Timestamp(end_date))
+                bundle = self._flat_bundle(pd.Timestamp(end_date))
+                if pd.Timestamp(end_date) > config.periods.validation_end:
+                    core_rows = (
+                        (bundle.close.index >= config.periods.core_test_start)
+                        & (bundle.close.index <= config.periods.core_test_end)
+                    )
+                    bundle.close.loc[core_rows, :] = core_daily
+                    if pd.Timestamp(end_date) > config.periods.core_test_end:
+                        holdout_rows = bundle.close.index >= config.periods.test_start
+                        bundle.close.loc[holdout_rows, :] = holdout_daily
+                return bundle
+
+            def executor(bundle, params):
+                end = pd.Timestamp(bundle.close.index.max())
+                is_candidate = float(params["leverage"]) == 0.75
+                if end <= config.periods.validation_end:
+                    daily = 0.0004 if is_candidate else 0.0002
+                elif end <= config.periods.core_test_end:
+                    daily = float(bundle.close.iloc[-1, 0]) if is_candidate else 0.0002
+                else:
+                    daily = float(bundle.close.iloc[-1, 0]) if is_candidate else 0.0002
+                return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+            try:
+                outcome = run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                    root / f"runs-{label}", label, False, loader, executor, "test-commit",
+                )
+                run_dir = outcome.run_dir
+            except RuntimeError as exc:
+                self.assertIn("Holdout test", str(exc))
+                run_dir = root / f"runs-{label}" / label
+            return {
+                "rounds": pd.read_csv(run_dir / "rounds.csv"),
+                "manifest": json.loads((run_dir / "manifest.json").read_text(encoding="utf-8")),
+                "scores": pd.read_csv(run_dir / "candidate_scores.csv"),
+                "folds": (run_dir / "folds.json").read_text(encoding="utf-8"),
+                "requested_ends": requested_ends,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pass_all = run_variant(root, "pass-all", 0.0004, 0.0004)
+            reject_core = run_variant(root, "reject-core", 0.0001, 0.0004)
+            reject_holdout = run_variant(root, "reject-holdout", 0.0004, 0.0001)
+
+        for result in (pass_all, reject_core, reject_holdout):
+            self.assertEqual(result["rounds"].loc[0, "winner_id"], "locked_candidate")
+        self.assertEqual(pass_all["manifest"]["core_test_status"], "eligible_for_shadow")
+        self.assertEqual(reject_core["manifest"]["core_test_status"], "rejected")
+        self.assertEqual(
+            reject_holdout["manifest"]["core_test_status"], "eligible_for_shadow"
+        )
+        self.assertEqual(pass_all["folds"], reject_holdout["folds"])
+        self.assertEqual(
+            pass_all["scores"].loc[0, "gates"],
+            reject_holdout["scores"].loc[0, "gates"],
+        )
+        self.assertTrue(all(
+            end <= config.periods.core_test_end
+            for end in reject_core["requested_ends"]
+        ))
+
+    def test_old_full_2025_selection_winner_no_longer_uses_core_test_rows(self):
+        raw = valid_raw_config()
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [{
+            "id": "old_interval",
+            "hypothesis_cn": "benefit exists only after selection ends",
+            "candidates": [{"id": "late_only", "overrides": {"leverage": 0.75}}],
+        }]
+        config = parse_evolution_config(raw)
+
+        def executor(bundle, params):
+            is_candidate = float(params["leverage"]) == 0.75
+            full_old_interval = bundle.close.index.max() > config.periods.validation_end
+            daily = (
+                0.0005 if is_candidate and full_old_interval
+                else 0.0001 if is_candidate
+                else 0.0002
+            )
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        old_bundle = self._flat_bundle(config.periods.core_test_end)
+        old_baseline = calculate_segment_metrics(
+            executor(old_bundle, config.baseline).equity,
+            config.periods.validation_start,
+            config.periods.core_test_end,
+            config.selection.rolling_window_days,
+        )
+        old_candidate = calculate_segment_metrics(
+            executor(old_bundle, {**config.baseline, "leverage": 0.75}).equity,
+            config.periods.validation_start,
+            config.periods.core_test_end,
+            config.selection.rolling_window_days,
+        )
+        self.assertTrue(evaluate_promotion(
+            old_candidate, old_baseline, config.selection
+        ).eligible)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                root / "runs", "old-interval-rejected", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                executor, "test-commit",
+            )
+
+        self.assertEqual(outcome.champion_id, "baseline")
+        self.assertEqual(outcome.test_status, "not_opened_no_challenger")
+
+    def test_stale_cas_marks_decision_and_manifest_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", self._eligible_config().baseline,
+                now="2026-07-12T00:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, initial)
+
+            with self.assertRaisesRegex(Exception, "previous state fingerprint"):
+                self._run_eligible_promotion(
+                    root, "stale-cas", expected_previous_fingerprint="stale"
+                )
+
+            run_dir = root / "runs" / "stale-cas"
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            decision = (run_dir / "shadow_decision.md").read_text(encoding="utf-8")
+            self.assertEqual(manifest["promotion_persistence_status"], "rejected")
+            self.assertFalse(manifest["global_state_changed"])
+            self.assertIn("previous state fingerprint", manifest["error"])
+            self.assertIn("rejected", decision)
+            self.assertIn("previous state fingerprint", decision)
+            self.assertEqual(load_evolution_state(state_path, initial), initial)
+
+    def test_core_ineligible_group_winner_never_becomes_next_parent_or_shadow(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [
+            {
+                "id": "bad_core_group",
+                "hypothesis_cn": "legacy passes but core fails",
+                "candidates": [
+                    {"id": "bad_core", "overrides": {"leverage": 0.75}}
+                ],
+            },
+            {
+                "id": "clean_group",
+                "hypothesis_cn": "must start from the locked champion",
+                "candidates": [
+                    {"id": "clean_candidate", "overrides": {"top_n": 7}}
+                ],
+            },
+        ]
+        config = parse_evolution_config(raw)
+        seen_clean_params: list[dict[str, object]] = []
+        seen_bad_core_ends: list[pd.Timestamp] = []
+
+        def executor(bundle, params):
+            is_full_research = bundle.close.index.max() == config.periods.validation_end
+            if int(params["top_n"]) == 7:
+                seen_clean_params.append(dict(params))
+                daily = 0.0005
+            elif float(params["leverage"]) == 0.75:
+                seen_bad_core_ends.append(pd.Timestamp(bundle.close.index.max()))
+                daily = 0.0004 if is_full_research else -0.0002
+            else:
+                daily = 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                root / "runs", "group-core-gate", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                executor, "test-commit",
+            )
+
+            rounds = pd.read_csv(outcome.run_dir / "rounds.csv")
+            snapshot = json.loads(
+                (outcome.run_dir / "evolution_state_snapshot.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(rounds.loc[0, "winner_id"], "baseline")
+        self.assertEqual(rounds.loc[1, "parent_id"], "baseline")
+        self.assertEqual(outcome.champion_id, "clean_candidate")
+        self.assertEqual(outcome.champion_params["leverage"], 0.60)
+        self.assertTrue(seen_clean_params)
+        self.assertTrue(all(params["leverage"] == 0.60 for params in seen_clean_params))
+        self.assertEqual(snapshot["shadow_parameters"]["leverage"], 0.60)
+        self.assertTrue(seen_bad_core_ends)
+        self.assertTrue(all(
+            end <= config.periods.validation_end for end in seen_bad_core_ends
+        ))
+
+    def test_selection_local_generic_segments_never_read_core_or_holdout_dates(self):
+        config = self._eligible_config()
+        dates = self._flat_bundle(config.periods.core_test_end).close.index
+
+        segments = evolution_adapter.build_selection_segments(
+            dates,
+            config.periods.validation_start,
+            config.periods.validation_end,
+            config.evolution_core.min_folds,
+        )
+
+        self.assertGreaterEqual(len(segments), config.evolution_core.min_folds)
+        self.assertTrue(all(
+            config.periods.validation_start <= date <= config.periods.validation_end
+            for segment in segments
+            for date in segment.test_dates
+        ))
+        self.assertTrue(all(
+            segment.test_end < config.periods.core_test_start
+            for segment in segments
+        ))
+
+    def test_final_accumulated_candidate_must_pass_core_gates_against_locked_champion(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 1.50,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [
+            {
+                "id": "step_one",
+                "hypothesis_cn": "first incremental turnover step",
+                "candidates": [
+                    {"id": "step_one_candidate", "overrides": {"leverage": 0.75}}
+                ],
+            },
+            {
+                "id": "step_two",
+                "hypothesis_cn": "second incremental turnover step",
+                "candidates": [
+                    {"id": "step_two_candidate", "overrides": {"top_n": 7}}
+                ],
+            },
+        ]
+        config = parse_evolution_config(raw)
+
+        def executor(bundle, params):
+            if int(params["top_n"]) == 7:
+                daily, turnover = 0.0004, 0.19
+            elif float(params["leverage"]) == 0.75:
+                daily, turnover = 0.0003, 0.14
+            else:
+                daily, turnover = 0.0002, 0.10
+            return self._controlled_run(
+                bundle, daily_return=daily, turnover=turnover
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                root / "runs", "final-direct-gate", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                executor, "test-commit",
+            )
+            snapshot = json.loads(
+                (outcome.run_dir / "evolution_state_snapshot.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(outcome.champion_id, "step_two_candidate")
+        self.assertEqual(snapshot["shadow_status"], "none")
+        self.assertIn("turnover_ratio", manifest["failed_gates"])
+
+    def test_final_accumulated_legacy_rejection_is_persisted_before_holdout(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 1.50,
+        })
+        raw["search_groups"] = [
+            {
+                "id": "legacy_step_one",
+                "hypothesis_cn": "first legal turnover step",
+                "candidates": [{
+                    "id": "legacy_step_one_candidate",
+                    "overrides": {"leverage": 0.75},
+                }],
+            },
+            {
+                "id": "legacy_step_two",
+                "hypothesis_cn": "second legal but cumulatively excessive step",
+                "candidates": [{
+                    "id": "legacy_step_two_candidate",
+                    "overrides": {"top_n": 7},
+                }],
+            },
+        ]
+        config = parse_evolution_config(raw)
+        requested_ends: list[pd.Timestamp] = []
+
+        def loader(data_path, end_date, benchmark_path, params):
+            requested_ends.append(pd.Timestamp(end_date))
+            return self._flat_bundle(pd.Timestamp(end_date))
+
+        def executor(bundle, params):
+            if int(params["top_n"]) == 7:
+                daily, turnover = 0.0004, 0.19
+            elif float(params["leverage"]) == 0.75:
+                daily, turnover = 0.0003, 0.14
+            else:
+                daily, turnover = 0.0002, 0.10
+            return self._controlled_run(
+                bundle, daily_return=daily, turnover=turnover
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                root / "runs", "final-legacy-direct-gate", False,
+                loader, executor, "test-commit",
+            )
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            scores = pd.read_csv(outcome.run_dir / "candidate_scores.csv")
+            selected_score = scores.loc[
+                scores["experiment_id"] == manifest["selected_experiment_id"]
+            ].iloc[0]
+            experiment = json.loads(
+                (
+                    outcome.run_dir / "experiments"
+                    / f"{manifest['selected_experiment_id']}.json"
+                ).read_text(encoding="utf-8")
+            )
+            decision = (outcome.run_dir / "shadow_decision.md").read_text(
+                encoding="utf-8"
+            )
+            final_artifact_exists = (outcome.run_dir / "final").exists()
+
+        expected_reason = "换手率放大超过限制"
+        self.assertEqual(outcome.champion_id, "legacy_step_two_candidate")
+        self.assertEqual(outcome.test_status, "not_opened_final_legacy_rejected")
+        self.assertEqual(requested_ends, [config.periods.validation_end])
+        self.assertFalse(final_artifact_exists)
+        self.assertEqual(selected_score["status"], "final_legacy_rejected")
+        self.assertEqual(selected_score["final_legacy_status"], "rejected")
+        self.assertIn(
+            expected_reason, json.loads(selected_score["final_legacy_reasons"])
+        )
+        self.assertEqual(experiment["status"], "final_legacy_rejected")
+        self.assertEqual(experiment["final_legacy_status"], "rejected")
+        self.assertIn(expected_reason, experiment["final_legacy_reasons"])
+        self.assertEqual(manifest["final_legacy_status"], "rejected")
+        self.assertIn(expected_reason, manifest["final_legacy_reasons"])
+        self.assertIn(f"legacy:{expected_reason}", manifest["failed_gates"])
+        self.assertIn("Final locked-candidate legacy status: `rejected`", decision)
+        self.assertIn(expected_reason, decision)
+
+    def test_existing_shadow_is_reevaluated_and_used_as_candidate_parent(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [
+            {
+                "id": "shadow_extension",
+                "hypothesis_cn": "extend the healthy shadow",
+                "candidates": [
+                    {"id": "shadow_child", "overrides": {"top_n": 7}}
+                ],
+            }
+        ]
+        config = parse_evolution_config(raw)
+        shadow_params = {**config.baseline, "leverage": 0.75}
+        seen: list[dict[str, object]] = []
+
+        def executor(bundle, params):
+            seen.append(dict(params))
+            if int(params["top_n"]) == 7:
+                daily = 0.0004
+            elif float(params["leverage"]) == 0.75:
+                daily = 0.0003
+            else:
+                daily = 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            shadow = promote_to_shadow(
+                initial,
+                challenger_version="prior-shadow",
+                challenger_parameters=shadow_params,
+                experiment_id="prior-exp",
+                run_id="prior-run",
+                data_fingerprint="prior-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, shadow)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                root / "runs", "shadow-continuation", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                executor, "test-commit", state_path=state_path,
+            )
+            rounds = pd.read_csv(outcome.run_dir / "rounds.csv")
+
+        self.assertTrue(any(params == shadow_params for params in seen))
+        child_params = [params for params in seen if int(params["top_n"]) == 7]
+        self.assertTrue(child_params)
+        self.assertTrue(all(params["leverage"] == 0.75 for params in child_params))
+        self.assertEqual(rounds.loc[0, "parent_id"], "prior-shadow")
+        self.assertEqual(outcome.champion_params["leverage"], 0.75)
+
+    def test_failing_existing_shadow_rolls_back_with_cas_and_audit(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [
+            {
+                "id": "post_rollback_search",
+                "hypothesis_cn": "candidate must start from restored champion",
+                "candidates": [
+                    {"id": "weak_candidate", "overrides": {"top_n": 7}}
+                ],
+            }
+        ]
+        config = parse_evolution_config(raw)
+
+        def executor(bundle, params):
+            if float(params["leverage"]) == 0.75:
+                daily = -0.0002
+            elif int(params["top_n"]) == 7:
+                daily = -0.0001
+            else:
+                daily = 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            shadow = promote_to_shadow(
+                initial,
+                challenger_version="failing-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="prior-exp",
+                run_id="prior-run",
+                data_fingerprint="prior-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, shadow)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+            pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config, data, config_path, benchmark, pd.Timestamp("2026-07-09"),
+                root / "runs", "shadow-rollback", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                executor, "test-commit", dry_run=False, promote_shadow=True,
+                state_path=state_path,
+            )
+            restored = load_evolution_state(state_path, initial)
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(outcome.champion_id, "baseline")
+        self.assertEqual(restored.shadow_status, "rolled_back")
+        self.assertIn("shadow reevaluation", restored.blocked_reason)
+        self.assertTrue(manifest["global_state_changed"])
+        self.assertEqual(manifest["promotion_persistence_status"], "committed")
+
+    def test_failing_shadow_persists_rollback_and_stops_before_strong_replacement_search(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [{
+            "id": "strong_replacement_group",
+            "hypothesis_cn": "must wait for the next evolution run",
+            "candidates": [{
+                "id": "strong_replacement", "overrides": {"top_n": 7}
+            }],
+        }]
+        config = parse_evolution_config(raw)
+
+        def executor(bundle, params):
+            if float(params["leverage"]) == 0.75:
+                daily = -0.0002
+            elif int(params["top_n"]) == 7:
+                daily = 0.0008
+            else:
+                daily = 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            shadow = promote_to_shadow(
+                initial,
+                challenger_version="failing-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="prior-exp",
+                run_id="prior-run",
+                data_fingerprint="prior-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, shadow)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+            pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with patch(
+                "run_strong_pullback_evolution.build_group_candidates",
+                wraps=build_group_candidates,
+            ) as candidate_search:
+                outcome = run_evolution(
+                    config, data, config_path, benchmark, pd.Timestamp("2026-07-09"),
+                    root / "runs", "rollback-stop", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    executor, "test-commit", dry_run=False, promote_shadow=True,
+                    state_path=state_path,
+                )
+
+            persisted = load_evolution_state(state_path, initial)
+            journal = load_evolution_transition_journal(state_path)
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        candidate_search.assert_not_called()
+        self.assertEqual(outcome.test_status, "not_opened_shadow_rollback")
+        self.assertEqual(persisted.shadow_status, "rolled_back")
+        self.assertIsNotNone(journal)
+        self.assertEqual(journal.operation, "rollback")
+        self.assertEqual(journal.status, "committed")
+        self.assertEqual(manifest["selected_experiment_id"], "prior-exp")
+
+    def test_persisted_shadow_requires_generic_selection_gate_before_parenting(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [{
+            "id": "strong_replacement_group",
+            "hypothesis_cn": "must wait for the next evolution run",
+            "candidates": [{
+                "id": "strong_replacement", "overrides": {"top_n": 7}
+            }],
+        }]
+        config = parse_evolution_config(raw)
+        shadow_params = {**config.baseline, "leverage": 0.75}
+
+        def executor(bundle, params):
+            if int(params["top_n"]) == 7:
+                daily = 0.0008
+            elif float(params["leverage"]) == 0.75:
+                daily = 0.0003
+            else:
+                daily = 0.0002
+            run = self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+            if float(params["leverage"]) != 0.75:
+                return run
+            concentrated_trades = run.trades.copy()
+            concentrated_trades["symbol_contributions_json"] = [
+                json.dumps({"000001": daily}) for _ in range(len(run.trades))
+            ]
+            return StrategyRun(
+                run.equity, run.weights, concentrated_trades, run.candidates
+            )
+
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state_path = root / "evolution_state" / "strong_pullback.json"
+                initial = EvolutionState.initial(
+                    "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+                )
+                shadow = promote_to_shadow(
+                    initial,
+                    challenger_version="concentrated-shadow",
+                    challenger_parameters=shadow_params,
+                    experiment_id="prior-exp",
+                    run_id="prior-run",
+                    data_fingerprint="prior-data",
+                    data_asof_date="2026-07-08",
+                    now="2026-07-08T01:00:00+00:00",
+                )
+                write_evolution_state_atomic(state_path, shadow)
+                data = root / "panel.csv"
+                benchmark = root / "benchmark.csv"
+                config_path = root / "config.yaml"
+                pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+                pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                    benchmark, index=False
+                )
+                config_path.write_text("evidence", encoding="utf-8")
+
+                with patch(
+                    "run_strong_pullback_evolution.build_group_candidates",
+                    wraps=build_group_candidates,
+                ) as candidate_search:
+                    outcome = run_evolution(
+                        config, data, config_path, benchmark,
+                        pd.Timestamp("2026-07-09"), root / "runs",
+                        f"generic-shadow-rollback-{dry_run}", False,
+                        lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                            pd.Timestamp(end_date)
+                        ),
+                        executor, "test-commit", dry_run=dry_run,
+                        promote_shadow=True, state_path=state_path,
+                    )
+
+                persisted = load_evolution_state(state_path, initial)
+                journal = load_evolution_transition_journal(state_path)
+                manifest = json.loads(
+                    (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                snapshot = json.loads(
+                    (outcome.run_dir / "evolution_state_snapshot.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                final_parameters = yaml.safe_load(
+                    (outcome.run_dir / "champion_candidate.yaml").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+                candidate_search.assert_not_called()
+                self.assertEqual(outcome.test_status, "not_opened_shadow_rollback")
+                self.assertIn("pnl_concentration", manifest["failed_gates"])
+                self.assertIn("legacy=passed", outcome.test_reason)
+                self.assertIn("generic=pnl_concentration", outcome.test_reason)
+                self.assertEqual(snapshot["shadow_status"], "rolled_back")
+                self.assertEqual(snapshot["champion_parameters"], config.baseline)
+                self.assertEqual(final_parameters, config.baseline)
+                self.assertNotEqual(snapshot["champion_parameters"], shadow_params)
+                self.assertFalse((outcome.run_dir / "final").exists())
+                if dry_run:
+                    self.assertEqual(persisted, shadow)
+                    self.assertIsNone(journal)
+                    self.assertFalse(manifest["global_state_changed"])
+                    self.assertEqual(
+                        manifest["promotion_persistence_status"], "not_changed"
+                    )
+                else:
+                    self.assertEqual(persisted.shadow_status, "rolled_back")
+                    self.assertIsNotNone(journal)
+                    self.assertEqual(journal.operation, "rollback")
+                    self.assertEqual(journal.status, "committed")
+                    self.assertTrue(manifest["global_state_changed"])
+                    self.assertEqual(
+                        manifest["promotion_persistence_status"], "committed"
+                    )
+
+    def test_shadow_rollback_cas_failure_is_not_labeled_as_evidence_failure(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+        })
+        raw["search_groups"] = []
+        config = parse_evolution_config(raw)
+
+        def executor(bundle, params):
+            daily = -0.0002 if float(params["leverage"]) == 0.75 else 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            shadow = promote_to_shadow(
+                initial,
+                challenger_version="failing-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="prior-exp",
+                run_id="prior-run",
+                data_fingerprint="prior-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, shadow)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+            pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with patch(
+                "run_strong_pullback_evolution.commit_evolution_state_transition",
+                side_effect=RuntimeError("rollback CAS exploded"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "rollback CAS exploded"):
+                    run_evolution(
+                        config, data, config_path, benchmark,
+                        pd.Timestamp("2026-07-09"), root / "runs",
+                        "rollback-cas-failure", False,
+                        lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                            pd.Timestamp(end_date)
+                        ),
+                        executor, "test-commit", dry_run=False,
+                        promote_shadow=True, state_path=state_path,
+                    )
+
+            manifest = json.loads(
+                (root / "runs" / "rollback-cas-failure" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            decision = (
+                root / "runs" / "rollback-cas-failure" / "shadow_decision.md"
+            ).read_text(encoding="utf-8")
+            persisted = load_evolution_state(state_path, initial)
+
+        self.assertEqual(persisted, shadow)
+        self.assertEqual(manifest["promotion_persistence_status"], "rejected")
+        self.assertIn("rollback CAS exploded", manifest["error"])
+        self.assertNotIn("evidence failed", manifest["error"])
+        self.assertNotIn("evidence failed", decision)
+
+    def test_locked_existing_shadow_core_failure_rolls_back_durably_or_recommends_in_dry_run(self):
+        raw = valid_raw_config()
+        raw["search_groups"] = []
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        config = parse_evolution_config(raw)
+        asof_date = pd.Timestamp("2026-07-09")
+
+        def executor(bundle, params):
+            is_shadow = float(params["leverage"]) == 0.75
+            end = pd.Timestamp(bundle.close.index.max())
+            if is_shadow and end <= config.periods.validation_end:
+                daily = 0.0004
+            elif is_shadow:
+                daily = 0.0001
+            else:
+                daily = 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        for mutate in (False, True):
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state_path = root / "evolution_state" / "strong_pullback.json"
+                initial = EvolutionState.initial(
+                    "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+                )
+                shadow = promote_to_shadow(
+                    initial,
+                    challenger_version="existing-shadow",
+                    challenger_parameters={**config.baseline, "leverage": 0.75},
+                    experiment_id="existing-exp",
+                    run_id="existing-run",
+                    data_fingerprint="existing-data",
+                    data_asof_date="2026-07-08",
+                    now="2026-07-08T01:00:00+00:00",
+                )
+                write_evolution_state_atomic(state_path, shadow)
+                data = root / "panel.csv"
+                benchmark = root / "benchmark.csv"
+                config_path = root / "config.yaml"
+                pd.DataFrame({"date": [asof_date]}).to_csv(data, index=False)
+                pd.DataFrame({"date": [asof_date], "close": [100.0]}).to_csv(
+                    benchmark, index=False
+                )
+                config_path.write_text("evidence", encoding="utf-8")
+
+                outcome = run_evolution(
+                    config, data, config_path, benchmark, asof_date,
+                    root / "runs", f"shadow-core-{mutate}", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    executor, "test-commit", dry_run=not mutate,
+                    promote_shadow=mutate, state_path=state_path,
+                )
+
+                persisted = load_evolution_state(state_path, initial)
+                journal = load_evolution_transition_journal(state_path)
+                manifest = json.loads(
+                    (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                decision = (outcome.run_dir / "shadow_decision.md").read_text(
+                    encoding="utf-8"
+                )
+
+                self.assertEqual(outcome.test_status, "not_opened_shadow_core_rollback")
+                self.assertEqual(outcome.champion_id, "baseline")
+                self.assertEqual(manifest["core_test_status"], "rejected")
+                self.assertEqual(manifest["selected_experiment_id"], "existing-exp")
+                self.assertIn("rollback", decision.lower())
+                if mutate:
+                    self.assertEqual(persisted.shadow_status, "rolled_back")
+                    self.assertIsNotNone(journal)
+                    self.assertEqual(journal.operation, "rollback")
+                    self.assertEqual(journal.status, "committed")
+                    self.assertTrue(manifest["global_state_changed"])
+                    self.assertEqual(
+                        manifest["promotion_persistence_status"], "committed"
+                    )
+                else:
+                    self.assertEqual(persisted, shadow)
+                    self.assertIsNone(journal)
+                    self.assertFalse(manifest["global_state_changed"])
+                    self.assertEqual(
+                        manifest["promotion_persistence_status"], "not_changed"
+                    )
+
+    def test_locked_existing_shadow_holdout_failure_persists_rollback_and_stops(self):
+        raw = valid_raw_config()
+        raw["search_groups"] = []
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        config = parse_evolution_config(raw)
+        asof_date = pd.Timestamp("2026-07-09")
+
+        def executor(bundle, params):
+            is_shadow = float(params["leverage"]) == 0.75
+            end = pd.Timestamp(bundle.close.index.max())
+            if is_shadow and end <= config.periods.core_test_end:
+                daily = 0.0004
+            elif is_shadow:
+                daily = 0.0001
+            else:
+                daily = 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            shadow = promote_to_shadow(
+                initial,
+                challenger_version="existing-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="existing-exp",
+                run_id="existing-run",
+                data_fingerprint="existing-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, shadow)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": [asof_date]}).to_csv(data, index=False)
+            pd.DataFrame({"date": [asof_date], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            outcome = run_evolution(
+                config, data, config_path, benchmark, asof_date,
+                root / "runs", "shadow-holdout-rollback", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                executor, "test-commit", dry_run=False, promote_shadow=True,
+                state_path=state_path,
+            )
+
+            persisted = load_evolution_state(state_path, initial)
+            journal = load_evolution_transition_journal(state_path)
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            decision = (outcome.run_dir / "shadow_decision.md").read_text(
+                encoding="utf-8"
+            )
+            final_artifact_exists = (
+                outcome.run_dir / "final" / "champion" / "metrics.json"
+            ).exists()
+
+        self.assertEqual(outcome.test_status, "rollback_recommended")
+        self.assertEqual(outcome.champion_id, "baseline")
+        self.assertEqual(persisted.shadow_status, "rolled_back")
+        self.assertIsNotNone(journal)
+        self.assertEqual(journal.operation, "rollback")
+        self.assertEqual(journal.status, "committed")
+        self.assertEqual(manifest["status"], "success")
+        self.assertTrue(manifest["global_state_changed"])
+        self.assertEqual(manifest["promotion_persistence_status"], "committed")
+        self.assertEqual(manifest["selected_experiment_id"], "existing-exp")
+        self.assertIn("rollback", decision.lower())
+        self.assertTrue(final_artifact_exists)
+
+    def test_shadow_evidence_error_aborts_without_mutating_state(self):
+        raw = valid_raw_config()
+        raw["evolution_core"]["min_mean_return_improvement"] = 0.0
+        raw["selection"]["min_annualized_return_delta"] = 0.0
+        raw["search_groups"] = [
+            {
+                "id": "post_error_search",
+                "hypothesis_cn": "must not run after shadow evidence error",
+                "candidates": [
+                    {"id": "weak_candidate", "overrides": {"top_n": 7}}
+                ],
+            }
+        ]
+        config = parse_evolution_config(raw)
+
+        def executor(bundle, params):
+            if float(params["leverage"]) == 0.75:
+                raise ValueError("malformed fold audit")
+            daily = 0.0001 if int(params["top_n"]) == 7 else 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            shadow = promote_to_shadow(
+                initial,
+                challenger_version="broken-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="prior-exp",
+                run_id="prior-run",
+                data_fingerprint="prior-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, shadow)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+            pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "shadow reevaluation evidence failed"):
+                run_evolution(
+                    config, data, config_path, benchmark, pd.Timestamp("2026-07-09"),
+                    root / "runs", "shadow-evidence-error", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    executor, "test-commit", dry_run=False, promote_shadow=True,
+                    state_path=state_path,
+                )
+
+            persisted = load_evolution_state(state_path, initial)
+
+        self.assertEqual(persisted, shadow)
+
+    def test_eligible_holdout_approved_promotion_commits_audit_and_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            outcome = self._run_eligible_promotion(root, "committed-run")
+
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            state = load_evolution_state(
+                state_path, EvolutionState.initial("unused", {"leverage": 0.1})
+            )
+            manifest = json.loads((outcome.run_dir / "manifest.json").read_text(encoding="utf-8"))
+            decision = (outcome.run_dir / "shadow_decision.md").read_text(encoding="utf-8")
+            self.assertEqual(manifest["promotion_persistence_status"], "committed")
+            self.assertTrue(manifest["global_state_changed"])
+            self.assertEqual(state.shadow_run_id, "committed-run")
+            self.assertEqual(state.shadow_experiment_id, manifest["selected_experiment_id"])
+            self.assertIn("committed", decision)
+
+    def test_post_cas_artifact_failure_reconciles_committed_state_truth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            with patch(
+                "run_strong_pullback_evolution.write_chinese_summary",
+                side_effect=RuntimeError("post-CAS artifact failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "post-CAS artifact failed"):
+                    self._run_eligible_promotion(root, "post-cas-failure")
+
+            run_dir = root / "runs" / "post-cas-failure"
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            decision = (run_dir / "shadow_decision.md").read_text(encoding="utf-8")
+            state = load_evolution_state(
+                state_path, EvolutionState.initial("unused", {"leverage": 0.1})
+            )
+            self.assertEqual(state.shadow_run_id, "post-cas-failure")
+            self.assertEqual(manifest["promotion_persistence_status"], "committed")
+            self.assertTrue(manifest["global_state_changed"])
+            self.assertIn("post-CAS artifact failed", manifest["error"])
+            self.assertIn("committed", decision)
+            self.assertIn("post-CAS artifact failed", decision)
+
+    def test_post_cas_committed_journal_write_failure_reconciles_state_truth(self):
+        original_write = evolution_core._write_json_atomic
+        injected = {"failed": False}
+
+        def fail_first_committed_journal_write(path, payload):
+            status = getattr(payload, "status", None)
+            if (
+                Path(path).name.endswith("promotion_journal.json")
+                and status == "committed"
+                and not injected["failed"]
+            ):
+                injected["failed"] = True
+                raise OSError("committed journal write failed")
+            return original_write(path, payload)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch(
+                "strategy_evolution_core._write_json_atomic",
+                side_effect=fail_first_committed_journal_write,
+            ):
+                with self.assertRaisesRegex(OSError, "committed journal write failed"):
+                    self._run_eligible_promotion(root, "journal-finalize-failure")
+
+            run_dir = root / "runs" / "journal-finalize-failure"
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            state = load_evolution_state(
+                state_path, EvolutionState.initial("unused", {"leverage": 0.1})
+            )
+            journal = load_evolution_transition_journal(state_path)
+            manifest = json.loads(
+                (run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            decision = (run_dir / "shadow_decision.md").read_text(encoding="utf-8")
+
+        self.assertTrue(injected["failed"])
+        self.assertEqual(state.last_completed_run_id, "journal-finalize-failure")
+        self.assertIsNotNone(journal)
+        self.assertEqual(journal.status, "committed")
+        self.assertEqual(journal.run_id, "journal-finalize-failure")
+        self.assertEqual(journal.experiment_id, state.shadow_experiment_id)
+        self.assertEqual(
+            journal.target_state_fingerprint,
+            evolution_runner.fingerprint_payload(state),
+        )
+        self.assertEqual(manifest["promotion_persistence_status"], "committed")
+        self.assertTrue(manifest["global_state_changed"])
+        self.assertIn("committed journal write failed", manifest["error"])
+        self.assertIn("committed", decision)
+        self.assertIn("committed journal write failed", decision)
+
+    def test_startup_reconciles_pending_committed_journal_and_prior_manifest(self):
+        config = self._eligible_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_root = root / "runs"
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            target = promote_to_shadow(
+                initial,
+                challenger_version="prior-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="prior-exp",
+                run_id="crashed-run",
+                data_fingerprint="prior-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, target)
+            stage_evolution_transition(
+                state_path,
+                target,
+                operation="promote",
+                run_id="crashed-run",
+                experiment_id="prior-exp",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            prior_run_dir = output_root / "crashed-run"
+            prior_run_dir.mkdir(parents=True)
+            (prior_run_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "crashed-run",
+                        "status": "running",
+                        "promotion_persistence_status": "pending",
+                        "global_state_changed": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                output_root, "recovery-run", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                self._eligible_run_for_params, "test-commit", state_path=state_path,
+            )
+
+            journal = load_evolution_transition_journal(state_path)
+            recovered_manifest = json.loads(
+                (prior_run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertIsNotNone(journal)
+        self.assertEqual(journal.status, "committed")
+        self.assertEqual(
+            recovered_manifest["promotion_persistence_status"], "committed"
+        )
+        self.assertTrue(recovered_manifest["global_state_changed"])
+
+    def test_startup_finalizes_committed_but_unfinalized_run_idempotently(self):
+        config = self._eligible_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_root = root / "runs"
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            target = promote_to_shadow(
+                initial,
+                challenger_version="prior-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="prior-exp",
+                run_id="committed-crash",
+                data_fingerprint="prior-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            evolution_runner.commit_evolution_state_transition(
+                state_path,
+                target,
+                operation="promote",
+                run_id="committed-crash",
+                experiment_id="prior-exp",
+                expected_previous_fingerprint=evolution_runner.StateWriteExpectation.ABSENT,
+                now="2026-07-08T01:00:00+00:00",
+            )
+            state_bytes = state_path.read_bytes()
+            prior_run_dir = output_root / "committed-crash"
+            prior_run_dir.mkdir(parents=True)
+            (prior_run_dir / "manifest.json").write_text(
+                json.dumps({
+                    "run_id": "committed-crash",
+                    "status": "running",
+                    "champion_id": "prior-shadow",
+                    "selected_experiment_id": "prior-exp",
+                    "test_status": "ready_for_manual_review",
+                    "promotion_persistence_status": "pending",
+                    "global_state_changed": False,
+                }),
+                encoding="utf-8",
+            )
+            (prior_run_dir / "shadow_decision.md").write_text(
+                "# pending\n", encoding="utf-8"
+            )
+
+            evolution_runner.reconcile_startup_transition(
+                output_root, state_path, initial
+            )
+            first_manifest_text = (prior_run_dir / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+            evolution_runner.reconcile_startup_transition(
+                output_root, state_path, initial
+            )
+
+            recovered_manifest = json.loads(first_manifest_text)
+            registry_records = [
+                json.loads(line)
+                for line in (output_root / "evolution_registry.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(state_path.read_bytes(), state_bytes)
+            self.assertEqual(recovered_manifest["status"], "success")
+            self.assertEqual(
+                recovered_manifest["promotion_persistence_status"], "committed"
+            )
+            self.assertTrue(recovered_manifest["global_state_changed"])
+            self.assertIn(
+                "committed",
+                (prior_run_dir / "shadow_decision.md").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (prior_run_dir / "manifest.json").read_text(encoding="utf-8"),
+                first_manifest_text,
+            )
+            self.assertEqual(
+                [record["run_id"] for record in registry_records],
+                ["committed-crash"],
+            )
+
+    def test_startup_committed_success_manifest_repairs_missing_metadata_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (
+                output_root,
+                state_path,
+                initial,
+                run_dir,
+                manifest,
+            ) = self._prepare_committed_success_recovery(root, "metadata-crash")
+            state_bytes = state_path.read_bytes()
+            manifest_bytes = (run_dir / "manifest.json").read_bytes()
+            decision_bytes = (run_dir / "shadow_decision.md").read_bytes()
+
+            evolution_runner.reconcile_startup_transition(
+                output_root, state_path, initial
+            )
+
+            latest = json.loads(
+                (output_root / "latest.json").read_text(encoding="utf-8")
+            )
+            registry = [
+                json.loads(line)
+                for line in (output_root / "evolution_registry.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+            state_after = state_path.read_bytes()
+            manifest_after = (run_dir / "manifest.json").read_bytes()
+            decision_after = (run_dir / "shadow_decision.md").read_bytes()
+
+        self.assertEqual(state_after, state_bytes)
+        self.assertEqual(manifest_after, manifest_bytes)
+        self.assertEqual(decision_after, decision_bytes)
+        self.assertEqual(latest, manifest)
+        self.assertEqual(registry, [manifest])
+
+    def test_startup_committed_success_metadata_repair_is_repeatable_and_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (
+                output_root,
+                state_path,
+                initial,
+                run_dir,
+                manifest,
+            ) = self._prepare_committed_success_recovery(root, "partial-metadata")
+            output_root.mkdir(parents=True, exist_ok=True)
+            (output_root / "evolution_registry.jsonl").write_text(
+                json.dumps(manifest) + "\n", encoding="utf-8"
+            )
+            state_bytes = state_path.read_bytes()
+            manifest_bytes = (run_dir / "manifest.json").read_bytes()
+
+            evolution_runner.reconcile_startup_transition(
+                output_root, state_path, initial
+            )
+            first_latest = (output_root / "latest.json").read_bytes()
+            first_registry = (output_root / "evolution_registry.jsonl").read_bytes()
+            evolution_runner.reconcile_startup_transition(
+                output_root, state_path, initial
+            )
+
+            registry = [
+                json.loads(line)
+                for line in (output_root / "evolution_registry.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+            state_after = state_path.read_bytes()
+            manifest_after = (run_dir / "manifest.json").read_bytes()
+            latest_after = (output_root / "latest.json").read_bytes()
+            registry_after = (output_root / "evolution_registry.jsonl").read_bytes()
+
+        self.assertEqual(state_after, state_bytes)
+        self.assertEqual(manifest_after, manifest_bytes)
+        self.assertEqual(latest_after, first_latest)
+        self.assertEqual(registry_after, first_registry)
+        self.assertEqual([record["run_id"] for record in registry], ["partial-metadata"])
+
+    def test_startup_recovery_rejects_unsafe_journal_run_ids_before_any_probe(self):
+        bad_run_ids = (
+            ".",
+            "..",
+            "nested/run",
+            r"nested\run",
+            "../probe",
+            r"..\probe",
+            r"C:\probe",
+            "CON",
+            "nul.txt",
+            "run.",
+        )
+        for index, bad_run_id in enumerate(bad_run_ids):
+            with self.subTest(run_id=bad_run_id), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                output_root = root / "runs"
+                state_path = root / f"state-{index}" / "strong_pullback.json"
+                initial = EvolutionState.initial(
+                    "baseline", {"leverage": 0.6},
+                    now="2026-07-08T00:00:00+00:00",
+                )
+                target = promote_to_shadow(
+                    initial,
+                    challenger_version="probe-shadow",
+                    challenger_parameters={"leverage": 0.75},
+                    experiment_id="probe-exp",
+                    run_id=bad_run_id,
+                    data_fingerprint="probe-data",
+                    data_asof_date="2026-07-08",
+                    now="2026-07-08T01:00:00+00:00",
+                )
+                write_evolution_state_atomic(state_path, target)
+                stage_evolution_transition(
+                    state_path,
+                    target,
+                    operation="promote",
+                    run_id=bad_run_id,
+                    experiment_id="probe-exp",
+                    now="2026-07-08T01:00:00+00:00",
+                )
+
+                with (
+                    patch(
+                        "run_strong_pullback_evolution._resolve_run_dir",
+                        wraps=evolution_runner._resolve_run_dir,
+                    ) as resolve_probe,
+                    patch("run_strong_pullback_evolution._atomic_write_text") as text_probe,
+                    patch("run_strong_pullback_evolution._atomic_write_json") as json_probe,
+                    patch("run_strong_pullback_evolution.publish_run_metadata") as metadata_probe,
+                ):
+                    with self.assertRaisesRegex(ValueError, "run_id must"):
+                        evolution_runner.reconcile_startup_transition(
+                            output_root, state_path, initial
+                        )
+
+                resolve_probe.assert_called_once_with(output_root, bad_run_id)
+                text_probe.assert_not_called()
+                json_probe.assert_not_called()
+                metadata_probe.assert_not_called()
+                journal = load_evolution_transition_journal(state_path)
+                self.assertIsNotNone(journal)
+                self.assertEqual(journal.status, "pending")
+                self.assertFalse((output_root / "latest.json").exists())
+                self.assertFalse((output_root / "evolution_registry.jsonl").exists())
+
+    def test_selection_load_precedes_core_and_gated_holdout_load(self):
+        config = self._eligible_config()
+        requested_ends: list[pd.Timestamp] = []
+
+        def loader(data_path, end_date, benchmark_path, params):
+            requested_ends.append(pd.Timestamp(end_date))
+            return self._flat_bundle(pd.Timestamp(end_date))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config=config,
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=None,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                run_id="isolation-test",
+                resume=False,
+                bundle_loader=loader,
+                trial_executor=self._eligible_run_for_params,
+                git_commit="test-commit",
+            )
+
+        self.assertEqual(requested_ends[0], config.periods.validation_end)
+        self.assertEqual(requested_ends[1], config.periods.core_test_end)
+        self.assertEqual(requested_ends[-1], pd.Timestamp("2026-07-09"))
+        self.assertEqual(outcome.test_status, "ready_for_manual_review")
+
+    def test_orchestration_replays_only_locked_candidate_at_core_segment_ends(self):
+        config = self._eligible_config()
+        seen: list[tuple[float, pd.Timestamp]] = []
+
+        def executor(bundle, params):
+            seen.append((float(params["leverage"]), pd.Timestamp(bundle.close.index.max())))
+            return self._eligible_run_for_params(bundle, params)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            run_evolution(
+                config=config,
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=None,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                run_id="real-fold-replays",
+                resume=False,
+                bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                trial_executor=executor,
+                git_commit="test-commit",
+            )
+
+        core_bundle = self._flat_bundle(config.periods.core_test_end)
+        segments = evolution_adapter.build_core_test_segments(
+            core_bundle.close.index,
+            config.periods.core_test_start,
+            config.periods.core_test_end,
+            config.evolution_core.min_folds,
+        )
+        segment_ends = {segment.test_end for segment in segments}
+        locked_leverage = max(value for value, end in seen if end == config.periods.validation_end)
+        for leverage in (0.60, locked_leverage):
+            observed_ends = {end for value, end in seen if value == leverage}
+            self.assertTrue(segment_ends.issubset(observed_ends), leverage)
+        non_locked = {0.75, 0.90} - {locked_leverage}
+        for leverage in non_locked:
+            self.assertFalse(
+                segment_ends.intersection(end for value, end in seen if value == leverage)
+            )
+
+    def test_research_bundle_rejects_holdout_dates_in_any_member(self):
+        config = parse_evolution_config(valid_raw_config())
+
+        for late_member in ("open_px", "market_exposure"):
+            with self.subTest(late_member=late_member), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data = root / "panel.csv"
+                config_path = root / "config.yaml"
+                data.write_text("evidence", encoding="utf-8")
+                config_path.write_text("evidence", encoding="utf-8")
+
+                def loader(data_path, end_date, benchmark_path, params):
+                    bundle = self._flat_bundle(pd.Timestamp(end_date))
+                    late_date = pd.Timestamp(end_date) + pd.offsets.BDay(1)
+                    if late_member == "open_px":
+                        open_px = pd.concat([
+                            bundle.open_px,
+                            pd.DataFrame({"000001": [10.0]}, index=[late_date]),
+                        ])
+                        return PriceBundle(
+                            bundle.close, open_px, bundle.high, bundle.low, bundle.amount,
+                            bundle.market_exposure,
+                        )
+                    exposure = pd.concat([
+                        bundle.market_exposure,
+                        pd.Series([1.0], index=[late_date]),
+                    ])
+                    return PriceBundle(
+                        bundle.close, bundle.open_px, bundle.high, bundle.low, bundle.amount, exposure
+                    )
+
+                with self.assertRaisesRegex(
+                    AssertionError, "Selection bundle contains post-selection dates"
+                ):
+                    run_evolution(
+                        config, data, config_path, None, pd.Timestamp("2026-07-09"), root / "runs",
+                        f"late-{late_member}", False, loader, self._run_for_params, "test-commit",
+                    )
+
+    def test_shadow_promotion_rejects_explicit_stale_asof_date(self):
+        config = self._eligible_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": ["2026-07-09", "2026-07-10"]}).to_csv(
+                data, index=False
+            )
+            pd.DataFrame(
+                {"date": ["2026-07-09", "2026-07-10"], "close": [100.0, 101.0]}
+            ).to_csv(benchmark, index=False)
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "asof_date.*panel maximum"):
+                run_evolution(
+                    config, data, config_path, benchmark, pd.Timestamp("2026-07-09"),
+                    root / "runs", "stale-asof", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    self._eligible_run_for_params, "test-commit",
+                    dry_run=False, promote_shadow=True,
+                    state_path=root / "evolution_state" / "strong_pullback.json",
+                )
+
+            self.assertFalse(
+                (root / "evolution_state" / "strong_pullback.json").exists()
+            )
+
+    def test_shadow_promotion_rejects_benchmark_ending_before_panel(self):
+        config = self._eligible_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": ["2026-07-09", "2026-07-10"]}).to_csv(
+                data, index=False
+            )
+            pd.DataFrame(
+                {"date": ["2026-07-09"], "close": [100.0]}
+            ).to_csv(benchmark, index=False)
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "benchmark.*panel maximum"):
+                run_evolution(
+                    config, data, config_path, benchmark, pd.Timestamp("2026-07-10"),
+                    root / "runs", "short-benchmark", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    self._eligible_run_for_params, "test-commit",
+                    dry_run=False, promote_shadow=True,
+                    state_path=root / "evolution_state" / "strong_pullback.json",
+                )
+
+            self.assertFalse(
+                (root / "evolution_state" / "strong_pullback.json").exists()
+            )
+
+    def test_shadow_promotion_rejects_effective_loaded_bundle_older_than_raw_max(self):
+        config = self._eligible_config()
+        asof_date = pd.Timestamp("2026-07-09")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": [asof_date]}).to_csv(data, index=False)
+            pd.DataFrame({"date": [asof_date], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            def loader(data_path, end_date, benchmark_path, params):
+                effective_end = pd.Timestamp(end_date)
+                if effective_end == asof_date:
+                    effective_end -= pd.offsets.BDay(1)
+                return self._flat_bundle(effective_end)
+
+            with self.assertRaisesRegex(ValueError, "effective loaded.*asof_date"):
+                run_evolution(
+                    config, data, config_path, benchmark, asof_date,
+                    root / "runs", "stale-loaded-bundle", False,
+                    loader, self._eligible_run_for_params, "test-commit",
+                    dry_run=False, promote_shadow=True,
+                    state_path=root / "evolution_state" / "strong_pullback.json",
+                )
+
+            self.assertFalse(
+                (root / "evolution_state" / "strong_pullback.json").exists()
+            )
+
+    def test_dry_run_allows_older_asof_without_mutating_global_state(self):
+        config = self._eligible_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            pd.DataFrame({"date": ["2026-07-09", "2026-07-10"]}).to_csv(
+                data, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                root / "runs", "older-dry-run", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                self._eligible_run_for_params, "test-commit", state_path=state_path,
+            )
+
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            state_exists = state_path.exists()
+
+        self.assertFalse(state_exists)
+        self.assertFalse(manifest["global_state_changed"])
+
+    def test_resume_requires_exact_trial_evidence_and_params(self):
+        state = {
+            "status": "completed",
+            "trial_id": "risk_075",
+            "evidence_fingerprint": "abc",
+            "params_hash": "def",
+        }
+
+        self.assertTrue(can_resume_trial(state, "abc", "def", "risk_075"))
+        self.assertFalse(can_resume_trial(state, "changed", "def", "risk_075"))
+        self.assertFalse(can_resume_trial(state, "abc", "changed", "risk_075"))
+        self.assertFalse(can_resume_trial(state, "abc", "def", "other_trial"))
+
+    def test_resume_rejects_run_level_evidence_mismatch_before_executing_trials(self):
+        config = parse_evolution_config(valid_raw_config())
+        calls: list[float] = []
+
+        def executor(bundle, params):
+            calls.append(float(params["leverage"]))
+            return self._run_for_params(bundle, params)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            kwargs = dict(
+                config=config,
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=None,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                run_id="evidence-mismatch",
+                bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                trial_executor=executor,
+                git_commit="test-commit",
+            )
+            run_evolution(resume=False, **kwargs)
+            calls.clear()
+            data.write_text("changed evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Resume evidence does not match"):
+                run_evolution(resume=True, **kwargs)
+
+        self.assertEqual(calls, [])
+
+    def test_resume_rejects_changed_benchmark_evidence_before_executing_trials(self):
+        config = parse_evolution_config(valid_raw_config())
+        calls: list[float] = []
+
+        def executor(bundle, params):
+            calls.append(float(params["leverage"]))
+            return self._run_for_params(bundle, params)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            benchmark = root / "benchmark.csv"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            benchmark.write_text("benchmark evidence", encoding="utf-8")
+            kwargs = dict(
+                config=config,
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=benchmark,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                run_id="benchmark-evidence-mismatch",
+                bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                trial_executor=executor,
+                git_commit="test-commit",
+            )
+            run_evolution(resume=False, **kwargs)
+            calls.clear()
+            benchmark.write_text("changed benchmark evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Resume evidence does not match"):
+                run_evolution(resume=True, **kwargs)
+
+        self.assertEqual(calls, [])
+
+    def test_resume_recomputes_trial_when_cached_metrics_or_csv_are_invalid(self):
+        config = parse_evolution_config(valid_raw_config())
+        mutations = ("missing_metric", "non_finite_metric", "missing_csv", "corrupt_csv")
+
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data = root / "panel.csv"
+                config_path = root / "config.yaml"
+                data.write_text("evidence", encoding="utf-8")
+                config_path.write_text("evidence", encoding="utf-8")
+                calls: list[tuple[pd.Timestamp, float]] = []
+
+                def executor(bundle, params):
+                    calls.append((bundle.close.index.max(), float(params["leverage"])))
+                    return self._run_for_params(bundle, params)
+
+                kwargs = dict(
+                    config=config,
+                    data_path=data,
+                    config_path=config_path,
+                    benchmark_path=None,
+                    asof_date=pd.Timestamp("2026-07-09"),
+                    output_root=root / "runs",
+                    run_id=f"invalid-cache-{mutation}",
+                    bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    trial_executor=executor,
+                    git_commit="test-commit",
+                )
+                outcome = run_evolution(resume=False, **kwargs)
+                trial_dir = outcome.run_dir / "trials" / "baseline"
+                if mutation == "missing_metric":
+                    metrics = json.loads((trial_dir / "metrics.json").read_text(encoding="utf-8"))
+                    del metrics["validation"]["worst_rolling_return"]
+                    (trial_dir / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+                elif mutation == "non_finite_metric":
+                    metrics = json.loads((trial_dir / "metrics.json").read_text(encoding="utf-8"))
+                    metrics["train"]["annualized_return"] = "not-a-number"
+                    (trial_dir / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+                elif mutation == "missing_csv":
+                    (trial_dir / "trade_audit.csv").unlink()
+                else:
+                    (trial_dir / "equity_curve.csv").write_text("not,date\nvalid,rows\n", encoding="utf-8")
+
+                calls.clear()
+                run_evolution(resume=True, **kwargs)
+
+                research_baseline_calls = [
+                    call for call in calls
+                    if call[0] <= config.periods.validation_end and call[1] == config.baseline["leverage"]
+                ]
+                self.assertEqual(
+                    len(research_baseline_calls),
+                    config.evolution_core.min_folds + 1,
+                )
+
+    def test_successful_run_writes_manifest_versioned_artifacts_and_chinese_report(self):
+        config = self._eligible_config()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"), root / "runs",
+                "successful-run", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(pd.Timestamp(end_date)),
+                self._eligible_run_for_params, "test-commit",
+            )
+            run_dir = outcome.run_dir
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["status"], "success")
+            self.assertRegex(manifest["evidence"]["code_fingerprint"], r"^[0-9a-f]{64}$")
+            self.assertGreaterEqual(manifest["elapsed_seconds"], 0.0)
+            self.assertGreater(manifest["peak_memory_bytes"], 0)
+            self.assertTrue((root / "runs" / "latest.json").exists())
+            self.assertTrue((run_dir / "resolved_config.yaml").exists())
+            self.assertTrue((run_dir / "trials.csv").exists())
+            self.assertTrue((run_dir / "rounds.csv").exists())
+            self.assertTrue((run_dir / "test_comparison.csv").exists())
+            folds = json.loads((run_dir / "folds.json").read_text(encoding="utf-8"))
+            self.assertGreaterEqual(len(folds), config.evolution_core.min_folds)
+            scores = pd.read_csv(run_dir / "candidate_scores.csv")
+            self.assertEqual(set(scores["candidate_id"]), {"risk_075", "risk_090"})
+            self.assertIn("failed_gates", scores.columns)
+            self.assertEqual(len(list((run_dir / "experiments").glob("*.json"))), 2)
+            for experiment_path in (run_dir / "experiments").glob("*.json"):
+                experiment = json.loads(
+                    experiment_path.read_text(encoding="utf-8"),
+                    parse_constant=lambda value: (_ for _ in ()).throw(
+                        ValueError(f"non-standard JSON constant: {value}")
+                    ),
+                )
+                self.assertEqual(
+                    experiment["code_fingerprint"],
+                    manifest["evidence"]["code_fingerprint"],
+                )
+            snapshot = json.loads(
+                (run_dir / "evolution_state_snapshot.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(snapshot["last_data_fingerprint"], manifest["data_fingerprint"])
+            self.assertIn("纸面", (run_dir / "shadow_decision.md").read_text(encoding="utf-8"))
+            self.assertFalse(manifest["global_state_changed"])
+            self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
+            self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())
+            summary = Path(manifest["summary"])
+            self.assertIn("风险提示", summary.read_text(encoding="utf-8"))
+
+    def test_both_flags_do_not_write_state_for_selection_generic_ineligible_challenger(self):
+        raw = valid_raw_config()
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+        })
+        config = parse_evolution_config(raw)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+            pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            outcome = run_evolution(
+                config, data, config_path, benchmark, pd.Timestamp("2026-07-09"), root / "runs",
+                "ineligible-run", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                self._run_for_params, "test-commit",
+                dry_run=False, promote_shadow=True, state_path=state_path,
+            )
+
+            manifest = json.loads((outcome.run_dir / "manifest.json").read_text(encoding="utf-8"))
+            scores = pd.read_csv(outcome.run_dir / "candidate_scores.csv")
+            self.assertFalse(state_path.exists())
+            self.assertFalse(manifest["global_state_changed"])
+            self.assertEqual(manifest["failed_gates"], ["no_selected_experiment"])
+            self.assertTrue(all(
+                status == "insufficient_evidence"
+                for status in scores["selection_generic_status"]
+            ))
+
+    def test_failed_run_does_not_update_latest_pointer_and_marks_manifest_failed(self):
+        config = parse_evolution_config(valid_raw_config())
+
+        def broken_executor(bundle, params):
+            raise RuntimeError("trial failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "Baseline trial failed"):
+                run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"), root / "runs",
+                    "failed-run", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(pd.Timestamp(end_date)),
+                    broken_executor, "test-commit",
+                )
+            self.assertFalse((root / "runs" / "latest.json").exists())
+            manifest = json.loads(
+                (root / "runs" / "failed-run" / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["status"], "failed")
+            self.assertFalse(manifest["global_state_changed"])
+            run_dir = root / "runs" / "failed-run"
+            for relative in (
+                "folds.json",
+                "candidate_scores.csv",
+                "evolution_state_snapshot.json",
+                "shadow_decision.md",
+            ):
+                self.assertTrue((run_dir / relative).exists(), relative)
+            self.assertTrue((run_dir / "experiments").is_dir())
+
+    def test_all_candidate_failures_preserve_every_candidate_experiment(self):
+        config = parse_evolution_config(valid_raw_config())
+
+        def candidate_failure_executor(bundle, params):
+            if float(params["leverage"]) != float(config.baseline["leverage"]):
+                raise RuntimeError("candidate failed")
+            return self._run_for_params(bundle, params)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "All candidates failed"):
+                run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                    root / "runs", "candidate-failures", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    candidate_failure_executor, "test-commit",
+                )
+
+            run_dir = root / "runs" / "candidate-failures"
+            scores = pd.read_csv(run_dir / "candidate_scores.csv")
+            self.assertEqual(set(scores["candidate_id"]), {"risk_075", "risk_090"})
+            self.assertEqual(set(scores["status"]), {"trial_error"})
+            experiments = list((run_dir / "experiments").glob("*.json"))
+            self.assertEqual(len(experiments), 2)
+
+    def test_content_identical_copied_and_touched_inputs_keep_semantic_identity(self):
+        config = parse_evolution_config(valid_raw_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            first_data = first / "panel.csv"
+            second_data = second / "copied-panel.csv"
+            first_config = first / "config.yaml"
+            second_config = second / "copied-config.yaml"
+            for path, content in (
+                (first_data, "identical panel bytes\n"),
+                (second_data, "identical panel bytes\n"),
+                (first_config, "identical config bytes\n"),
+                (second_config, "identical config bytes\n"),
+            ):
+                path.write_text(content, encoding="utf-8")
+            future = first_data.stat().st_mtime + 3600
+            os.utime(second_data, (future, future))
+            os.utime(second_config, (future, future))
+
+            outcomes = []
+            for label, data_path, config_path in (
+                ("first", first_data, first_config),
+                ("second", second_data, second_config),
+            ):
+                outcomes.append(run_evolution(
+                    config, data_path, config_path, None, pd.Timestamp("2026-07-09"),
+                    root / f"runs-{label}", f"{label}-run", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    self._run_for_params, "test-commit",
+                ))
+
+            manifests = [
+                json.loads((outcome.run_dir / "manifest.json").read_text(encoding="utf-8"))
+                for outcome in outcomes
+            ]
+            self.assertNotEqual(
+                manifests[0]["evidence_fingerprint"], manifests[1]["evidence_fingerprint"]
+            )
+            self.assertEqual(manifests[0]["data_fingerprint"], manifests[1]["data_fingerprint"])
+            experiment_names = [
+                sorted(path.name for path in (outcome.run_dir / "experiments").glob("*.json"))
+                for outcome in outcomes
+            ]
+            self.assertEqual(experiment_names[0], experiment_names[1])
+
+    def test_run_refuses_output_root_under_configs_before_writing_yaml(self):
+        config = parse_evolution_config(valid_raw_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "configs"):
+                run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                    root / "configs", "unsafe-run", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    self._run_for_params, "test-commit",
+                )
+
+            self.assertFalse((root / "configs").exists())
+
+    def test_run_rejects_unsafe_run_ids_before_creating_output(self):
+        config = parse_evolution_config(valid_raw_config())
+        unsafe_ids = ("", ".", "..", "../escape", "..\\escape", "nested/run", "nested\\run")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            for run_id in unsafe_ids:
+                with self.subTest(run_id=run_id):
+                    output_root = root / f"runs-{len(run_id)}-{run_id.count('.') }"
+                    with self.assertRaisesRegex(ValueError, "run_id"):
+                        run_evolution(
+                            config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                            output_root, run_id, False,
+                            lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                                pd.Timestamp(end_date)
+                            ),
+                            self._run_for_params, "test-commit",
+                        )
+                    self.assertFalse(output_root.exists())
+
+    def test_run_rejects_absolute_run_id_before_creating_output(self):
+        config = parse_evolution_config(valid_raw_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            output_root = root / "runs"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "run_id"):
+                run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                    output_root, str(root / "absolute-run"), False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    self._run_for_params, "test-commit",
+                )
+            self.assertFalse(output_root.exists())
+
+    def test_holdout_rollback_preserves_artifacts_but_does_not_publish(self):
+        raw = valid_raw_config()
+        raw["evolution_core"]["min_mean_return_improvement"] = 0.0
+        raw["selection"]["min_annualized_return_delta"] = 0.0
+        config = parse_evolution_config(raw)
+
+        def rollback_executor(bundle, params):
+            run = self._eligible_run_for_params(bundle, params)
+            if bundle.close.index.max() > config.periods.core_test_end:
+                daily = 0.0002 if float(params["leverage"]) == config.baseline["leverage"] else -0.0002
+                equity = run.equity.copy()
+                equity["equity"] = 1_000_000.0 * (1.0 + daily) ** pd.RangeIndex(1, len(equity) + 1)
+                equity["gross_return"] = daily
+                return StrategyRun(equity, run.weights, run.trades, run.candidates)
+            return run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+            pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+            common = dict(
+                config=config,
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=benchmark,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                git_commit="test-commit",
+            )
+            run_evolution(
+                run_id="published-run",
+                resume=False,
+                trial_executor=self._run_for_params,
+                **common,
+            )
+            latest_before = (root / "runs" / "latest.json").read_text(encoding="utf-8")
+            registry_before = (root / "runs" / "evolution_registry.jsonl").read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "Holdout test rollback_recommended"):
+                run_evolution(
+                    run_id="rollback-run",
+                    resume=False,
+                    trial_executor=rollback_executor,
+                    dry_run=False,
+                    promote_shadow=True,
+                    state_path=root / "evolution_state" / "strong_pullback.json",
+                    **common,
+                )
+
+            run_dir = root / "runs" / "rollback-run"
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["test_status"], "rollback_recommended")
+            self.assertFalse(manifest["global_state_changed"])
+            self.assertFalse((root / "evolution_state" / "strong_pullback.json").exists())
+            self.assertTrue((run_dir / "test_comparison.csv").exists())
+            self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
+            self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())
+            self.assertEqual((root / "runs" / "latest.json").read_text(encoding="utf-8"), latest_before)
+            self.assertEqual(
+                (root / "runs" / "evolution_registry.jsonl").read_text(encoding="utf-8"), registry_before
+            )
+
+    def test_holdout_warning_preserves_artifacts_but_does_not_publish(self):
+        published_raw = valid_raw_config()
+        published_raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_mean_return_improvement": 0.0,
+        })
+        published_raw["selection"]["min_annualized_return_delta"] = 0.0
+        published_config = parse_evolution_config(published_raw)
+        warning_raw = valid_raw_config()
+        warning_raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_mean_return_improvement": 0.0,
+        })
+        warning_raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_test_days": 1_000,
+        })
+        warning_config = parse_evolution_config(warning_raw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+            pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+            common = dict(
+                data_path=data,
+                config_path=config_path,
+                benchmark_path=benchmark,
+                asof_date=pd.Timestamp("2026-07-09"),
+                output_root=root / "runs",
+                bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                trial_executor=self._eligible_run_for_params,
+                git_commit="test-commit",
+            )
+            run_evolution(
+                config=published_config,
+                run_id="published-run",
+                resume=False,
+                **common,
+            )
+            latest_before = (root / "runs" / "latest.json").read_text(encoding="utf-8")
+            registry_before = (root / "runs" / "evolution_registry.jsonl").read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "Holdout test test_warning"):
+                run_evolution(
+                    config=warning_config,
+                    run_id="warning-run",
+                    resume=False,
+                    dry_run=False,
+                    promote_shadow=True,
+                    state_path=root / "evolution_state" / "strong_pullback.json",
+                    **common,
+                )
+
+            run_dir = root / "runs" / "warning-run"
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["test_status"], "test_warning")
+            self.assertFalse(manifest["global_state_changed"])
+            self.assertFalse((root / "evolution_state" / "strong_pullback.json").exists())
+            self.assertTrue((run_dir / "test_comparison.csv").exists())
+            self.assertTrue((run_dir / "final" / "baseline" / "metrics.json").exists())
+            self.assertTrue((run_dir / "final" / "champion" / "metrics.json").exists())
+            self.assertEqual((root / "runs" / "latest.json").read_text(encoding="utf-8"), latest_before)
+            self.assertEqual(
+                (root / "runs" / "evolution_registry.jsonl").read_text(encoding="utf-8"), registry_before
+            )
+
+
+class EvolutionDecisionTest(unittest.TestCase):
+    def test_checked_in_selection_gates_are_feasible_on_real_2025_calendar(self):
+        config = load_evolution_config(Path("configs/evolution_strong_pullback.yaml"))
+        exchange_holidays = pd.DatetimeIndex([
+            "2025-01-01",
+            "2025-01-28", "2025-01-29", "2025-01-30", "2025-01-31",
+            "2025-02-03", "2025-02-04",
+            "2025-04-04",
+            "2025-05-01", "2025-05-02", "2025-05-05",
+            "2025-06-02",
+        ])
+        trading_dates = pd.bdate_range("2025-01-01", "2025-06-30").difference(
+            exchange_holidays
+        )
+
+        def equity_for(net_returns):
+            returns = np.asarray(net_returns, dtype=float)
+            return pd.DataFrame({
+                "date": trading_dates,
+                "equity": 1_000_000.0 * np.cumprod(1.0 + returns),
+                "gross_return": returns,
+                "cost": 0.0,
+                "turnover": 0.10,
+                "gross_exposure": 0.60,
+            })
+
+        self.assertEqual(len(trading_dates), 117)
+        self.assertEqual(config.selection.min_validation_days, 100)
+        self.assertEqual(config.selection.rolling_window_days, 63)
+        self.assertEqual(config.selection.max_drawdown_floor, -0.40)
+        self.assertEqual(config.selection.min_sharpe_delta, -0.10)
+        self.assertEqual(config.selection.max_turnover_ratio, 1.50)
+        self.assertEqual(config.selection.max_negative_window_rate, 0.60)
+        self.assertEqual(config.evolution_core.max_drawdown_floor, -0.40)
+        self.assertEqual(config.evolution_core.max_drawdown_worsening, 0.05)
+        self.assertEqual(config.evolution_core.max_turnover_ratio, 1.50)
+        self.assertEqual(config.evolution_core.max_pnl_concentration, 0.50)
+
+        baseline_metrics = calculate_segment_metrics(
+            equity_for(np.full(len(trading_dates), 0.0002)),
+            trading_dates[0],
+            trading_dates[-1],
+            config.selection.rolling_window_days,
+        )
+        candidate_metrics = calculate_segment_metrics(
+            equity_for(np.full(len(trading_dates), 0.0005)),
+            trading_dates[0],
+            trading_dates[-1],
+            config.selection.rolling_window_days,
+        )
+        decision = evaluate_promotion(
+            candidate_metrics, baseline_metrics, config.selection
+        )
+
+        self.assertEqual(candidate_metrics["trade_days"], 117)
+        self.assertEqual(candidate_metrics["rolling_window_count"], 54)
+        self.assertTrue(decision.eligible, decision.reasons)
+
+        risky_returns = np.full(len(trading_dates), 0.0005)
+        risky_returns[80] = -0.45
+        risky_returns[81] = 0.90
+        risky_metrics = calculate_segment_metrics(
+            equity_for(risky_returns),
+            trading_dates[0],
+            trading_dates[-1],
+            config.selection.rolling_window_days,
+        )
+        risky_decision = evaluate_promotion(
+            risky_metrics, baseline_metrics, config.selection
+        )
+
+        self.assertLess(risky_metrics["max_drawdown"], -0.40)
+        self.assertFalse(risky_decision.eligible)
+        self.assertIn("最大回撤超过限制", risky_decision.reasons)
+
+    def test_build_trading_folds_uses_actual_index_positions(self):
+        dates = pd.DatetimeIndex(
+            ["2026-01-02", "2026-01-05", "2026-01-08", "2026-01-09", "2026-01-12", "2026-01-16"]
+        )
+
+        folds = build_trading_folds(
+            dates, train_days=2, validation_days=2, test_days=1, step_days=1
+        )
+
+        self.assertEqual(
+            folds[0].train_dates,
+            (pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-05")),
+        )
+        self.assertEqual(
+            folds[0].validation_dates,
+            (pd.Timestamp("2026-01-08"), pd.Timestamp("2026-01-09")),
+        )
+        self.assertEqual(folds[0].test_dates, (pd.Timestamp("2026-01-12"),))
+
+    def test_build_trading_folds_rejects_duplicate_dates(self):
+        dates = pd.DatetimeIndex(["2026-01-02", "2026-01-02", "2026-01-05"])
+
+        with pytest.raises(ValueError, match="unique"):
+            build_trading_folds(dates, train_days=1, validation_days=1, test_days=1, step_days=1)
+
+    def test_calculate_fold_metrics_uses_realized_symbol_pnl_concentration(self):
+        equity = pd.DataFrame(
+            {
+                "date": pd.date_range("2026-01-01", periods=3),
+                "gross_return": [0.0, 0.02, 0.01],
+                "cost": [0.0, 0.0, 0.0],
+                "turnover": [0.0, 0.2, 0.1],
+                "gross_exposure": [0.0, 0.6, 0.6],
+            }
+        )
+        trades = pd.DataFrame(
+            {
+                "realize_date": ["2026-01-02", "2026-01-03"],
+                "turnover": [0.2, 0.1],
+                "symbol_contributions_json": [
+                    '{"000001": 0.012, "000002": 0.008}',
+                    '{"000001": 0.006, "000002": 0.004}',
+                ]
+            }
+        )
+
+        metrics = calculate_fold_metrics(equity, trades, fold_id="f1")
+
+        self.assertAlmostEqual(metrics.pnl_concentration, 0.60)
+
+    def test_fold_metrics_filter_dates_count_execution_days_and_net_signed_contributions(self):
+        dates = pd.date_range("2026-01-01", periods=4)
+        fold = TradingFold(
+            "f1", (dates[0],), (dates[1],), (dates[2], dates[3])
+        )
+        equity = pd.DataFrame(
+            {
+                "date": dates,
+                "gross_return": [0.0, 0.0, 0.02, -0.01],
+                "cost": [0.0, 0.0, 0.0, 0.0],
+                "turnover": [0.0, 0.0, 0.2, 0.0],
+                "gross_exposure": [0.0, 0.0, 0.6, 0.6],
+            }
+        )
+        trades = pd.DataFrame(
+            {
+                "realize_date": [dates[2], dates[3], dates[1]],
+                "turnover": [0.2, 0.0, 0.5],
+                "symbol_contributions_json": [
+                    '{"000001": 0.10, "000002": 0.03}',
+                    '{"000001": -0.08, "000002": 0.00}',
+                    '{"999999": 10.0}',
+                ],
+            }
+        )
+
+        metrics = calculate_fold_metrics(equity, trades, fold)
+
+        self.assertEqual(metrics.filled_trades, 1)
+        self.assertAlmostEqual(metrics.pnl_concentration, 0.60)
+
+    def test_fold_metrics_fail_closed_without_realize_date(self):
+        dates = pd.date_range("2026-01-01", periods=4)
+        fold = TradingFold("f1", (dates[0],), (dates[1],), (dates[2], dates[3]))
+        equity = pd.DataFrame(
+            {
+                "date": dates,
+                "gross_return": [0.0, 0.0, 0.01, -0.005],
+                "cost": [0.0, 0.0, 0.0, 0.0],
+                "turnover": [0.0, 0.0, 0.1, 0.0],
+                "gross_exposure": [0.0, 0.0, 0.6, 0.6],
+            }
+        )
+        trades = pd.DataFrame(
+            {
+                "turnover": [0.1],
+                "symbol_contributions_json": ['{"000001": 0.01}'],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "realize_date"):
+            calculate_fold_metrics(equity, trades, fold)
+
+    def test_fold_metrics_fail_closed_on_malformed_contribution_json(self):
+        dates = pd.date_range("2026-01-01", periods=4)
+        fold = TradingFold("f1", (dates[0],), (dates[1],), (dates[2], dates[3]))
+        equity = pd.DataFrame(
+            {
+                "date": dates,
+                "gross_return": [0.0, 0.0, 0.01, -0.005],
+                "cost": [0.0, 0.0, 0.0, 0.0],
+                "turnover": [0.0, 0.0, 0.1, 0.0],
+                "gross_exposure": [0.0, 0.0, 0.6, 0.6],
+            }
+        )
+        trades = pd.DataFrame(
+            {
+                "realize_date": [dates[2]],
+                "turnover": [0.1],
+                "symbol_contributions_json": ["{malformed"],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "symbol_contributions_json"):
+            calculate_fold_metrics(equity, trades, fold)
+
+    def test_fold_runner_never_receives_rows_after_test_end(self):
+        dates = pd.date_range("2026-01-01", periods=6)
+        panel = pd.DataFrame({"date": dates, "symbol": "000001"})
+        folds = (
+            TradingFold("f1", tuple(dates[:2]), tuple(dates[2:4]), (dates[4],)),
+            TradingFold("f2", tuple(dates[:3]), tuple(dates[3:5]), (dates[5],)),
+        )
+        seen: list[pd.Timestamp] = []
+
+        results = run_strong_pullback_folds(
+            panel,
+            folds,
+            lambda sliced, params: seen.append(sliced["date"].max()) or {"params": params},
+            {"leverage": 0.6},
+        )
+
+        self.assertEqual(seen, [fold.test_end for fold in folds])
+        self.assertEqual([fold.fold_id for fold, _ in results], ["f1", "f2"])
+
+    def test_future_bundle_changes_cannot_change_prior_fold_metrics_or_decision(self):
+        dates = pd.bdate_range("2026-01-05", periods=10)
+        close = pd.DataFrame({"000001": np.linspace(10.0, 11.0, len(dates))}, index=dates)
+        bundle = PriceBundle(
+            close,
+            close * 0.999,
+            close * 1.01,
+            close * 0.99,
+            close * 1_000_000.0,
+            pd.Series(1.0, index=dates),
+        )
+        folds = (
+            TradingFold("f1", tuple(dates[:3]), tuple(dates[3:5]), tuple(dates[5:7])),
+            TradingFold("f2", tuple(dates[:5]), tuple(dates[5:7]), tuple(dates[7:9])),
+        )
+        seen: list[pd.Timestamp] = []
+
+        def executor(sliced, params):
+            seen.append(pd.Timestamp(sliced.close.index.max()))
+            run_dates = sliced.close.index
+            daily = float(sliced.close.iloc[-1, 0] / 10_000.0)
+            equity = pd.DataFrame(
+                {
+                    "date": run_dates,
+                    "equity": 1_000_000.0,
+                    "gross_return": [daily if index % 2 == 0 else daily / 2.0 for index in range(len(run_dates))],
+                    "cost": 0.0,
+                    "turnover": 0.1,
+                    "gross_exposure": 0.6,
+                }
+            )
+            trades = pd.DataFrame(
+                {
+                    "realize_date": run_dates,
+                    "turnover": 0.1,
+                    "symbol_contributions_json": [
+                        json.dumps({"000001": daily}) for _ in run_dates
+                    ],
+                }
+            )
+            return StrategyRun(equity, pd.DataFrame(), trades, pd.DataFrame())
+
+        base_metrics = evaluate_strategy_folds(bundle, folds, executor, {"leverage": 0.6})
+        def change_frame_after(frame, multiplier):
+            changed = frame.copy()
+            changed.loc[changed.index > folds[0].test_end] *= multiplier
+            return changed
+
+        changed_close = change_frame_after(bundle.close, 5.0)
+        changed_exposure = bundle.market_exposure.copy()
+        changed_exposure.loc[changed_exposure.index > folds[0].test_end] = 0.0
+        changed_bundle = PriceBundle(
+            changed_close,
+            change_frame_after(bundle.open_px, 4.0),
+            change_frame_after(bundle.high, 6.0),
+            change_frame_after(bundle.low, 3.0),
+            change_frame_after(bundle.amount, 10.0),
+            changed_exposure,
+        )
+        changed_metrics = evaluate_strategy_folds(
+            changed_bundle, folds, executor, {"leverage": 0.6}
+        )
+        policy = CorePromotionPolicy(
+            min_folds=1,
+            min_filled_trades_per_fold=1,
+            min_positive_fold_ratio=0.0,
+            min_mean_return_improvement=0.0,
+            max_drawdown_floor=-1.0,
+            max_drawdown_worsening=1.0,
+            max_turnover_ratio=2.0,
+            max_pnl_concentration=1.0,
+        )
+
+        self.assertEqual(seen, [fold.test_end for fold in folds] * 2)
+        self.assertEqual(base_metrics[0], changed_metrics[0])
+        self.assertEqual(
+            evaluate_core_candidate((base_metrics[0],), (base_metrics[0],), policy),
+            evaluate_core_candidate((changed_metrics[0],), (base_metrics[0],), policy),
+        )
+
+    def test_segment_metrics_compound_net_returns_inside_requested_period(self):
+        equity = pd.DataFrame(
+            {
+                "date": pd.date_range("2025-01-01", periods=4, freq="B"),
+                "gross_return": [0.50, 0.10, -0.05, 0.02],
+                "cost": [0.0, 0.01, 0.0, 0.0],
+                "turnover": [0.0, 0.2, 0.1, 0.0],
+                "gross_exposure": [0.0, 0.6, 0.6, 0.6],
+            }
+        )
+
+        metrics = calculate_segment_metrics(
+            equity, "2025-01-02", "2025-01-06", rolling_window_days=2
+        )
+
+        self.assertAlmostEqual(metrics["total_return"], 1.09 * 0.95 * 1.02 - 1.0)
+        self.assertEqual(metrics["trade_days"], 3)
+        self.assertAlmostEqual(metrics["avg_turnover"], 0.1)
+        self.assertEqual(metrics["rolling_window_count"], 1)
+
+    def test_segment_metrics_rejects_negative_rolling_window_before_shift(self):
+        equity = pd.DataFrame(
+            {
+                "date": pd.date_range("2025-01-01", periods=3, freq="B"),
+                "gross_return": [0.01, 0.01, 0.01],
+                "cost": [0.0, 0.0, 0.0],
+                "turnover": [0.1, 0.1, 0.1],
+                "gross_exposure": [0.6, 0.6, 0.6],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "rolling_window_days"):
+            calculate_segment_metrics(
+                equity, "2025-01-01", "2025-01-03", rolling_window_days=-2
+            )
+
+    def test_promotion_accepts_exact_drawdown_and_sharpe_boundaries(self):
+        rules = parse_evolution_config(valid_raw_config()).selection
+        incumbent = {
+            "annualized_return": 0.10, "max_drawdown": -0.30, "sharpe_like": 0.50,
+            "avg_turnover": 0.10, "trade_days": 200, "negative_window_rate": 0.20,
+            "rolling_window_count": 1,
+        }
+        candidate = {
+            "annualized_return": 0.11, "max_drawdown": -0.40, "sharpe_like": 0.40,
+            "avg_turnover": 0.15, "trade_days": 200, "negative_window_rate": 0.60,
+            "rolling_window_count": 1,
+        }
+
+        decision = evaluate_promotion(candidate, incumbent, rules)
+
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.reasons, ())
+
+    def test_group_keeps_incumbent_when_no_candidate_passes(self):
+        rules = parse_evolution_config(valid_raw_config()).selection
+        incumbent = {
+            "annualized_return": 0.10, "max_drawdown": -0.20, "sharpe_like": 0.50,
+            "avg_turnover": 0.10, "trade_days": 200, "negative_window_rate": 0.20,
+            "rolling_window_count": 1,
+        }
+        candidate = {**incumbent, "annualized_return": 0.105}
+
+        winner, decisions = choose_group_winner(
+            "incumbent", incumbent, (("weak_gain", candidate),), rules
+        )
+
+        self.assertEqual(winner, "incumbent")
+        self.assertFalse(decisions[0].promotion.eligible)
+
+    def test_promotion_rejects_candidate_without_completed_rolling_windows(self):
+        rules = parse_evolution_config(valid_raw_config()).selection
+        incumbent = {
+            "annualized_return": 0.10, "max_drawdown": -0.20, "sharpe_like": 0.50,
+            "avg_turnover": 0.10, "trade_days": 200, "negative_window_rate": 0.20,
+            "rolling_window_count": 1,
+        }
+        candidate = {
+            "annualized_return": 0.11, "max_drawdown": -0.20, "sharpe_like": 0.50,
+            "avg_turnover": 0.10, "trade_days": 200, "negative_window_rate": 0.0,
+            "rolling_window_count": 0,
+        }
+
+        decision = evaluate_promotion(candidate, incumbent, rules)
+
+        self.assertFalse(decision.eligible)
+        self.assertIn("滚动窗口", "；".join(decision.reasons))
+
+    def test_holdout_recommends_rollback_when_champion_loses(self):
+        rules = parse_evolution_config(valid_raw_config()).selection
+        baseline = {"total_return": 0.20, "max_drawdown": -0.20, "sharpe_like": 0.50, "trade_days": 100}
+        champion = {"total_return": 0.10, "max_drawdown": -0.25, "sharpe_like": 0.45, "trade_days": 100}
+
+        status, reason = assess_test_result(baseline, champion, rules)
+
+        self.assertEqual(status, "rollback_recommended")
+        self.assertIn("收益", reason)
+
+    def test_holdout_warns_when_required_metrics_are_missing_or_non_finite(self):
+        rules = parse_evolution_config(valid_raw_config()).selection
+        baseline = {"total_return": 0.20, "max_drawdown": -0.20, "sharpe_like": 0.50, "trade_days": 100}
+        champion = {"total_return": 0.20, "max_drawdown": -0.20, "sharpe_like": 0.50, "trade_days": 100}
+
+        for missing_key in ("total_return", "max_drawdown", "sharpe_like", "trade_days"):
+            with self.subTest(case=f"missing {missing_key}"):
+                metrics = dict(champion)
+                del metrics[missing_key]
+                status, _ = assess_test_result(baseline, metrics, rules)
+                self.assertEqual(status, "test_warning")
+
+        for non_finite_key in ("total_return", "max_drawdown", "sharpe_like"):
+            with self.subTest(case=f"non-finite {non_finite_key}"):
+                metrics = dict(champion)
+                metrics[non_finite_key] = float("nan")
+                status, _ = assess_test_result(baseline, metrics, rules)
+                self.assertEqual(status, "test_warning")
+
+        metrics = dict(champion)
+        metrics["trade_days"] = float("nan")
+        status, _ = assess_test_result(baseline, metrics, rules)
+        self.assertEqual(status, "test_warning")
