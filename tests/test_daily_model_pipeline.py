@@ -1,8 +1,10 @@
 import tempfile
 import unittest
 import json
+import subprocess
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from run_daily_model_pipeline import (
     PipelineConfig,
@@ -11,6 +13,7 @@ from run_daily_model_pipeline import (
     build_daily_pipeline_steps,
     build_daily_run_state,
     ensure_fetch_status_ok,
+    execute_pipeline,
     latest_daily_date,
     metrics_path_for_date,
     names_source_for_date,
@@ -39,6 +42,11 @@ class DailyModelPipelineTest(unittest.TestCase):
         steps = build_daily_pipeline_steps(config)
         names = [step.name for step in steps]
 
+        self.assertEqual(names[:2], ["benchmark_refresh", "update_panel"])
+        benchmark_step = steps[0]
+        benchmark_args = " ".join(str(part) for part in benchmark_step.command)
+        self.assertIn("update_benchmark_510300.py", benchmark_args)
+        self.assertIn("benchmark_refresh_status_20260629.json", benchmark_args)
         self.assertIn("regime_shadow_compare", names)
         shadow_step = steps[names.index("regime_shadow_compare")]
         shadow_args = " ".join(str(part) for part in shadow_step.command)
@@ -99,6 +107,65 @@ class DailyModelPipelineTest(unittest.TestCase):
         names = [step.name for step in build_daily_pipeline_steps(config)]
 
         self.assertNotIn("regime_shadow_compare", names)
+
+    def test_pipeline_can_skip_benchmark_refresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                python_exe="python",
+                project_root=Path(tmp),
+                include_benchmark_refresh=False,
+                daily_data_dir=Path(tmp),
+                fetch_status_utils=Path(tmp) / "missing_utils.py",
+            )
+            stale_status = (
+                Path(tmp)
+                / "outputs"
+                / "high_return_v2"
+                / "benchmark_refresh_status_20260629.json"
+            )
+            stale_status.parent.mkdir(parents=True)
+            stale_status.write_text('{"status":"old"}', encoding="utf-8")
+
+            names = [step.name for step in build_daily_pipeline_steps(config)]
+            record = build_daily_run_state(config, [])
+
+            self.assertNotIn("benchmark_refresh", names)
+            self.assertEqual(names[0], "update_panel")
+            self.assertEqual(record["verification"]["benchmark_refresh_status"], "skipped")
+            self.assertIsNone(record["artifacts"]["benchmark_refresh_status"])
+
+    def test_failed_benchmark_step_is_appended_to_state_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_log = root / "daily_run_state.jsonl"
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                python_exe="python",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                daily_data_dir=root,
+                fetch_status_utils=root / "missing_utils.py",
+            )
+            steps = [PipelineStep("benchmark_refresh", ("python", "refresh.py"))]
+
+            with patch(
+                "run_daily_model_pipeline.subprocess.run",
+                side_effect=subprocess.CalledProcessError(1, ["python", "refresh.py"]),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "benchmark_refresh"):
+                    execute_pipeline(
+                        config,
+                        steps,
+                        state_log=state_log,
+                        argv=["--asof-date", "2026-06-29"],
+                        test_status="not_run",
+                    )
+
+            record = json.loads(state_log.read_text(encoding="utf-8").strip())
+            self.assertEqual(record["run_status"], "failed")
+            self.assertEqual(record["failure"]["step"], "benchmark_refresh")
+            self.assertEqual(record["verification"]["benchmark_refresh_status"], "missing")
 
     def test_fetch_status_must_be_ok_before_real_run(self):
         ensure_fetch_status_ok({"status": "ok", "run_id": "run-1"})
@@ -168,6 +235,17 @@ class DailyModelPipelineTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (shadow_dir / "report.md").write_text("shadow report", encoding="utf-8")
+            (output / f"benchmark_refresh_status_{token}.json").write_text(
+                json.dumps(
+                    {
+                        "status": "already_fresh",
+                        "latest_date": "2026-06-29",
+                        "source_agreement": True,
+                        "rows_added": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
             config = PipelineConfig(
                 asof_date="2026-06-29",
                 python_exe="python",
@@ -202,6 +280,10 @@ class DailyModelPipelineTest(unittest.TestCase):
             self.assertEqual(record["verification"]["regime_shadow_total_return_delta"], 0.03)
             self.assertFalse(record["verification"]["regime_shadow_benchmark_fresh"])
             self.assertTrue(str(record["artifacts"]["regime_shadow_report"]).endswith("report.md"))
+            self.assertEqual(record["verification"]["benchmark_refresh_status"], "already_fresh")
+            self.assertEqual(record["verification"]["benchmark_latest_date"], "2026-06-29")
+            self.assertTrue(record["verification"]["benchmark_source_agreement"])
+            self.assertTrue(str(record["artifacts"]["benchmark_refresh_status"]).endswith(".json"))
 
     def test_daily_run_state_uses_newest_pending_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -28,6 +28,13 @@ class PipelineStep:
     command: tuple[str, ...]
 
 
+class PipelineStepExecutionError(RuntimeError):
+    def __init__(self, step: PipelineStep, returncode: int):
+        super().__init__(f"Pipeline step {step.name} failed with exit code {returncode}")
+        self.step = step
+        self.returncode = returncode
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     asof_date: str
@@ -59,6 +66,7 @@ class PipelineConfig:
     allowed_trend_states: str = DEFAULT_ALLOWED_TREND_STATES
     include_strategy_stability_report: bool = True
     include_strategy_family_forward_report: bool = True
+    include_benchmark_refresh: bool = True
     include_regime_shadow_compare: bool = True
     regime_shadow_config: Path = Path("configs/evolution_strong_pullback.yaml")
     regime_shadow_candidate_id: str = "regime_090_balanced"
@@ -241,6 +249,7 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "regime_shadow_dir": output_root / f"regime_shadow_compare_{token}",
         "regime_shadow_report": output_root / f"regime_shadow_compare_{token}" / "report.md",
         "regime_shadow_comparison": output_root / f"regime_shadow_compare_{token}" / "comparison.json",
+        "benchmark_refresh_status": output_root / f"benchmark_refresh_status_{token}.json",
     }
 
 
@@ -248,7 +257,24 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
     paths = _paths(config)
     token = _date_token(config.asof_date)
     base_target_weight = min(config.max_position_weight, config.leverage / max(config.top_n, 1))
-    steps = [
+    steps: list[PipelineStep] = []
+    if config.include_benchmark_refresh:
+        steps.append(
+            PipelineStep(
+                "benchmark_refresh",
+                (
+                    config.python_exe,
+                    str(config.project_root / "update_benchmark_510300.py"),
+                    "--benchmark",
+                    str(config.benchmark),
+                    "--asof-date",
+                    config.asof_date,
+                    "--status-output",
+                    str(paths["benchmark_refresh_status"]),
+                ),
+            )
+        )
+    steps.extend([
         PipelineStep(
             "update_panel",
             (
@@ -281,7 +307,7 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                 str(config.max_abs_daily_return),
             ),
         ),
-    ]
+    ])
     if config.include_regime_shadow_compare:
         steps.append(
             PipelineStep(
@@ -534,7 +560,10 @@ def run_steps(steps: list[PipelineStep], project_root: Path, dry_run: bool = Fal
         print(f"[{index}/{len(steps)}] {step.name}")
         print(" ".join(step.command))
         if not dry_run:
-            subprocess.run(step.command, cwd=project_root, check=True)
+            try:
+                subprocess.run(step.command, cwd=project_root, check=True)
+            except subprocess.CalledProcessError as exc:
+                raise PipelineStepExecutionError(step, int(exc.returncode)) from exc
 
 
 def build_daily_run_state(
@@ -542,6 +571,8 @@ def build_daily_run_state(
     steps: list[PipelineStep],
     argv: list[str] | None = None,
     test_status: str = "not_run_by_pipeline",
+    run_status: str = "success",
+    failure: dict[str, object] | None = None,
 ) -> dict[str, object]:
     paths = _paths(config)
     priority_path = _latest_artifact(paths["merged_priority_watchlist"])
@@ -564,6 +595,12 @@ def build_daily_run_state(
     selected_rows = _read_csv_rows(selected_path)
     change_rows = _read_csv_rows(changes_path)
     regime_shadow = _read_json_object(paths["regime_shadow_comparison"])
+    if not config.include_benchmark_refresh:
+        benchmark_refresh = {"status": "skipped"}
+    elif paths["benchmark_refresh_status"].exists():
+        benchmark_refresh = _read_json_object(paths["benchmark_refresh_status"])
+    else:
+        benchmark_refresh = {"status": "missing"}
     regime_delta = regime_shadow.get("delta")
     if not isinstance(regime_delta, dict):
         regime_delta = {}
@@ -574,6 +611,8 @@ def build_daily_run_state(
         regime_latest = {}
     return {
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
+        "run_status": run_status,
+        "failure": failure,
         "asof_date": config.asof_date,
         "project_root": str(config.project_root),
         "run_type": "full_train" if config.train_model else "skip_train",
@@ -606,6 +645,10 @@ def build_daily_run_state(
             "regime_shadow_max_drawdown_delta": regime_delta.get("max_drawdown"),
             "regime_shadow_benchmark_last_date": regime_shadow.get("benchmark_last_date"),
             "regime_shadow_benchmark_fresh": regime_shadow.get("benchmark_fresh"),
+            "benchmark_refresh_status": benchmark_refresh.get("status"),
+            "benchmark_latest_date": benchmark_refresh.get("latest_date"),
+            "benchmark_source_agreement": benchmark_refresh.get("source_agreement"),
+            "benchmark_rows_added": benchmark_refresh.get("rows_added"),
         },
         "top10": _top_rows(priority_rows, ["symbol", "stock_name", "strategy_family", "priority_bucket"]),
         "artifacts": {
@@ -623,6 +666,12 @@ def build_daily_run_state(
             "stability_report": str(_latest_artifact(paths["strategy_stability_report"])),
             "regime_shadow_report": str(_latest_artifact(paths["regime_shadow_report"])),
             "regime_shadow_comparison": str(_latest_artifact(paths["regime_shadow_comparison"])),
+            "benchmark_refresh_status": (
+                str(_latest_artifact(paths["benchmark_refresh_status"]))
+                if config.include_benchmark_refresh
+                and paths["benchmark_refresh_status"].exists()
+                else None
+            ),
         },
     }
 
@@ -631,6 +680,44 @@ def append_daily_run_state(state_log: Path, record: dict[str, object]) -> None:
     state_log.parent.mkdir(parents=True, exist_ok=True)
     with state_log.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def execute_pipeline(
+    config: PipelineConfig,
+    steps: list[PipelineStep],
+    *,
+    state_log: Path,
+    argv: list[str] | None = None,
+    test_status: str = "not_run_by_pipeline",
+    skip_state_log: bool = False,
+    dry_run: bool = False,
+) -> None:
+    try:
+        run_steps(steps, config.project_root, dry_run=dry_run)
+    except PipelineStepExecutionError as exc:
+        if not dry_run and not skip_state_log:
+            record = build_daily_run_state(
+                config,
+                steps,
+                argv=argv,
+                test_status=test_status,
+                run_status="failed",
+                failure={
+                    "step": exc.step.name,
+                    "returncode": exc.returncode,
+                    "message": str(exc),
+                },
+            )
+            append_daily_run_state(state_log, record)
+        raise
+    if not dry_run and not skip_state_log:
+        record = build_daily_run_state(
+            config,
+            steps,
+            argv=argv,
+            test_status=test_status,
+        )
+        append_daily_run_state(state_log, record)
 
 
 def parse_args() -> argparse.Namespace:
@@ -651,6 +738,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-strategy-family-forward", action="store_true")
     parser.add_argument("--skip-strategy-stability", action="store_true")
+    parser.add_argument("--skip-benchmark-refresh", action="store_true")
     parser.add_argument("--skip-regime-shadow-compare", action="store_true")
     parser.add_argument("--regime-shadow-config", default="configs/evolution_strong_pullback.yaml")
     parser.add_argument("--regime-shadow-candidate-id", default="regime_090_balanced")
@@ -684,6 +772,7 @@ def main() -> None:
         train_model=not args.skip_train,
         include_strategy_family_forward_report=not args.skip_strategy_family_forward,
         include_strategy_stability_report=not args.skip_strategy_stability,
+        include_benchmark_refresh=not args.skip_benchmark_refresh,
         include_regime_shadow_compare=not args.skip_regime_shadow_compare,
         regime_shadow_config=Path(args.regime_shadow_config),
         regime_shadow_candidate_id=args.regime_shadow_candidate_id,
@@ -693,17 +782,17 @@ def main() -> None:
     print(json.dumps(fetch_status, ensure_ascii=False, indent=2, default=str))
     if not args.dry_run:
         ensure_fetch_status_ok(fetch_status)
-    steps = build_daily_pipeline_steps(config)
-    run_steps(steps, project_root, dry_run=args.dry_run)
     state_log = _resolve(project_root, Path(args.state_log))
-    if not args.dry_run and not args.skip_state_log:
-        record = build_daily_run_state(
-            config,
-            steps,
-            argv=sys.argv[1:],
-            test_status=args.state_test_status,
-        )
-        append_daily_run_state(state_log, record)
+    steps = build_daily_pipeline_steps(config)
+    execute_pipeline(
+        config,
+        steps,
+        state_log=state_log,
+        argv=sys.argv[1:],
+        test_status=args.state_test_status,
+        skip_state_log=args.skip_state_log,
+        dry_run=args.dry_run,
+    )
     token = _date_token(asof_date)
     output_root = _resolve(project_root, Path(args.output_root))
     print("Daily workflow outputs:")
@@ -720,6 +809,8 @@ def main() -> None:
         print(output_root / f"core_risk_filter_finalist_stability_{token}.md")
     if config.include_regime_shadow_compare:
         print(output_root / f"regime_shadow_compare_{token}" / "report.md")
+    if config.include_benchmark_refresh:
+        print(output_root / f"benchmark_refresh_status_{token}.json")
     if not args.dry_run and not args.skip_state_log:
         print("Daily run state:")
         print(state_log)
