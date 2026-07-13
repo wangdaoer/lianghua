@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -17,6 +18,7 @@ from run_daily_model_pipeline import (
     latest_daily_date,
     metrics_path_for_date,
     names_source_for_date,
+    parse_args,
 )
 
 
@@ -53,6 +55,15 @@ class DailyModelPipelineTest(unittest.TestCase):
         self.assertIn("run_daily_regime_shadow_compare.py", shadow_args)
         self.assertIn("regime_shadow_compare_20260629", shadow_args)
         self.assertIn("daily-market-data\\benchmarks\\510300.csv", shadow_args)
+        self.assertIn("regime_shadow_tracking", names)
+        tracking_step = steps[names.index("regime_shadow_tracking")]
+        tracking_args = " ".join(str(part) for part in tracking_step.command)
+        self.assertEqual(names[names.index("regime_shadow_compare") + 1], "regime_shadow_tracking")
+        self.assertIn("update_regime_shadow_tracking.py", tracking_args)
+        self.assertIn("regime_shadow_tracking.csv", tracking_args)
+        self.assertIn("regime_shadow_tracking_summary.json", tracking_args)
+        self.assertIn("regime_shadow_tracking_report.md", tracking_args)
+        self.assertIn("--target-days 20", tracking_args)
 
         self.assertEqual(
             names[-7:],
@@ -102,11 +113,33 @@ class DailyModelPipelineTest(unittest.TestCase):
             python_exe="python",
             project_root=Path("C:/model"),
             include_regime_shadow_compare=False,
+            include_regime_shadow_tracking=False,
         )
 
         names = [step.name for step in build_daily_pipeline_steps(config)]
 
         self.assertNotIn("regime_shadow_compare", names)
+
+    def test_pipeline_requires_compare_when_tracking_enabled(self):
+        config = PipelineConfig(
+            asof_date="2026-06-29",
+            python_exe="python",
+            project_root=Path("C:/model"),
+            include_regime_shadow_compare=False,
+        )
+        object.__setattr__(config, "include_regime_shadow_tracking", True)
+
+        with self.assertRaisesRegex(ValueError, "comparison"):
+            build_daily_pipeline_steps(config)
+
+    def test_parse_args_accepts_skip_regime_shadow_tracking_flag(self):
+        with patch.object(sys, "argv", ["run_daily_model_pipeline.py", "--skip-regime-shadow-tracking"]):
+            try:
+                args = parse_args()
+            except SystemExit as exc:
+                self.fail(f"parse_args should accept --skip-regime-shadow-tracking: {exc}")
+
+        self.assertTrue(args.skip_regime_shadow_tracking)
 
     def test_pipeline_can_skip_benchmark_refresh(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -284,6 +317,100 @@ class DailyModelPipelineTest(unittest.TestCase):
             self.assertEqual(record["verification"]["benchmark_latest_date"], "2026-06-29")
             self.assertTrue(record["verification"]["benchmark_source_agreement"])
             self.assertTrue(str(record["artifacts"]["benchmark_refresh_status"]).endswith(".json"))
+
+    def test_build_daily_run_state_includes_tracking_summary_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            output.mkdir(parents=True)
+            token = "20260629"
+            self._write_csv(
+                output / f"merged_priority_watchlist_{token}.csv",
+                [{"symbol": "000001", "stock_name": "Alpha", "priority_bucket": "model_focus"}],
+            )
+            self._write_csv(output / f"early_pattern_watchlist_{token}.csv", [])
+            self._write_csv(output / f"merged_model_decision_table_{token}.csv", [])
+            self._write_csv(output / f"daily_personal_overlay_selected_{token}.csv", [])
+            self._write_csv(output / f"daily_personal_overlay_changes_{token}.csv", [])
+            shadow_dir = output / f"regime_shadow_compare_{token}"
+            shadow_dir.mkdir()
+            (shadow_dir / "comparison.json").write_text(
+                json.dumps({"decision": "experimental_only", "benchmark_fresh": True, "delta": {}, "latest_dynamic_state": {}}),
+                encoding="utf-8",
+            )
+            (shadow_dir / "report.md").write_text("shadow report", encoding="utf-8")
+            tracking_summary = output / "regime_shadow_tracking_summary.json"
+            tracking_summary.write_text(
+                json.dumps(
+                    {
+                        "status": "manual_review_ready",
+                        "valid_observation_count": 20,
+                        "target_days": 20,
+                        "remaining_days": 0,
+                        "invalid_observation_count": 0,
+                        "cumulative_return_delta": 0.05,
+                        "latest_benchmark_fresh": True,
+                        "latest_risk_state": {"risk_regime": "strong", "target_leverage": 0.75},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output / "regime_shadow_tracking.csv").write_text("asof_date\n2026-06-29\n", encoding="utf-8")
+            (output / "regime_shadow_tracking_report.md").write_text("tracking report", encoding="utf-8")
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                python_exe="python",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                daily_data_dir=root,
+                fetch_status_utils=root / "missing_utils.py",
+            )
+
+            record = build_daily_run_state(config, [])
+
+            self.assertEqual(record["verification"]["regime_shadow_tracking_status"], "manual_review_ready")
+            self.assertEqual(record["verification"]["regime_shadow_tracking_valid_observations"], 20)
+            self.assertEqual(record["verification"]["regime_shadow_tracking_target_days"], 20)
+            self.assertEqual(record["verification"]["regime_shadow_tracking_remaining_days"], 0)
+            self.assertEqual(record["verification"]["regime_shadow_tracking_cumulative_return_delta"], 0.05)
+            self.assertTrue(record["verification"]["regime_shadow_tracking_benchmark_fresh"])
+            self.assertEqual(record["verification"]["regime_shadow_tracking_risk_regime"], "strong")
+            self.assertTrue(str(record["artifacts"]["regime_shadow_tracking_summary"]).endswith(".json"))
+
+    def test_build_daily_run_state_marks_tracking_skipped_and_hides_stale_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            output.mkdir(parents=True)
+            token = "20260629"
+            self._write_csv(
+                output / f"merged_priority_watchlist_{token}.csv",
+                [{"symbol": "000001", "stock_name": "Alpha", "priority_bucket": "model_focus"}],
+            )
+            self._write_csv(output / f"early_pattern_watchlist_{token}.csv", [])
+            self._write_csv(output / f"merged_model_decision_table_{token}.csv", [])
+            self._write_csv(output / f"daily_personal_overlay_selected_{token}.csv", [])
+            self._write_csv(output / f"daily_personal_overlay_changes_{token}.csv", [])
+            (output / "regime_shadow_tracking.csv").write_text("stale", encoding="utf-8")
+            (output / "regime_shadow_tracking_summary.json").write_text('{"status": "stale"}', encoding="utf-8")
+            (output / "regime_shadow_tracking_report.md").write_text("stale", encoding="utf-8")
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                python_exe="python",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                daily_data_dir=root,
+                fetch_status_utils=root / "missing_utils.py",
+            )
+            object.__setattr__(config, "include_regime_shadow_tracking", False)
+
+            record = build_daily_run_state(config, [])
+
+            self.assertEqual(record["verification"]["regime_shadow_tracking_status"], "skipped")
+            self.assertIsNone(record["verification"]["regime_shadow_tracking_valid_observations"])
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_ledger"])
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_summary"])
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_report"])
 
     def test_daily_run_state_uses_newest_pending_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:

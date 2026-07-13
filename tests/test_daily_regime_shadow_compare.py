@@ -80,6 +80,7 @@ class DailyRegimeShadowCompareTest(unittest.TestCase):
         )
         report = render_chinese_report(payload)
 
+        self.assertEqual(payload["asof"], "2026-07-13")
         self.assertAlmostEqual(payload["delta"]["total_return"], 0.03)
         self.assertAlmostEqual(payload["delta"]["max_drawdown"], 0.01)
         self.assertEqual(payload["decision"], "experimental_only")
