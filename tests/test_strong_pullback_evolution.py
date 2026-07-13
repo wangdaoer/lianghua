@@ -1881,6 +1881,211 @@ class EvolutionOrchestrationTest(unittest.TestCase):
         self.assertEqual(journal.status, "committed")
         self.assertEqual(manifest["selected_experiment_id"], "prior-exp")
 
+    def test_persisted_shadow_requires_generic_selection_gate_before_parenting(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [{
+            "id": "strong_replacement_group",
+            "hypothesis_cn": "must wait for the next evolution run",
+            "candidates": [{
+                "id": "strong_replacement", "overrides": {"top_n": 7}
+            }],
+        }]
+        config = parse_evolution_config(raw)
+        shadow_params = {**config.baseline, "leverage": 0.75}
+
+        def executor(bundle, params):
+            if int(params["top_n"]) == 7:
+                daily = 0.0008
+            elif float(params["leverage"]) == 0.75:
+                daily = 0.0003
+            else:
+                daily = 0.0002
+            run = self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+            if float(params["leverage"]) != 0.75:
+                return run
+            concentrated_trades = run.trades.copy()
+            concentrated_trades["symbol_contributions_json"] = [
+                json.dumps({"000001": daily}) for _ in range(len(run.trades))
+            ]
+            return StrategyRun(
+                run.equity, run.weights, concentrated_trades, run.candidates
+            )
+
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state_path = root / "evolution_state" / "strong_pullback.json"
+                initial = EvolutionState.initial(
+                    "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+                )
+                shadow = promote_to_shadow(
+                    initial,
+                    challenger_version="concentrated-shadow",
+                    challenger_parameters=shadow_params,
+                    experiment_id="prior-exp",
+                    run_id="prior-run",
+                    data_fingerprint="prior-data",
+                    data_asof_date="2026-07-08",
+                    now="2026-07-08T01:00:00+00:00",
+                )
+                write_evolution_state_atomic(state_path, shadow)
+                data = root / "panel.csv"
+                benchmark = root / "benchmark.csv"
+                config_path = root / "config.yaml"
+                pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+                pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                    benchmark, index=False
+                )
+                config_path.write_text("evidence", encoding="utf-8")
+
+                with patch(
+                    "run_strong_pullback_evolution.build_group_candidates",
+                    wraps=build_group_candidates,
+                ) as candidate_search:
+                    outcome = run_evolution(
+                        config, data, config_path, benchmark,
+                        pd.Timestamp("2026-07-09"), root / "runs",
+                        f"generic-shadow-rollback-{dry_run}", False,
+                        lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                            pd.Timestamp(end_date)
+                        ),
+                        executor, "test-commit", dry_run=dry_run,
+                        promote_shadow=True, state_path=state_path,
+                    )
+
+                persisted = load_evolution_state(state_path, initial)
+                journal = load_evolution_transition_journal(state_path)
+                manifest = json.loads(
+                    (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                snapshot = json.loads(
+                    (outcome.run_dir / "evolution_state_snapshot.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                final_parameters = yaml.safe_load(
+                    (outcome.run_dir / "champion_candidate.yaml").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+                candidate_search.assert_not_called()
+                self.assertEqual(outcome.test_status, "not_opened_shadow_rollback")
+                self.assertIn("pnl_concentration", manifest["failed_gates"])
+                self.assertIn("legacy=passed", outcome.test_reason)
+                self.assertIn("generic=pnl_concentration", outcome.test_reason)
+                self.assertEqual(snapshot["shadow_status"], "rolled_back")
+                self.assertEqual(snapshot["champion_parameters"], config.baseline)
+                self.assertEqual(final_parameters, config.baseline)
+                self.assertNotEqual(snapshot["champion_parameters"], shadow_params)
+                self.assertFalse((outcome.run_dir / "final").exists())
+                if dry_run:
+                    self.assertEqual(persisted, shadow)
+                    self.assertIsNone(journal)
+                    self.assertFalse(manifest["global_state_changed"])
+                    self.assertEqual(
+                        manifest["promotion_persistence_status"], "not_changed"
+                    )
+                else:
+                    self.assertEqual(persisted.shadow_status, "rolled_back")
+                    self.assertIsNotNone(journal)
+                    self.assertEqual(journal.operation, "rollback")
+                    self.assertEqual(journal.status, "committed")
+                    self.assertTrue(manifest["global_state_changed"])
+                    self.assertEqual(
+                        manifest["promotion_persistence_status"], "committed"
+                    )
+
+    def test_shadow_rollback_cas_failure_is_not_labeled_as_evidence_failure(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+        })
+        raw["search_groups"] = []
+        config = parse_evolution_config(raw)
+
+        def executor(bundle, params):
+            daily = -0.0002 if float(params["leverage"]) == 0.75 else 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            shadow = promote_to_shadow(
+                initial,
+                challenger_version="failing-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="prior-exp",
+                run_id="prior-run",
+                data_fingerprint="prior-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, shadow)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+            pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with patch(
+                "run_strong_pullback_evolution.commit_evolution_state_transition",
+                side_effect=RuntimeError("rollback CAS exploded"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "rollback CAS exploded"):
+                    run_evolution(
+                        config, data, config_path, benchmark,
+                        pd.Timestamp("2026-07-09"), root / "runs",
+                        "rollback-cas-failure", False,
+                        lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                            pd.Timestamp(end_date)
+                        ),
+                        executor, "test-commit", dry_run=False,
+                        promote_shadow=True, state_path=state_path,
+                    )
+
+            manifest = json.loads(
+                (root / "runs" / "rollback-cas-failure" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            decision = (
+                root / "runs" / "rollback-cas-failure" / "shadow_decision.md"
+            ).read_text(encoding="utf-8")
+            persisted = load_evolution_state(state_path, initial)
+
+        self.assertEqual(persisted, shadow)
+        self.assertEqual(manifest["promotion_persistence_status"], "rejected")
+        self.assertIn("rollback CAS exploded", manifest["error"])
+        self.assertNotIn("evidence failed", manifest["error"])
+        self.assertNotIn("evidence failed", decision)
+
     def test_locked_existing_shadow_core_failure_rolls_back_durably_or_recommends_in_dry_run(self):
         raw = valid_raw_config()
         raw["search_groups"] = []

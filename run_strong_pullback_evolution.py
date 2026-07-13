@@ -1405,62 +1405,11 @@ def run_evolution(
                     trial_metrics["baseline"]["validation"],
                     config.selection,
                 )
-                shadow_is_eligible = shadow_legacy_decision.eligible
-                shadow_reevaluation_reason = (
-                    "shadow reevaluation passed"
-                    if shadow_is_eligible
-                    else (
-                        "shadow reevaluation failed: legacy="
-                        + ",".join(shadow_legacy_decision.reasons or ("passed",))
-                    )
+                shadow_generic_decision = evaluate_candidate(
+                    trial_selection_fold_metrics[shadow_trial_id],
+                    trial_selection_fold_metrics["baseline"],
+                    _promotion_policy(config),
                 )
-                trial_rows.append({
-                    "group_id": "shadow_reevaluation",
-                    "trial_id": shadow_id,
-                    "parent_id": locked_champion_id,
-                    "status": "eligible" if shadow_is_eligible else "rejected",
-                    "reason_cn": shadow_reevaluation_reason,
-                    **{
-                        f"validation_{key}": value
-                        for key, value in trial_metrics[shadow_trial_id]["validation"].items()
-                    },
-                })
-                if shadow_is_eligible:
-                    incumbent_id = shadow_id
-                    incumbent_trial_id = shadow_trial_id
-                    incumbent_params = shadow_params
-                    incumbent_metrics = trial_metrics[shadow_trial_id]["validation"]
-                else:
-                    effective_data_asof = data_asof_date
-                    if not dry_run and promote_shadow:
-                        freshness_bundle = bundle_loader(
-                            data_path, asof_date, benchmark_path, locked_champion_params
-                        )
-                        effective_data_asof = validate_loaded_bundle_freshness(
-                            freshness_bundle, asof_date
-                        )
-                    rollback_snapshot = rollback_shadow(
-                        input_state,
-                        reason=shadow_reevaluation_reason,
-                        data_asof_date=effective_data_asof,
-                    )
-                    rollback_snapshot = replace(
-                        rollback_snapshot,
-                        last_completed_run_id=run_id,
-                        last_data_fingerprint=evidence.data_fingerprint,
-                        updated_at=datetime.now(timezone.utc).isoformat(),
-                    )
-                    selected_experiment_id = input_state.shadow_experiment_id
-                    return finish_without_holdout(
-                        final_champion_id=rollback_snapshot.champion_version,
-                        final_champion_params=rollback_snapshot.champion_parameters,
-                        snapshot=rollback_snapshot,
-                        test_status="not_opened_shadow_rollback",
-                        test_reason=shadow_reevaluation_reason,
-                        failed_gates=["shadow_reevaluation"],
-                        core_test_status="not_opened",
-                        persist_rollback=True,
-                    )
             except Exception as exc:
                 shadow_reevaluation_reason = (
                     "shadow reevaluation evidence failed: "
@@ -1474,6 +1423,81 @@ def run_evolution(
                     "reason_cn": shadow_reevaluation_reason,
                 })
                 raise RuntimeError(shadow_reevaluation_reason) from exc
+
+            shadow_is_eligible = (
+                shadow_legacy_decision.eligible
+                and shadow_generic_decision.status == "eligible_for_shadow"
+            )
+            shadow_legacy_summary = ",".join(
+                shadow_legacy_decision.reasons or ("passed",)
+            )
+            shadow_generic_summary = ",".join(
+                shadow_generic_decision.failed_gates or ("passed",)
+            )
+            shadow_reevaluation_reason = (
+                "shadow reevaluation passed"
+                if shadow_is_eligible
+                else (
+                    "shadow reevaluation failed: "
+                    f"legacy={shadow_legacy_summary}; "
+                    f"generic={shadow_generic_summary} "
+                    f"(status={shadow_generic_decision.status})"
+                )
+            )
+            shadow_failed_gates = [
+                f"legacy:{reason}" for reason in shadow_legacy_decision.reasons
+            ] + list(shadow_generic_decision.failed_gates)
+            trial_rows.append({
+                "group_id": "shadow_reevaluation",
+                "trial_id": shadow_id,
+                "parent_id": locked_champion_id,
+                "status": "eligible" if shadow_is_eligible else "rejected",
+                "selection_generic_status": shadow_generic_decision.status,
+                "selection_generic_failed_gates": json.dumps(
+                    shadow_generic_decision.failed_gates, ensure_ascii=True
+                ),
+                "reason_cn": shadow_reevaluation_reason,
+                **{
+                    f"validation_{key}": value
+                    for key, value in trial_metrics[shadow_trial_id]["validation"].items()
+                },
+            })
+            if shadow_is_eligible:
+                incumbent_id = shadow_id
+                incumbent_trial_id = shadow_trial_id
+                incumbent_params = shadow_params
+                incumbent_metrics = trial_metrics[shadow_trial_id]["validation"]
+            else:
+                effective_data_asof = data_asof_date
+                if not dry_run and promote_shadow:
+                    freshness_bundle = bundle_loader(
+                        data_path, asof_date, benchmark_path, locked_champion_params
+                    )
+                    effective_data_asof = validate_loaded_bundle_freshness(
+                        freshness_bundle, asof_date
+                    )
+                rollback_snapshot = rollback_shadow(
+                    input_state,
+                    reason=shadow_reevaluation_reason,
+                    data_asof_date=effective_data_asof,
+                )
+                rollback_snapshot = replace(
+                    rollback_snapshot,
+                    last_completed_run_id=run_id,
+                    last_data_fingerprint=evidence.data_fingerprint,
+                    updated_at=datetime.now(timezone.utc).isoformat(),
+                )
+                selected_experiment_id = input_state.shadow_experiment_id
+                return finish_without_holdout(
+                    final_champion_id=rollback_snapshot.champion_version,
+                    final_champion_params=rollback_snapshot.champion_parameters,
+                    snapshot=rollback_snapshot,
+                    test_status="not_opened_shadow_rollback",
+                    test_reason=shadow_reevaluation_reason,
+                    failed_gates=shadow_failed_gates or ["shadow_reevaluation"],
+                    core_test_status="not_opened",
+                    persist_rollback=True,
+                )
 
         for group in config.search_groups:
             candidate_pairs: list[tuple[str, Mapping[str, float]]] = []
