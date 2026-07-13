@@ -344,6 +344,7 @@ class DailyModelPipelineTest(unittest.TestCase):
                 json.dumps(
                     {
                         "status": "manual_review_ready",
+                        "latest_asof_date": "2026-06-29",
                         "valid_observation_count": 20,
                         "target_days": 20,
                         "remaining_days": 0,
@@ -376,6 +377,108 @@ class DailyModelPipelineTest(unittest.TestCase):
             self.assertTrue(record["verification"]["regime_shadow_tracking_benchmark_fresh"])
             self.assertEqual(record["verification"]["regime_shadow_tracking_risk_regime"], "strong")
             self.assertTrue(str(record["artifacts"]["regime_shadow_tracking_summary"]).endswith(".json"))
+
+    def test_failed_pipeline_before_tracking_hides_stale_tracking_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            output.mkdir(parents=True)
+            token = "20260629"
+            self._seed_minimal_daily_state_inputs(output, token)
+            self._write_tracking_outputs(
+                output,
+                status="manual_review_ready",
+                latest_asof_date="2026-06-28",
+            )
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                python_exe="python",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                daily_data_dir=root,
+                fetch_status_utils=root / "missing_utils.py",
+            )
+            steps = build_daily_pipeline_steps(config)
+
+            record = build_daily_run_state(
+                config,
+                steps,
+                run_status="failed",
+                failure={"step": "regime_shadow_compare", "returncode": 1},
+            )
+
+            self.assertEqual(record["verification"]["regime_shadow_tracking_status"], "not_run")
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_ledger"])
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_summary"])
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_report"])
+
+    def test_failed_tracking_step_hides_stale_tracking_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            output.mkdir(parents=True)
+            token = "20260629"
+            self._seed_minimal_daily_state_inputs(output, token)
+            self._write_tracking_outputs(
+                output,
+                status="manual_review_ready",
+                latest_asof_date="2026-06-28",
+            )
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                python_exe="python",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                daily_data_dir=root,
+                fetch_status_utils=root / "missing_utils.py",
+            )
+            steps = build_daily_pipeline_steps(config)
+
+            record = build_daily_run_state(
+                config,
+                steps,
+                run_status="failed",
+                failure={"step": "regime_shadow_tracking", "returncode": 1},
+            )
+
+            self.assertEqual(record["verification"]["regime_shadow_tracking_status"], "failed")
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_ledger"])
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_summary"])
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_report"])
+
+    def test_failed_pipeline_after_tracking_requires_current_tracking_asof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            output.mkdir(parents=True)
+            token = "20260629"
+            self._seed_minimal_daily_state_inputs(output, token)
+            self._write_tracking_outputs(
+                output,
+                status="manual_review_ready",
+                latest_asof_date="2026-06-28",
+            )
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                python_exe="python",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                daily_data_dir=root,
+                fetch_status_utils=root / "missing_utils.py",
+            )
+            steps = build_daily_pipeline_steps(config)
+
+            record = build_daily_run_state(
+                config,
+                steps,
+                run_status="failed",
+                failure={"step": "train_rank_model", "returncode": 1},
+            )
+
+            self.assertEqual(record["verification"]["regime_shadow_tracking_status"], "missing")
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_ledger"])
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_summary"])
+            self.assertIsNone(record["artifacts"]["regime_shadow_tracking_report"])
 
     def test_build_daily_run_state_marks_tracking_skipped_and_hides_stale_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -470,6 +573,51 @@ class DailyModelPipelineTest(unittest.TestCase):
             writer = csv.DictWriter(handle, fieldnames=columns)
             writer.writeheader()
             writer.writerows(rows)
+
+    def _seed_minimal_daily_state_inputs(self, output: Path, token: str) -> None:
+        self._write_csv(
+            output / f"merged_priority_watchlist_{token}.csv",
+            [{"symbol": "000001", "stock_name": "Alpha", "priority_bucket": "model_focus"}],
+        )
+        self._write_csv(output / f"early_pattern_watchlist_{token}.csv", [])
+        self._write_csv(output / f"merged_model_decision_table_{token}.csv", [])
+        self._write_csv(output / f"daily_personal_overlay_selected_{token}.csv", [])
+        self._write_csv(output / f"daily_personal_overlay_changes_{token}.csv", [])
+        shadow_dir = output / f"regime_shadow_compare_{token}"
+        shadow_dir.mkdir(exist_ok=True)
+        (shadow_dir / "comparison.json").write_text(
+            json.dumps(
+                {
+                    "decision": "experimental_only",
+                    "benchmark_last_date": "2026-06-29",
+                    "benchmark_fresh": True,
+                    "delta": {},
+                    "latest_dynamic_state": {"risk_regime": "strong", "target_leverage": 0.75},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (shadow_dir / "report.md").write_text("shadow report", encoding="utf-8")
+
+    def _write_tracking_outputs(self, output: Path, *, status: str, latest_asof_date: str) -> None:
+        (output / "regime_shadow_tracking.csv").write_text("asof_date\n2026-06-28\n", encoding="utf-8")
+        (output / "regime_shadow_tracking_summary.json").write_text(
+            json.dumps(
+                {
+                    "status": status,
+                    "latest_asof_date": latest_asof_date,
+                    "valid_observation_count": 20,
+                    "target_days": 20,
+                    "remaining_days": 0,
+                    "invalid_observation_count": 0,
+                    "cumulative_return_delta": 0.05,
+                    "latest_benchmark_fresh": True,
+                    "latest_risk_state": {"risk_regime": "strong", "target_leverage": 0.75},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (output / "regime_shadow_tracking_report.md").write_text("tracking report", encoding="utf-8")
 
 
 if __name__ == "__main__":

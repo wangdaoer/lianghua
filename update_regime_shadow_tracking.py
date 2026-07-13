@@ -247,6 +247,7 @@ def _summary_from_rows(rows: list[dict[str, str]], target_days: int) -> dict[str
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "status": status,
+        "latest_asof_date": latest.get("asof_date") if latest else None,
         "valid_observation_count": len(valid_rows),
         "invalid_observation_count": len(invalid_rows),
         "target_days": target_days,

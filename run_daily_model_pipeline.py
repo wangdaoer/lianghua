@@ -123,6 +123,30 @@ def _top_rows(rows: list[dict[str, str]], columns: list[str], limit: int = 10) -
     return [{column: row.get(column, "") for column in columns} for row in rows[:limit]]
 
 
+def _tracking_state_gate(
+    steps: list[PipelineStep],
+    run_status: str,
+    failure: dict[str, object] | None,
+) -> tuple[str | None, bool]:
+    step_names = [step.name for step in steps]
+    if "regime_shadow_tracking" not in step_names:
+        return ("missing" if run_status == "failed" else None), run_status != "failed"
+    if run_status != "failed":
+        return None, True
+    if not isinstance(failure, dict):
+        return "missing", False
+    failure_step = failure.get("step")
+    if not isinstance(failure_step, str) or failure_step not in step_names:
+        return "missing", False
+    failure_index = step_names.index(failure_step)
+    tracking_index = step_names.index("regime_shadow_tracking")
+    if failure_index < tracking_index:
+        return "not_run", False
+    if failure_index == tracking_index:
+        return "failed", False
+    return None, True
+
+
 def _jsonable(value: object) -> object:
     if dataclass_isinstance(value):
         return {key: _jsonable(item) for key, item in vars(value).items()}
@@ -624,22 +648,55 @@ def build_daily_run_state(
     change_rows = _read_csv_rows(changes_path)
     regime_shadow = _read_json_object(paths["regime_shadow_comparison"])
     if tracking_enabled:
-        tracking_summary = _read_json_object(paths["regime_shadow_tracking_summary"])
-        tracking_risk_state = tracking_summary.get("latest_risk_state")
-        if not isinstance(tracking_risk_state, dict):
-            tracking_risk_state = {}
-        tracking_status = tracking_summary.get("status", "missing")
-        tracking_valid = tracking_summary.get("valid_observation_count")
-        tracking_target = tracking_summary.get("target_days")
-        tracking_remaining = tracking_summary.get("remaining_days")
-        tracking_invalid = tracking_summary.get("invalid_observation_count")
-        tracking_return_delta = tracking_summary.get("cumulative_return_delta")
-        tracking_benchmark_fresh = tracking_summary.get("latest_benchmark_fresh")
-        tracking_risk_regime = tracking_risk_state.get("risk_regime")
-        tracking_target_leverage = tracking_risk_state.get("target_leverage")
-        tracking_ledger_artifact = str(_latest_artifact(paths["regime_shadow_tracking_ledger"]))
-        tracking_summary_artifact = str(_latest_artifact(paths["regime_shadow_tracking_summary"]))
-        tracking_report_artifact = str(_latest_artifact(paths["regime_shadow_tracking_report"]))
+        tracking_status_override, tracking_may_be_current = _tracking_state_gate(
+            steps,
+            run_status,
+            failure,
+        )
+        if tracking_may_be_current:
+            tracking_summary = _read_json_object(paths["regime_shadow_tracking_summary"])
+            if tracking_summary.get("latest_asof_date") != config.asof_date:
+                tracking_status = "missing"
+                tracking_valid = None
+                tracking_target = None
+                tracking_remaining = None
+                tracking_invalid = None
+                tracking_return_delta = None
+                tracking_benchmark_fresh = None
+                tracking_risk_regime = None
+                tracking_target_leverage = None
+                tracking_ledger_artifact = None
+                tracking_summary_artifact = None
+                tracking_report_artifact = None
+            else:
+                tracking_risk_state = tracking_summary.get("latest_risk_state")
+                if not isinstance(tracking_risk_state, dict):
+                    tracking_risk_state = {}
+                tracking_status = tracking_summary.get("status", "missing")
+                tracking_valid = tracking_summary.get("valid_observation_count")
+                tracking_target = tracking_summary.get("target_days")
+                tracking_remaining = tracking_summary.get("remaining_days")
+                tracking_invalid = tracking_summary.get("invalid_observation_count")
+                tracking_return_delta = tracking_summary.get("cumulative_return_delta")
+                tracking_benchmark_fresh = tracking_summary.get("latest_benchmark_fresh")
+                tracking_risk_regime = tracking_risk_state.get("risk_regime")
+                tracking_target_leverage = tracking_risk_state.get("target_leverage")
+                tracking_ledger_artifact = str(_latest_artifact(paths["regime_shadow_tracking_ledger"]))
+                tracking_summary_artifact = str(_latest_artifact(paths["regime_shadow_tracking_summary"]))
+                tracking_report_artifact = str(_latest_artifact(paths["regime_shadow_tracking_report"]))
+        else:
+            tracking_status = tracking_status_override or "missing"
+            tracking_valid = None
+            tracking_target = None
+            tracking_remaining = None
+            tracking_invalid = None
+            tracking_return_delta = None
+            tracking_benchmark_fresh = None
+            tracking_risk_regime = None
+            tracking_target_leverage = None
+            tracking_ledger_artifact = None
+            tracking_summary_artifact = None
+            tracking_report_artifact = None
     else:
         tracking_status = "skipped"
         tracking_valid = None
