@@ -260,6 +260,41 @@ class EvolutionCliTest(unittest.TestCase):
 
 
 class EvolutionConfigTest(unittest.TestCase):
+    def test_rejects_unknown_fields_at_every_config_mapping_level(self):
+        mutations = {
+            "top_level": lambda raw: raw.__setitem__("future_top", True),
+            "periods": lambda raw: raw["periods"].__setitem__("future_period", True),
+            "baseline": lambda raw: raw["baseline"].__setitem__("future_baseline", True),
+            "selection": lambda raw: raw["selection"].__setitem__("future_selection", True),
+            "evolution_core": lambda raw: raw["evolution_core"].__setitem__("future_core", True),
+            "search_group": lambda raw: raw["search_groups"][0].__setitem__("future_group", True),
+            "candidate": lambda raw: raw["search_groups"][0]["candidates"][0].__setitem__(
+                "future_candidate", True
+            ),
+        }
+        for level, mutate in mutations.items():
+            with self.subTest(level=level):
+                raw = valid_raw_config()
+                mutate(raw)
+                with self.assertRaisesRegex(ValueError, "Unknown"):
+                    parse_evolution_config(raw)
+
+    def test_rejects_windows_reserved_device_names_with_extensions_and_trailing_forms(self):
+        device_names = (
+            "CON", "con.txt", "PRN.log", "AUX ", "NUL.",
+            "COM1", "com9.json", "LPT1", "lpt9.tmp",
+        )
+        for field, label in (("group", "Group id"), ("candidate", "Candidate id")):
+            for device_name in device_names:
+                with self.subTest(field=field, device_name=device_name):
+                    raw = valid_raw_config()
+                    if field == "group":
+                        raw["search_groups"][0]["id"] = device_name
+                    else:
+                        raw["search_groups"][0]["candidates"][0]["id"] = device_name
+                    with self.assertRaisesRegex(ValueError, label):
+                        parse_evolution_config(raw)
+
     def test_requires_disjoint_selection_core_and_holdout_periods(self):
         raw = valid_raw_config()
         raw["periods"].update({
@@ -572,6 +607,45 @@ class EvolutionConfigTest(unittest.TestCase):
 
 
 class EvolutionAdapterTest(unittest.TestCase):
+    def test_effective_loaded_freshness_rejects_non_finite_latest_values(self):
+        anomalies = ("amount_inf", "price_neg_inf", "benchmark_inf")
+        for anomaly in anomalies:
+            with self.subTest(anomaly=anomaly), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data = root / "panel.csv"
+                benchmark = root / "benchmark.csv"
+                latest_price = -np.inf if anomaly == "price_neg_inf" else 10.1
+                latest_amount = np.inf if anomaly == "amount_inf" else 10_100.0
+                pd.DataFrame([
+                    {
+                        "date": "2026-07-08", "symbol": "000001", "open": 10.0,
+                        "high": 10.2, "low": 9.8, "close": 10.0,
+                        "volume": 1000.0, "amount": 10_000.0,
+                    },
+                    {
+                        "date": "2026-07-09", "symbol": "000001",
+                        "open": latest_price, "high": latest_price,
+                        "low": latest_price, "close": latest_price,
+                        "volume": 1000.0, "amount": latest_amount,
+                    },
+                ]).to_csv(data, index=False)
+                pd.DataFrame({
+                    "date": ["2026-07-08", "2026-07-09"],
+                    "close": [100.0, np.inf if anomaly == "benchmark_inf" else 101.0],
+                }).to_csv(benchmark, index=False)
+
+                bundle = load_price_bundle(
+                    data,
+                    pd.Timestamp("2026-07-09"),
+                    benchmark,
+                    DEFAULT_STRATEGY_PARAMS,
+                )
+
+                with self.assertRaisesRegex(ValueError, "finite|asof_date"):
+                    evolution_runner.validate_loaded_bundle_freshness(
+                        bundle, pd.Timestamp("2026-07-09")
+                    )
+
     def test_effective_loaded_freshness_rejects_raw_latest_row_dropped_by_cleaning(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1385,7 +1459,7 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             self.assertIn("previous state fingerprint", decision)
             self.assertEqual(load_evolution_state(state_path, initial), initial)
 
-    def test_intermediate_selection_winner_is_not_core_gated_before_path_lock(self):
+    def test_core_ineligible_group_winner_never_becomes_next_parent_or_shadow(self):
         raw = valid_raw_config()
         raw["evolution_core"].update({
             "min_filled_trades_per_fold": 1,
@@ -1419,6 +1493,7 @@ class EvolutionOrchestrationTest(unittest.TestCase):
         ]
         config = parse_evolution_config(raw)
         seen_clean_params: list[dict[str, object]] = []
+        seen_bad_core_ends: list[pd.Timestamp] = []
 
         def executor(bundle, params):
             is_full_research = bundle.close.index.max() == config.periods.validation_end
@@ -1426,6 +1501,7 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 seen_clean_params.append(dict(params))
                 daily = 0.0005
             elif float(params["leverage"]) == 0.75:
+                seen_bad_core_ends.append(pd.Timestamp(bundle.close.index.max()))
                 daily = 0.0004 if is_full_research else -0.0002
             else:
                 daily = 0.0002
@@ -1453,13 +1529,39 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(rounds.loc[0, "winner_id"], "bad_core")
-        self.assertEqual(rounds.loc[1, "parent_id"], "bad_core")
+        self.assertEqual(rounds.loc[0, "winner_id"], "baseline")
+        self.assertEqual(rounds.loc[1, "parent_id"], "baseline")
         self.assertEqual(outcome.champion_id, "clean_candidate")
-        self.assertEqual(outcome.champion_params["leverage"], 0.75)
+        self.assertEqual(outcome.champion_params["leverage"], 0.60)
         self.assertTrue(seen_clean_params)
-        self.assertTrue(all(params["leverage"] == 0.75 for params in seen_clean_params))
-        self.assertEqual(snapshot["shadow_parameters"]["leverage"], 0.75)
+        self.assertTrue(all(params["leverage"] == 0.60 for params in seen_clean_params))
+        self.assertEqual(snapshot["shadow_parameters"]["leverage"], 0.60)
+        self.assertTrue(seen_bad_core_ends)
+        self.assertTrue(all(
+            end <= config.periods.validation_end for end in seen_bad_core_ends
+        ))
+
+    def test_selection_local_generic_segments_never_read_core_or_holdout_dates(self):
+        config = self._eligible_config()
+        dates = self._flat_bundle(config.periods.core_test_end).close.index
+
+        segments = evolution_adapter.build_selection_segments(
+            dates,
+            config.periods.validation_start,
+            config.periods.validation_end,
+            config.evolution_core.min_folds,
+        )
+
+        self.assertGreaterEqual(len(segments), config.evolution_core.min_folds)
+        self.assertTrue(all(
+            config.periods.validation_start <= date <= config.periods.validation_end
+            for segment in segments
+            for date in segment.test_dates
+        ))
+        self.assertTrue(all(
+            segment.test_end < config.periods.core_test_start
+            for segment in segments
+        ))
 
     def test_final_accumulated_candidate_must_pass_core_gates_against_locked_champion(self):
         raw = valid_raw_config()
@@ -1778,6 +1880,197 @@ class EvolutionOrchestrationTest(unittest.TestCase):
         self.assertEqual(journal.operation, "rollback")
         self.assertEqual(journal.status, "committed")
         self.assertEqual(manifest["selected_experiment_id"], "prior-exp")
+
+    def test_locked_existing_shadow_core_failure_rolls_back_durably_or_recommends_in_dry_run(self):
+        raw = valid_raw_config()
+        raw["search_groups"] = []
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        config = parse_evolution_config(raw)
+        asof_date = pd.Timestamp("2026-07-09")
+
+        def executor(bundle, params):
+            is_shadow = float(params["leverage"]) == 0.75
+            end = pd.Timestamp(bundle.close.index.max())
+            if is_shadow and end <= config.periods.validation_end:
+                daily = 0.0004
+            elif is_shadow:
+                daily = 0.0001
+            else:
+                daily = 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        for mutate in (False, True):
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state_path = root / "evolution_state" / "strong_pullback.json"
+                initial = EvolutionState.initial(
+                    "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+                )
+                shadow = promote_to_shadow(
+                    initial,
+                    challenger_version="existing-shadow",
+                    challenger_parameters={**config.baseline, "leverage": 0.75},
+                    experiment_id="existing-exp",
+                    run_id="existing-run",
+                    data_fingerprint="existing-data",
+                    data_asof_date="2026-07-08",
+                    now="2026-07-08T01:00:00+00:00",
+                )
+                write_evolution_state_atomic(state_path, shadow)
+                data = root / "panel.csv"
+                benchmark = root / "benchmark.csv"
+                config_path = root / "config.yaml"
+                pd.DataFrame({"date": [asof_date]}).to_csv(data, index=False)
+                pd.DataFrame({"date": [asof_date], "close": [100.0]}).to_csv(
+                    benchmark, index=False
+                )
+                config_path.write_text("evidence", encoding="utf-8")
+
+                outcome = run_evolution(
+                    config, data, config_path, benchmark, asof_date,
+                    root / "runs", f"shadow-core-{mutate}", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    executor, "test-commit", dry_run=not mutate,
+                    promote_shadow=mutate, state_path=state_path,
+                )
+
+                persisted = load_evolution_state(state_path, initial)
+                journal = load_evolution_transition_journal(state_path)
+                manifest = json.loads(
+                    (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                decision = (outcome.run_dir / "shadow_decision.md").read_text(
+                    encoding="utf-8"
+                )
+
+                self.assertEqual(outcome.test_status, "not_opened_shadow_core_rollback")
+                self.assertEqual(outcome.champion_id, "baseline")
+                self.assertEqual(manifest["core_test_status"], "rejected")
+                self.assertEqual(manifest["selected_experiment_id"], "existing-exp")
+                self.assertIn("rollback", decision.lower())
+                if mutate:
+                    self.assertEqual(persisted.shadow_status, "rolled_back")
+                    self.assertIsNotNone(journal)
+                    self.assertEqual(journal.operation, "rollback")
+                    self.assertEqual(journal.status, "committed")
+                    self.assertTrue(manifest["global_state_changed"])
+                    self.assertEqual(
+                        manifest["promotion_persistence_status"], "committed"
+                    )
+                else:
+                    self.assertEqual(persisted, shadow)
+                    self.assertIsNone(journal)
+                    self.assertFalse(manifest["global_state_changed"])
+                    self.assertEqual(
+                        manifest["promotion_persistence_status"], "not_changed"
+                    )
+
+    def test_locked_existing_shadow_holdout_failure_persists_rollback_and_stops(self):
+        raw = valid_raw_config()
+        raw["search_groups"] = []
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        config = parse_evolution_config(raw)
+        asof_date = pd.Timestamp("2026-07-09")
+
+        def executor(bundle, params):
+            is_shadow = float(params["leverage"]) == 0.75
+            end = pd.Timestamp(bundle.close.index.max())
+            if is_shadow and end <= config.periods.core_test_end:
+                daily = 0.0004
+            elif is_shadow:
+                daily = 0.0001
+            else:
+                daily = 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            shadow = promote_to_shadow(
+                initial,
+                challenger_version="existing-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="existing-exp",
+                run_id="existing-run",
+                data_fingerprint="existing-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, shadow)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": [asof_date]}).to_csv(data, index=False)
+            pd.DataFrame({"date": [asof_date], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            outcome = run_evolution(
+                config, data, config_path, benchmark, asof_date,
+                root / "runs", "shadow-holdout-rollback", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                executor, "test-commit", dry_run=False, promote_shadow=True,
+                state_path=state_path,
+            )
+
+            persisted = load_evolution_state(state_path, initial)
+            journal = load_evolution_transition_journal(state_path)
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            decision = (outcome.run_dir / "shadow_decision.md").read_text(
+                encoding="utf-8"
+            )
+            final_artifact_exists = (
+                outcome.run_dir / "final" / "champion" / "metrics.json"
+            ).exists()
+
+        self.assertEqual(outcome.test_status, "rollback_recommended")
+        self.assertEqual(outcome.champion_id, "baseline")
+        self.assertEqual(persisted.shadow_status, "rolled_back")
+        self.assertIsNotNone(journal)
+        self.assertEqual(journal.operation, "rollback")
+        self.assertEqual(journal.status, "committed")
+        self.assertEqual(manifest["status"], "success")
+        self.assertTrue(manifest["global_state_changed"])
+        self.assertEqual(manifest["promotion_persistence_status"], "committed")
+        self.assertEqual(manifest["selected_experiment_id"], "existing-exp")
+        self.assertIn("rollback", decision.lower())
+        self.assertTrue(final_artifact_exists)
 
     def test_shadow_evidence_error_aborts_without_mutating_state(self):
         raw = valid_raw_config()
@@ -2422,7 +2715,10 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                     call for call in calls
                     if call[0] <= config.periods.validation_end and call[1] == config.baseline["leverage"]
                 ]
-                self.assertEqual(len(research_baseline_calls), 1)
+                self.assertEqual(
+                    len(research_baseline_calls),
+                    config.evolution_core.min_folds + 1,
+                )
 
     def test_successful_run_writes_manifest_versioned_artifacts_and_chinese_report(self):
         config = self._eligible_config()
@@ -2479,7 +2775,7 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             summary = Path(manifest["summary"])
             self.assertIn("风险提示", summary.read_text(encoding="utf-8"))
 
-    def test_both_flags_do_not_write_state_for_core_ineligible_challenger(self):
+    def test_both_flags_do_not_write_state_for_selection_generic_ineligible_challenger(self):
         raw = valid_raw_config()
         raw["selection"].update({
             "min_annualized_return_delta": 0.0,
@@ -2509,9 +2805,14 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             )
 
             manifest = json.loads((outcome.run_dir / "manifest.json").read_text(encoding="utf-8"))
+            scores = pd.read_csv(outcome.run_dir / "candidate_scores.csv")
             self.assertFalse(state_path.exists())
             self.assertFalse(manifest["global_state_changed"])
-            self.assertIn(manifest["failed_gates"][0], {"min_folds", "min_filled_trades", "finite_metrics"})
+            self.assertEqual(manifest["failed_gates"], ["no_selected_experiment"])
+            self.assertTrue(all(
+                status == "insufficient_evidence"
+                for status in scores["selection_generic_status"]
+            ))
 
     def test_failed_run_does_not_update_latest_pointer_and_marks_manifest_failed(self):
         config = parse_evolution_config(valid_raw_config())

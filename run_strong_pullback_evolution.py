@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Callable, Mapping
@@ -43,11 +43,13 @@ from strong_pullback_evolution import (
     TradingFold,
     assess_test_result,
     build_core_test_segments,
+    build_selection_segments,
     build_group_candidates,
     calculate_fold_metrics,
     calculate_segment_metrics,
     choose_group_winner,
     evaluate_promotion,
+    is_windows_reserved_device_name,
     load_evolution_config,
     run_strong_pullback_folds,
 )
@@ -351,6 +353,7 @@ def _resolve_trial_dir(run_dir: Path, trial_id: str) -> Path:
         or any(ord(character) < 32 or ord(character) == 127 for character in trial_id)
         or any(character in '<>:"|?*' for character in trial_id)
         or trial_id.endswith(".")
+        or is_windows_reserved_device_name(trial_id)
     ):
         raise ValueError("trial_id must be a safe single relative path component")
     trials_root = (Path(run_dir).resolve() / "trials").resolve()
@@ -745,7 +748,13 @@ def validate_loaded_bundle_freshness(
         frame = getattr(bundle, name)
         if frame.empty:
             raise ValueError(f"effective loaded {name} data is empty")
-        valid_rows = frame.notna().any(axis=1)
+        numeric = frame.apply(pd.to_numeric, errors="coerce")
+        finite_values = pd.DataFrame(
+            np.isfinite(numeric.to_numpy(dtype=float)),
+            index=frame.index,
+            columns=frame.columns,
+        )
+        valid_rows = finite_values.any(axis=1)
         valid_index = pd.DatetimeIndex(frame.index[valid_rows]).normalize()
         if valid_index.empty:
             raise ValueError(f"effective loaded {name} data is empty")
@@ -753,12 +762,12 @@ def validate_loaded_bundle_freshness(
         if common_valid is None:
             common_index = pd.DatetimeIndex(frame.index)
             common_columns = frame.columns
-            common_valid = frame.notna()
+            common_valid = finite_values
         else:
             assert common_index is not None and common_columns is not None
-            common_valid &= frame.reindex(
-                index=common_index, columns=common_columns
-            ).notna()
+            common_valid &= finite_values.reindex(
+                index=common_index, columns=common_columns, fill_value=False
+            )
 
     assert common_valid is not None and common_index is not None
     common_dates = common_index[common_valid.any(axis=1)]
@@ -820,9 +829,11 @@ def load_price_bundle(
         benchmark["date"] = pd.to_datetime(benchmark["date"], errors="coerce")
         benchmark["close"] = pd.to_numeric(benchmark["close"], errors="coerce")
         benchmark = benchmark.dropna(subset=["date", "close"])
+        benchmark = benchmark.loc[np.isfinite(benchmark["close"])]
         benchmark = benchmark.loc[benchmark["date"] <= end_date]
-        if not benchmark.empty:
-            benchmark_effective_date = pd.Timestamp(benchmark["date"].max()).normalize()
+        if benchmark.empty:
+            raise ValueError("benchmark has no finite effective close")
+        benchmark_effective_date = pd.Timestamp(benchmark["date"].max()).normalize()
     if close.index.max() > end_date:
         raise AssertionError("Price bundle extends beyond requested end date")
     return PriceBundle(
@@ -1105,14 +1116,41 @@ def run_evolution(
             raise AssertionError("Selection bundle contains post-selection dates")
 
         core = config.evolution_core
+        selection_segments = build_selection_segments(
+            selection_bundle.close.index,
+            config.periods.validation_start,
+            config.periods.validation_end,
+            core.min_folds,
+        )
+        selection_fold_rows = [
+            {
+                "fold_id": segment.fold_id,
+                "test_start": segment.test_start,
+                "test_end": segment.test_end,
+                "fingerprint": fingerprint_payload(segment),
+            }
+            for segment in selection_segments
+        ]
+        (run_dir / "selection_folds.json").write_text(
+            json.dumps(
+                selection_fold_rows,
+                default=str,
+                sort_keys=True,
+                ensure_ascii=True,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
         fold_rows: list[dict[str, object]] = []
 
         trial_rows: list[dict[str, object]] = []
         round_rows: list[dict[str, object]] = []
         trial_metrics: dict[str, dict[str, dict[str, float]]] = {}
+        trial_selection_fold_metrics: dict[str, tuple[FoldMetrics, ...]] = {}
         candidate_scores: list[dict[str, object]] = []
         experiments: list[dict[str, object]] = []
         experiment_ids: dict[str, str] = {}
+        selection_generic_decisions: dict[str, object] = {}
         trial_params: dict[str, dict[str, object]] = {
             "baseline": dict(locked_champion_params)
         }
@@ -1127,6 +1165,7 @@ def run_evolution(
             failed_gates: list[str],
             core_test_status: str,
             persist_rollback: bool = False,
+            comparison_metrics: Mapping[str, Mapping[str, float]] | None = None,
         ) -> EvolutionOutcome:
             state_transition_pending = (
                 persist_rollback and not dry_run and promote_shadow
@@ -1134,11 +1173,16 @@ def run_evolution(
             persistence_status = (
                 "pending" if state_transition_pending else "not_changed"
             )
-            persistence_reason = (
-                "Waiting for durable shadow rollback CAS."
-                if state_transition_pending
-                else "Research-only result; global shadow state was not changed."
-            )
+            if state_transition_pending:
+                persistence_reason = "Waiting for durable shadow rollback CAS."
+            elif persist_rollback:
+                persistence_reason = (
+                    "Shadow rollback recommended; dry-run did not change global state."
+                )
+            else:
+                persistence_reason = (
+                    "Research-only result; global shadow state was not changed."
+                )
             manifest.update({
                 "champion_id": final_champion_id,
                 "test_status": test_status,
@@ -1192,7 +1236,11 @@ def run_evolution(
             pd.DataFrame(round_rows).to_csv(
                 run_dir / "rounds.csv", index=False, encoding="utf-8-sig"
             )
-            pd.DataFrame(columns=("version", *TRIAL_METRIC_KEYS)).to_csv(
+            resolved_comparison_metrics = comparison_metrics or {}
+            pd.DataFrame([
+                {"version": name, **metrics}
+                for name, metrics in resolved_comparison_metrics.items()
+            ], columns=("version", *TRIAL_METRIC_KEYS)).to_csv(
                 run_dir / "test_comparison.csv", index=False, encoding="utf-8-sig"
             )
             (run_dir / "champion_candidate.yaml").write_text(
@@ -1206,7 +1254,7 @@ def run_evolution(
                 asof_date,
                 final_champion_id,
                 round_rows,
-                {},
+                resolved_comparison_metrics,
                 test_status,
                 test_reason,
             )
@@ -1242,6 +1290,35 @@ def run_evolution(
                 metrics = json.loads((trial_dir / "metrics.json").read_text(encoding="utf-8"))
                 if not _has_complete_cached_metrics(metrics):
                     return None
+                fold_payloads = metrics.get("selection_folds")
+                if not isinstance(fold_payloads, list):
+                    return None
+                expected_fold_fields = {field.name for field in fields(FoldMetrics)}
+                parsed_fold_metrics: list[FoldMetrics] = []
+                for payload in fold_payloads:
+                    if not isinstance(payload, Mapping) or set(payload) != expected_fold_fields:
+                        return None
+                    metric = FoldMetrics(**dict(payload))
+                    numeric_values = (
+                        metric.total_return,
+                        metric.max_drawdown,
+                        metric.sharpe,
+                        metric.filled_trades,
+                        metric.average_turnover,
+                        metric.pnl_concentration,
+                    )
+                    if not all(
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value))
+                        for value in numeric_values
+                    ):
+                        return None
+                    parsed_fold_metrics.append(metric)
+                if [metric.fold_id for metric in parsed_fold_metrics] != [
+                    segment.fold_id for segment in selection_segments
+                ]:
+                    return None
                 run = load_trial_artifacts(trial_dir)
                 if not _has_complete_trial_artifacts(trial_dir, run):
                     return None
@@ -1249,6 +1326,7 @@ def run_evolution(
                     "train": dict(metrics["train"]),
                     "validation": dict(metrics["validation"]),
                 }
+                trial_selection_fold_metrics[trial_id] = tuple(parsed_fold_metrics)
                 return run
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 return None
@@ -1269,10 +1347,22 @@ def run_evolution(
                 config.selection.rolling_window_days,
             )
             trial_metrics[trial_id] = {"train": train_metrics, "validation": validation_metrics}
+            trial_selection_fold_metrics[trial_id] = evaluate_strategy_folds(
+                selection_bundle,
+                selection_segments,
+                trial_executor,
+                params,
+            )
             write_trial_artifacts(
                 trial_dir,
                 run,
-                trial_metrics[trial_id],
+                {
+                    **trial_metrics[trial_id],
+                    "selection_folds": [
+                        asdict(metric)
+                        for metric in trial_selection_fold_metrics[trial_id]
+                    ],
+                },
                 {
                     "status": "completed",
                     "trial_id": trial_id,
@@ -1412,6 +1502,12 @@ def run_evolution(
                 try:
                     execute_one(candidate_id, params)
                     candidate_pairs.append((candidate_id, trial_metrics[candidate_id]["validation"]))
+                    selection_generic_decision = evaluate_candidate(
+                        trial_selection_fold_metrics[candidate_id],
+                        trial_selection_fold_metrics[incumbent_trial_id],
+                        _promotion_policy(config),
+                    )
+                    selection_generic_decisions[candidate_id] = selection_generic_decision
                     candidate_scores.append({
                         "group_id": group.group_id,
                         "candidate_id": candidate_id,
@@ -1419,6 +1515,12 @@ def run_evolution(
                         "experiment_id": experiment_id,
                         "status": "selection_evaluated",
                         "selection_status": "selection_evaluated",
+                        "selection_generic_status": selection_generic_decision.status,
+                        "selection_generic_gates": json.dumps(
+                            selection_generic_decision.gates,
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
                         "core_status": "not_evaluated",
                         "failed_gates": "[]",
                         "gates": "{}",
@@ -1432,6 +1534,12 @@ def run_evolution(
                         "data_fingerprint": evidence.data_fingerprint,
                         "code_fingerprint": evidence.code_fingerprint,
                         "selection_metrics": trial_metrics[candidate_id]["validation"],
+                        "selection_fold_metrics": [
+                            asdict(metric)
+                            for metric in trial_selection_fold_metrics[candidate_id]
+                        ],
+                        "selection_generic_status": selection_generic_decision.status,
+                        "selection_generic_gates": selection_generic_decision.gates,
                         "fold_metrics": [],
                         "status": "selection_evaluated",
                         "selection_status": "selection_evaluated",
@@ -1445,6 +1553,7 @@ def run_evolution(
                         "trial_id": candidate_id,
                         "status": "trial_error",
                         "selection_status": "trial_error",
+                        "selection_generic_status": "not_evaluated",
                         "core_status": "not_evaluated",
                         "reason_cn": str(exc),
                     })
@@ -1455,6 +1564,7 @@ def run_evolution(
                         "experiment_id": experiment_id,
                         "status": "trial_error",
                         "selection_status": "trial_error",
+                        "selection_generic_status": "not_evaluated",
                         "core_status": "not_evaluated",
                         "failed_gates": json.dumps(("trial_error",)),
                         "gates": "{}",
@@ -1469,6 +1579,9 @@ def run_evolution(
                         "code_fingerprint": evidence.code_fingerprint,
                         "fold_metrics": [],
                         "status": "trial_error",
+                        "selection_status": "trial_error",
+                        "selection_generic_status": "not_evaluated",
+                        "core_status": "not_evaluated",
                         "failed_gates": ("trial_error",),
                         "error": f"{type(exc).__name__}: {exc}",
                     })
@@ -1488,21 +1601,44 @@ def run_evolution(
             )
             if not candidate_pairs:
                 raise RuntimeError(f"All candidates failed in group {group.group_id}")
-            legacy_winner_id, decisions = choose_group_winner(
+            _, decisions = choose_group_winner(
                 incumbent_id, incumbent_metrics, tuple(candidate_pairs), config.selection
             )
+            generic_eligible_pairs = tuple(
+                pair
+                for pair in candidate_pairs
+                if selection_generic_decisions[pair[0]].status == "eligible_for_shadow"
+            )
+            winner_id, _ = choose_group_winner(
+                incumbent_id,
+                incumbent_metrics,
+                generic_eligible_pairs,
+                config.selection,
+            )
             for decision in decisions:
+                generic_decision = selection_generic_decisions[decision.candidate_id]
+                combined_eligible = (
+                    decision.promotion.eligible
+                    and generic_decision.status == "eligible_for_shadow"
+                )
                 selection_status = (
                     "selection_eligible"
-                    if decision.promotion.eligible
+                    if combined_eligible
                     else "selection_rejected"
                 )
-                failed_selection_gates = tuple(decision.promotion.reasons)
+                failed_selection_gates = tuple(
+                    [f"legacy:{reason}" for reason in decision.promotion.reasons]
+                    + [
+                        f"generic:{gate}"
+                        for gate in generic_decision.failed_gates
+                    ]
+                )
                 for score in candidate_scores:
                     if score.get("candidate_id") == decision.candidate_id:
                         score.update({
                             "status": selection_status,
                             "selection_status": selection_status,
+                            "selection_generic_status": generic_decision.status,
                             "failed_gates": json.dumps(
                                 failed_selection_gates, ensure_ascii=True
                             ),
@@ -1512,21 +1648,23 @@ def run_evolution(
                         experiment.update({
                             "status": selection_status,
                             "selection_status": selection_status,
+                            "selection_generic_status": generic_decision.status,
                             "failed_gates": failed_selection_gates,
                         })
                 trial_rows.append({
                     "group_id": group.group_id,
                     "trial_id": decision.candidate_id,
                     "parent_id": incumbent_id,
-                    "status": "eligible" if decision.promotion.eligible else "rejected",
-                    "reason_cn": "通过全部门槛" if decision.promotion.eligible else "；".join(
-                        decision.promotion.reasons
+                    "status": "eligible" if combined_eligible else "rejected",
+                    "reason_cn": (
+                        "旧版与通用选择期门槛均通过"
+                        if combined_eligible
+                        else "；".join(failed_selection_gates)
                     ),
                     **{f"validation_{key}": value for key, value in decision.metrics.items()},
                     "turnover_ratio": decision.promotion.turnover_ratio,
                     "robust_score": decision.promotion.robust_score,
                 })
-            winner_id = legacy_winner_id
             promoted = winner_id != incumbent_id
             round_rows.append({
                 "group_id": group.group_id,
@@ -1535,9 +1673,9 @@ def run_evolution(
                 "winner_id": winner_id,
                 "decision": "保留" if promoted else "回滚",
                 "reason_cn": (
-                    "验证期参数选择门槛通过；候选路径现已锁定"
+                    "旧版与通用选择期门槛均通过"
                     if promoted
-                    else "没有候选通过参数选择门槛"
+                    else "没有候选同时通过旧版与通用选择期门槛"
                 ),
             })
             if promoted:
@@ -1549,6 +1687,11 @@ def run_evolution(
         champion_id = incumbent_id
         champion_params = incumbent_params
         selected_experiment_id = experiment_ids.get(champion_id)
+        locked_candidate_is_existing_shadow = (
+            input_state.shadow_status == "shadow"
+            and incumbent_trial_id == "__shadow_incumbent__"
+            and champion_id == input_state.shadow_version
+        )
         base_snapshot = replace(
             input_state,
             last_completed_run_id=run_id,
@@ -1659,6 +1802,41 @@ def run_evolution(
             expected_previous_fingerprint=None,
         )
         if selected_core_decision.status != "eligible_for_shadow":
+            if locked_candidate_is_existing_shadow:
+                effective_data_asof = data_asof_date
+                if not dry_run and promote_shadow:
+                    freshness_bundle = bundle_loader(
+                        data_path, asof_date, benchmark_path, locked_champion_params
+                    )
+                    effective_data_asof = validate_loaded_bundle_freshness(
+                        freshness_bundle, asof_date
+                    )
+                rollback_reason = (
+                    "Existing shadow failed locked core tests: "
+                    + ",".join(selected_core_decision.failed_gates)
+                )
+                rollback_snapshot = rollback_shadow(
+                    input_state,
+                    reason=rollback_reason,
+                    data_asof_date=effective_data_asof,
+                )
+                rollback_snapshot = replace(
+                    rollback_snapshot,
+                    last_completed_run_id=run_id,
+                    last_data_fingerprint=evidence.data_fingerprint,
+                    updated_at=datetime.now(timezone.utc).isoformat(),
+                )
+                selected_experiment_id = input_state.shadow_experiment_id
+                return finish_without_holdout(
+                    final_champion_id=rollback_snapshot.champion_version,
+                    final_champion_params=rollback_snapshot.champion_parameters,
+                    snapshot=rollback_snapshot,
+                    test_status="not_opened_shadow_core_rollback",
+                    test_reason=rollback_reason,
+                    failed_gates=list(selected_core_decision.failed_gates),
+                    core_test_status=selected_core_decision.status,
+                    persist_rollback=True,
+                )
             return finish_without_holdout(
                 final_champion_id=champion_id,
                 final_champion_params=champion_params,
@@ -1713,6 +1891,32 @@ def run_evolution(
         test_status, test_reason = assess_test_result(
             final_metrics["baseline"], final_metrics["champion"], config.selection
         )
+
+        if locked_candidate_is_existing_shadow and test_status == "rollback_recommended":
+            rollback_reason = f"Existing shadow failed final holdout: {test_reason}"
+            rollback_snapshot = rollback_shadow(
+                input_state,
+                reason=rollback_reason,
+                data_asof_date=effective_data_asof,
+            )
+            rollback_snapshot = replace(
+                rollback_snapshot,
+                last_completed_run_id=run_id,
+                last_data_fingerprint=evidence.data_fingerprint,
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            selected_experiment_id = input_state.shadow_experiment_id
+            return finish_without_holdout(
+                final_champion_id=rollback_snapshot.champion_version,
+                final_champion_params=rollback_snapshot.champion_parameters,
+                snapshot=rollback_snapshot,
+                test_status=test_status,
+                test_reason=rollback_reason,
+                failed_gates=["holdout_rollback"],
+                core_test_status=selected_core_decision.status,
+                persist_rollback=True,
+                comparison_metrics=final_metrics,
+            )
 
         selected_legacy_decision = (
             evaluate_promotion(

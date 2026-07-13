@@ -88,6 +88,20 @@ RESERVED_EVOLUTION_IDS = frozenset({
     "baseline", "champion", "final", "experiments", "trials",
     "__shadow_incumbent__",
 })
+TOP_LEVEL_KEYS = frozenset({
+    "strategy", "evolution_core", "periods", "baseline", "search_groups", "selection",
+})
+PERIOD_KEYS = frozenset({
+    "research_start", "train_end", "validation_start", "validation_end",
+    "core_test_start", "core_test_end", "test_start", "test_end",
+})
+SEARCH_GROUP_KEYS = frozenset({"id", "hypothesis_cn", "candidates"})
+SEARCH_CANDIDATE_KEYS = frozenset({"id", "overrides"})
+WINDOWS_RESERVED_DEVICE_NAMES = frozenset({
+    "con", "prn", "aux", "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+})
 
 
 @dataclass(frozen=True)
@@ -269,6 +283,12 @@ def _validate_params(params: Mapping[str, object]) -> None:
         raise ValueError("min_pullback_5d must be <= max_pullback_5d")
 
 
+def is_windows_reserved_device_name(value: str) -> bool:
+    normalized = value.strip().rstrip(". ").casefold()
+    stem = normalized.split(".", 1)[0]
+    return stem in WINDOWS_RESERVED_DEVICE_NAMES
+
+
 def _identifier(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a non-empty string")
@@ -283,6 +303,7 @@ def _identifier(value: object, label: str) -> str:
         or any(ord(character) < 32 or ord(character) == 127 for character in identifier)
         or any(character in '<>:"|?*' for character in identifier)
         or identifier.endswith(".")
+        or is_windows_reserved_device_name(identifier)
         or normalized in RESERVED_EVOLUTION_IDS
     ):
         raise ValueError(f"{label} must be a safe non-reserved filename component")
@@ -392,10 +413,22 @@ def _parse_selection(value: object) -> SelectionRules:
 
 
 def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
-    if raw.get("strategy") != "strong_pullback_satellite":
+    if not isinstance(raw, Mapping):
+        raise ValueError("Evolution config must be a mapping")
+    raw_config = dict(raw)
+    unknown_top_level = set(raw_config) - TOP_LEVEL_KEYS
+    if unknown_top_level:
+        raise ValueError(f"Unknown top-level keys: {sorted(unknown_top_level)}")
+    if raw_config.get("strategy") != "strong_pullback_satellite":
         raise ValueError("strategy must be strong_pullback_satellite")
-    evolution_core = _parse_evolution_core(raw.get("evolution_core"))
-    period_raw = dict(raw.get("periods") or {})
+    evolution_core = _parse_evolution_core(raw_config.get("evolution_core"))
+    period_value = raw_config.get("periods")
+    if not isinstance(period_value, Mapping):
+        raise ValueError("periods must be a mapping")
+    period_raw = dict(period_value)
+    unknown_periods = set(period_raw) - PERIOD_KEYS
+    if unknown_periods:
+        raise ValueError(f"Unknown periods keys: {sorted(unknown_periods)}")
     periods = EvolutionPeriods(
         research_start=_timestamp(period_raw.get("research_start"), "research_start"),
         train_end=_timestamp(period_raw.get("train_end"), "train_end"),
@@ -420,14 +453,24 @@ def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
             "< core_test_start <= core_test_end < test_start"
         )
 
-    baseline = {**DEFAULT_STRATEGY_PARAMS, **dict(raw.get("baseline") or {})}
+    baseline_value = raw_config.get("baseline")
+    if not isinstance(baseline_value, Mapping):
+        raise ValueError("baseline must be a mapping")
+    baseline_raw = dict(baseline_value)
+    unknown_baseline = set(baseline_raw) - set(DEFAULT_STRATEGY_PARAMS)
+    if unknown_baseline:
+        raise ValueError(f"Unknown baseline keys: {sorted(unknown_baseline)}")
+    baseline = {**DEFAULT_STRATEGY_PARAMS, **baseline_raw}
     _validate_params(baseline)
     group_ids: set[str] = set()
     candidate_ids: set[str] = set()
     groups: list[SearchGroup] = []
-    for group_raw in list(raw.get("search_groups") or []):
+    for group_raw in list(raw_config.get("search_groups") or []):
         if not isinstance(group_raw, Mapping):
             raise ValueError("search_groups entries must be mappings")
+        unknown_group = set(group_raw) - SEARCH_GROUP_KEYS
+        if unknown_group:
+            raise ValueError(f"Unknown search group keys: {sorted(unknown_group)}")
         group_id = _identifier(group_raw.get("id"), "Group id")
         normalized_group_id = group_id.casefold()
         if normalized_group_id in group_ids:
@@ -437,6 +480,11 @@ def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
         for candidate_raw in list(group_raw.get("candidates") or []):
             if not isinstance(candidate_raw, Mapping):
                 raise ValueError("candidates entries must be mappings")
+            unknown_candidate = set(candidate_raw) - SEARCH_CANDIDATE_KEYS
+            if unknown_candidate:
+                raise ValueError(
+                    f"Unknown search candidate keys: {sorted(unknown_candidate)}"
+                )
             candidate_id = _identifier(candidate_raw.get("id"), "Candidate id")
             normalized_candidate_id = candidate_id.casefold()
             if normalized_candidate_id in candidate_ids:
@@ -455,7 +503,7 @@ def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
             raise ValueError(f"Search group {group_id!r} has no candidates")
         groups.append(SearchGroup(group_id, str(group_raw.get("hypothesis_cn", "")).strip(), tuple(candidates)))
 
-    selection = _parse_selection(raw.get("selection"))
+    selection = _parse_selection(raw_config.get("selection"))
     return EvolutionConfig(
         strategy="strong_pullback_satellite",
         evolution_core=evolution_core,
@@ -552,44 +600,76 @@ def build_trading_folds(
     return tuple(folds)
 
 
+def _build_period_segments(
+    trading_dates: object,
+    period_start: object,
+    period_end: object,
+    min_folds: int,
+    *,
+    prefix: str,
+) -> tuple[CoreTestSegment, ...]:
+    min_folds = _positive_window_size(min_folds, "min_folds")
+    try:
+        dates = pd.DatetimeIndex(pd.to_datetime(trading_dates)).normalize()
+        start = pd.Timestamp(period_start).normalize()
+        end = pd.Timestamp(period_end).normalize()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Evaluation-period dates must be valid datetimes") from exc
+    if dates.hasnans:
+        raise ValueError("trading_dates must not contain NaT")
+    if not dates.is_unique:
+        raise ValueError("trading_dates must be unique")
+    if start > end:
+        raise ValueError("period_start must not be after period_end")
+    period_dates = dates.sort_values()
+    period_dates = period_dates[(period_dates >= start) & (period_dates <= end)]
+    if len(period_dates) < min_folds:
+        raise ValueError("Evaluation period has fewer trading dates than min_folds")
+
+    base_size, remainder = divmod(len(period_dates), min_folds)
+    segments: list[CoreTestSegment] = []
+    offset = 0
+    for index in range(min_folds):
+        size = base_size + (1 if index < remainder else 0)
+        segment_dates = tuple(period_dates[offset:offset + size])
+        segments.append(
+            CoreTestSegment(
+                fold_id=f"{prefix}_{index:03d}",
+                test_dates=segment_dates,
+            )
+        )
+        offset += size
+    return tuple(segments)
+
+
+def build_selection_segments(
+    trading_dates: object,
+    validation_start: object,
+    validation_end: object,
+    min_folds: int,
+) -> tuple[CoreTestSegment, ...]:
+    return _build_period_segments(
+        trading_dates,
+        validation_start,
+        validation_end,
+        min_folds,
+        prefix="selection",
+    )
+
+
 def build_core_test_segments(
     trading_dates: object,
     core_test_start: object,
     core_test_end: object,
     min_folds: int,
 ) -> tuple[CoreTestSegment, ...]:
-    min_folds = _positive_window_size(min_folds, "min_folds")
-    try:
-        dates = pd.DatetimeIndex(pd.to_datetime(trading_dates)).normalize()
-        start = pd.Timestamp(core_test_start).normalize()
-        end = pd.Timestamp(core_test_end).normalize()
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Core-test dates must be valid datetimes") from exc
-    if dates.hasnans:
-        raise ValueError("trading_dates must not contain NaT")
-    if not dates.is_unique:
-        raise ValueError("trading_dates must be unique")
-    if start > end:
-        raise ValueError("core_test_start must not be after core_test_end")
-    core_dates = dates.sort_values()
-    core_dates = core_dates[(core_dates >= start) & (core_dates <= end)]
-    if len(core_dates) < min_folds:
-        raise ValueError("Core-test period has fewer trading dates than min_folds")
-
-    base_size, remainder = divmod(len(core_dates), min_folds)
-    segments: list[CoreTestSegment] = []
-    offset = 0
-    for index in range(min_folds):
-        size = base_size + (1 if index < remainder else 0)
-        segment_dates = tuple(core_dates[offset:offset + size])
-        segments.append(
-            CoreTestSegment(
-                fold_id=f"core_{index:03d}",
-                test_dates=segment_dates,
-            )
-        )
-        offset += size
-    return tuple(segments)
+    return _build_period_segments(
+        trading_dates,
+        core_test_start,
+        core_test_end,
+        min_folds,
+        prefix="core",
+    )
 
 
 def _slice_fold_rows(
