@@ -371,10 +371,6 @@ Add an `evolution_core` config block:
 
 ```yaml
 evolution_core:
-  train_days: 504
-  validation_days: 126
-  test_days: 126
-  step_days: 63
   max_candidates_per_group: 8
   random_seed: 20260712
   min_folds: 3
@@ -387,7 +383,7 @@ evolution_core:
   max_pnl_concentration: 0.50
 ```
 
-Add `EvolutionCoreConfig` as a frozen dataclass in `strong_pullback_evolution.py` and make `parse_evolution_config()` reject missing/unknown keys, booleans passed as integers, non-positive window sizes, `min_folds < 1`, ratios outside `[0, 1]`, positive drawdown floors, and non-positive `max_candidates_per_group`. Extend the existing default-config test to assert the parsed values.
+Add `EvolutionCoreConfig` as a frozen dataclass in `strong_pullback_evolution.py` and make `parse_evolution_config()` reject missing/unknown keys, booleans passed as integers, `min_folds < 1`, ratios outside `[0, 1]`, positive drawdown floors, and non-positive candidate/trade limits. The disjoint `periods` dates are the sole orchestration timing contract; legacy `evolution_core` walk-forward window fields are not accepted. The checked-in selection rules use `min_validation_days: 100` and `rolling_window_days: 63` for the 117-session 2025-01-01..2025-06-30 period without changing risk gates. Extend the existing default-config test to assert the parsed values.
 
 For each existing `search_groups` entry, the runner must pass that group's explicit overrides to `generate_parameter_candidates()` using a seed derived from `random_seed` and the stable group ID fingerprint. Candidates remain independent copies of the current champion, so random ordering cannot create path dependence within a group. The runner must always write run-local `folds.json`, `candidate_scores.csv`, `experiments/*.json`, `evolution_state_snapshot.json`, and `shadow_decision.md`. Only `promote_shadow=True` with `dry_run=False` may call `write_evolution_state_atomic()`. It must never open a path under `configs/` for writing.
 

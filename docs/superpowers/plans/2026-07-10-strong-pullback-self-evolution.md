@@ -1562,13 +1562,13 @@ search_groups:
           rebound_exit_return: 0.095
 
 selection:
-  min_validation_days: 120
+  min_validation_days: 100
   min_test_days: 60
   max_drawdown_floor: -0.40
   min_annualized_return_delta: 0.01
   min_sharpe_delta: -0.10
   max_turnover_ratio: 1.50
-  rolling_window_days: 126
+  rolling_window_days: 63
   max_negative_window_rate: 0.60
 ```
 

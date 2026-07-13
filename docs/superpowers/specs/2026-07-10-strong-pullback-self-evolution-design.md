@@ -113,17 +113,17 @@ search_groups:
         overrides: {rebound_exit_return: 0.095}
 
 selection:
-  min_validation_days: 120
+  min_validation_days: 100
   min_test_days: 60
   max_drawdown_floor: -0.40
   min_annualized_return_delta: 0.01
   min_sharpe_delta: -0.10
   max_turnover_ratio: 1.50
-  rolling_window_days: 126
+  rolling_window_days: 63
   max_negative_window_rate: 0.60
 ```
 
-配置读取后必须拒绝未知策略参数、重复的组或候选标识、交叉或倒置的时间区间，以及不在合理范围内的风险参数。
+配置读取后必须拒绝未知策略参数、重复的组或候选标识、交叉或倒置的时间区间，以及不在合理范围内的风险参数。默认选择期 2025-01-01 至 2025-06-30 按实际 A 股日历有 117 个交易日；100 日有效样本门槛与 63 日滚动窗口可形成 54 个完整窗口，同时不改变回撤、Sharpe、换手率和负窗口率门槛。
 
 ## 迭代流程
 

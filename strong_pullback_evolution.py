@@ -77,7 +77,6 @@ SELECTION_KEYS = frozenset({
 })
 
 EVOLUTION_CORE_KEYS = frozenset({
-    "train_days", "validation_days", "test_days", "step_days",
     "max_candidates_per_group", "random_seed", "min_folds",
     "min_filled_trades_per_fold", "min_positive_fold_ratio",
     "min_mean_return_improvement", "max_drawdown_floor",
@@ -130,10 +129,6 @@ class SelectionRules:
 
 @dataclass(frozen=True)
 class EvolutionCoreConfig:
-    train_days: int
-    validation_days: int
-    test_days: int
-    step_days: int
     max_candidates_per_group: int
     random_seed: int
     min_folds: int
@@ -341,10 +336,6 @@ def _parse_evolution_core(value: object) -> EvolutionCoreConfig:
     integer_values = {
         name: _strict_integer(raw[name], name, minimum=minimum)
         for name, minimum in {
-            "train_days": 1,
-            "validation_days": 1,
-            "test_days": 1,
-            "step_days": 1,
             "max_candidates_per_group": 1,
             "random_seed": None,
             "min_folds": 1,

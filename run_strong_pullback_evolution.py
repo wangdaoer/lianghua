@@ -326,8 +326,12 @@ def _resolve_run_dir(output_root: Path, run_id: str) -> tuple[Path, Path]:
         or "\\" in run_id
         or Path(run_id).is_absolute()
         or PureWindowsPath(run_id).is_absolute()
+        or any(ord(character) < 32 or ord(character) == 127 for character in run_id)
+        or any(character in '<>:"|?*' for character in run_id)
+        or run_id.endswith(".")
+        or is_windows_reserved_device_name(run_id)
     ):
-        raise ValueError("run_id must be a non-empty single relative path component")
+        raise ValueError("run_id must be a safe single relative path component")
     resolved_root = Path(output_root).resolve()
     resolved_run_dir = (resolved_root / run_id).resolve()
     try:
@@ -467,6 +471,7 @@ def reconcile_startup_transition(
     before = load_evolution_transition_journal(state_path)
     if before is None:
         return
+    resolved_root, prior_run_dir = _resolve_run_dir(output_root, before.run_id)
     reconciled = (
         reconcile_evolution_transition(state_path, default_state)
         if before.status == "pending"
@@ -475,13 +480,9 @@ def reconcile_startup_transition(
     if reconciled is None:
         return
     run_id = reconciled.run_id
-    if (
-        Path(run_id).name != run_id
-        or Path(run_id).is_absolute()
-        or PureWindowsPath(run_id).is_absolute()
-    ):
-        raise ValueError("transition journal run_id is unsafe")
-    manifest_path = Path(output_root) / run_id / "manifest.json"
+    if run_id != before.run_id:
+        raise ValueError("Reconciled transition journal changed run_id")
+    manifest_path = prior_run_dir / "manifest.json"
     if not manifest_path.exists():
         return
     try:
@@ -525,7 +526,7 @@ def reconcile_startup_transition(
     )
     _atomic_write_json(manifest_path, manifest)
     if committed:
-        publish_run_metadata(output_root, manifest)
+        publish_run_metadata(resolved_root, manifest)
 
 
 def _promotion_decision_markdown(
@@ -559,20 +560,33 @@ def _state_records_promotion(
     try:
         journal = load_evolution_transition_journal(state_path)
     except (OSError, ValueError):
-        journal = None
-    if journal is not None and journal.run_id == run_id:
-        return journal.status == "committed"
-    if not selected_experiment_id or not Path(state_path).exists():
+        return False
+    if (
+        journal is None
+        or journal.run_id != run_id
+        or journal.experiment_id != selected_experiment_id
+        or not selected_experiment_id
+        or not Path(state_path).exists()
+    ):
         return False
     try:
         state = load_evolution_state(Path(state_path), default_state)
     except (OSError, ValueError):
         return False
-    return (
-        state.shadow_status == "shadow"
-        and state.shadow_run_id == run_id
+    target_is_committed = (
+        fingerprint_payload(state) == journal.target_state_fingerprint
+        and state.last_completed_run_id == run_id
         and state.shadow_experiment_id == selected_experiment_id
     )
+    if not target_is_committed:
+        return False
+    if journal.status == "pending":
+        try:
+            reconciled = reconcile_evolution_transition(state_path, default_state)
+        except (OSError, ValueError):
+            return True
+        return reconciled is not None and reconciled.status == "committed"
+    return journal.status == "committed"
 
 
 def persist_evolution_outcome(

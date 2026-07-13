@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 import run_strong_pullback_evolution as evolution_runner
+import strategy_evolution_core as evolution_core
 import strong_pullback_evolution as evolution_adapter
 
 from strategy_evolution_core import (
@@ -75,10 +76,6 @@ def valid_raw_config() -> dict[str, object]:
     return {
         "strategy": "strong_pullback_satellite",
         "evolution_core": {
-            "train_days": 504,
-            "validation_days": 126,
-            "test_days": 126,
-            "step_days": 63,
             "max_candidates_per_group": 8,
             "random_seed": 20260712,
             "min_folds": 3,
@@ -137,7 +134,12 @@ class EvolutionCliTest(unittest.TestCase):
             ["risk_budget", "entry_depth", "rebound_exit"],
         )
         self.assertEqual(config.selection.max_drawdown_floor, -0.40)
-        self.assertEqual(config.evolution_core.train_days, 504)
+        self.assertEqual(config.selection.min_validation_days, 100)
+        self.assertEqual(config.selection.rolling_window_days, 63)
+        for removed_field in (
+            "train_days", "validation_days", "test_days", "step_days"
+        ):
+            self.assertFalse(hasattr(config.evolution_core, removed_field))
         self.assertEqual(config.evolution_core.random_seed, 20260712)
         self.assertEqual(config.evolution_core.min_positive_fold_ratio, 0.6666666667)
         self.assertEqual(config.periods.validation_end, pd.Timestamp("2025-06-30"))
@@ -318,7 +320,7 @@ class EvolutionConfigTest(unittest.TestCase):
 
     def test_rejects_missing_and_unknown_evolution_core_keys(self):
         raw = valid_raw_config()
-        del raw["evolution_core"]["train_days"]
+        del raw["evolution_core"]["max_candidates_per_group"]
         with self.assertRaisesRegex(ValueError, "Missing evolution_core keys"):
             parse_evolution_config(raw)
 
@@ -327,12 +329,31 @@ class EvolutionConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown evolution_core keys"):
             parse_evolution_config(raw)
 
+    def test_period_driven_core_schema_rejects_removed_walk_forward_fields(self):
+        removed_fields = {
+            "train_days": 504,
+            "validation_days": 126,
+            "test_days": 126,
+            "step_days": 63,
+        }
+        raw = valid_raw_config()
+        for field in removed_fields:
+            raw["evolution_core"].pop(field, None)
+
+        config = parse_evolution_config(raw)
+        resolved_core = evolution_runner.resolved_config_dict(config)["evolution_core"]
+
+        for field, value in removed_fields.items():
+            with self.subTest(field=field):
+                self.assertFalse(hasattr(config.evolution_core, field))
+                self.assertNotIn(field, resolved_core)
+                legacy = copy.deepcopy(raw)
+                legacy["evolution_core"][field] = value
+                with self.assertRaisesRegex(ValueError, "Unknown evolution_core keys"):
+                    parse_evolution_config(legacy)
+
     def test_rejects_invalid_evolution_core_values_and_boolean_integers(self):
         invalid_values = {
-            "train_days": (0, True),
-            "validation_days": (0, True),
-            "test_days": (0, True),
-            "step_days": (0, True),
             "max_candidates_per_group": (0, True),
             "random_seed": (True,),
             "min_folds": (0, True),
@@ -2382,6 +2403,57 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             self.assertIn("committed", decision)
             self.assertIn("post-CAS artifact failed", decision)
 
+    def test_post_cas_committed_journal_write_failure_reconciles_state_truth(self):
+        original_write = evolution_core._write_json_atomic
+        injected = {"failed": False}
+
+        def fail_first_committed_journal_write(path, payload):
+            status = getattr(payload, "status", None)
+            if (
+                Path(path).name.endswith("promotion_journal.json")
+                and status == "committed"
+                and not injected["failed"]
+            ):
+                injected["failed"] = True
+                raise OSError("committed journal write failed")
+            return original_write(path, payload)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch(
+                "strategy_evolution_core._write_json_atomic",
+                side_effect=fail_first_committed_journal_write,
+            ):
+                with self.assertRaisesRegex(OSError, "committed journal write failed"):
+                    self._run_eligible_promotion(root, "journal-finalize-failure")
+
+            run_dir = root / "runs" / "journal-finalize-failure"
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            state = load_evolution_state(
+                state_path, EvolutionState.initial("unused", {"leverage": 0.1})
+            )
+            journal = load_evolution_transition_journal(state_path)
+            manifest = json.loads(
+                (run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            decision = (run_dir / "shadow_decision.md").read_text(encoding="utf-8")
+
+        self.assertTrue(injected["failed"])
+        self.assertEqual(state.last_completed_run_id, "journal-finalize-failure")
+        self.assertIsNotNone(journal)
+        self.assertEqual(journal.status, "committed")
+        self.assertEqual(journal.run_id, "journal-finalize-failure")
+        self.assertEqual(journal.experiment_id, state.shadow_experiment_id)
+        self.assertEqual(
+            journal.target_state_fingerprint,
+            evolution_runner.fingerprint_payload(state),
+        )
+        self.assertEqual(manifest["promotion_persistence_status"], "committed")
+        self.assertTrue(manifest["global_state_changed"])
+        self.assertIn("committed journal write failed", manifest["error"])
+        self.assertIn("committed", decision)
+        self.assertIn("committed journal write failed", decision)
+
     def test_startup_reconciles_pending_committed_journal_and_prior_manifest(self):
         config = self._eligible_config()
         with tempfile.TemporaryDirectory() as tmp:
@@ -2533,6 +2605,72 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 [record["run_id"] for record in registry_records],
                 ["committed-crash"],
             )
+
+    def test_startup_recovery_rejects_unsafe_journal_run_ids_before_any_probe(self):
+        bad_run_ids = (
+            ".",
+            "..",
+            "nested/run",
+            r"nested\run",
+            "../probe",
+            r"..\probe",
+            r"C:\probe",
+            "CON",
+            "nul.txt",
+            "run.",
+        )
+        for index, bad_run_id in enumerate(bad_run_ids):
+            with self.subTest(run_id=bad_run_id), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                output_root = root / "runs"
+                state_path = root / f"state-{index}" / "strong_pullback.json"
+                initial = EvolutionState.initial(
+                    "baseline", {"leverage": 0.6},
+                    now="2026-07-08T00:00:00+00:00",
+                )
+                target = promote_to_shadow(
+                    initial,
+                    challenger_version="probe-shadow",
+                    challenger_parameters={"leverage": 0.75},
+                    experiment_id="probe-exp",
+                    run_id=bad_run_id,
+                    data_fingerprint="probe-data",
+                    data_asof_date="2026-07-08",
+                    now="2026-07-08T01:00:00+00:00",
+                )
+                write_evolution_state_atomic(state_path, target)
+                stage_evolution_transition(
+                    state_path,
+                    target,
+                    operation="promote",
+                    run_id=bad_run_id,
+                    experiment_id="probe-exp",
+                    now="2026-07-08T01:00:00+00:00",
+                )
+
+                with (
+                    patch(
+                        "run_strong_pullback_evolution._resolve_run_dir",
+                        wraps=evolution_runner._resolve_run_dir,
+                    ) as resolve_probe,
+                    patch("run_strong_pullback_evolution._atomic_write_text") as text_probe,
+                    patch("run_strong_pullback_evolution._atomic_write_json") as json_probe,
+                    patch("run_strong_pullback_evolution.publish_run_metadata") as metadata_probe,
+                ):
+                    with self.assertRaisesRegex(ValueError, "run_id must"):
+                        evolution_runner.reconcile_startup_transition(
+                            output_root, state_path, initial
+                        )
+
+                resolve_probe.assert_called_once_with(output_root, bad_run_id)
+                text_probe.assert_not_called()
+                json_probe.assert_not_called()
+                metadata_probe.assert_not_called()
+                journal = load_evolution_transition_journal(state_path)
+                self.assertIsNotNone(journal)
+                self.assertEqual(journal.status, "pending")
+                self.assertFalse((output_root / "latest.json").exists())
+                self.assertFalse((output_root / "evolution_registry.jsonl").exists())
 
     def test_selection_load_precedes_core_and_gated_holdout_load(self):
         config = self._eligible_config()
@@ -3352,6 +3490,80 @@ class EvolutionOrchestrationTest(unittest.TestCase):
 
 
 class EvolutionDecisionTest(unittest.TestCase):
+    def test_checked_in_selection_gates_are_feasible_on_real_2025_calendar(self):
+        config = load_evolution_config(Path("configs/evolution_strong_pullback.yaml"))
+        exchange_holidays = pd.DatetimeIndex([
+            "2025-01-01",
+            "2025-01-28", "2025-01-29", "2025-01-30", "2025-01-31",
+            "2025-02-03", "2025-02-04",
+            "2025-04-04",
+            "2025-05-01", "2025-05-02", "2025-05-05",
+            "2025-06-02",
+        ])
+        trading_dates = pd.bdate_range("2025-01-01", "2025-06-30").difference(
+            exchange_holidays
+        )
+
+        def equity_for(net_returns):
+            returns = np.asarray(net_returns, dtype=float)
+            return pd.DataFrame({
+                "date": trading_dates,
+                "equity": 1_000_000.0 * np.cumprod(1.0 + returns),
+                "gross_return": returns,
+                "cost": 0.0,
+                "turnover": 0.10,
+                "gross_exposure": 0.60,
+            })
+
+        self.assertEqual(len(trading_dates), 117)
+        self.assertEqual(config.selection.min_validation_days, 100)
+        self.assertEqual(config.selection.rolling_window_days, 63)
+        self.assertEqual(config.selection.max_drawdown_floor, -0.40)
+        self.assertEqual(config.selection.min_sharpe_delta, -0.10)
+        self.assertEqual(config.selection.max_turnover_ratio, 1.50)
+        self.assertEqual(config.selection.max_negative_window_rate, 0.60)
+        self.assertEqual(config.evolution_core.max_drawdown_floor, -0.40)
+        self.assertEqual(config.evolution_core.max_drawdown_worsening, 0.05)
+        self.assertEqual(config.evolution_core.max_turnover_ratio, 1.50)
+        self.assertEqual(config.evolution_core.max_pnl_concentration, 0.50)
+
+        baseline_metrics = calculate_segment_metrics(
+            equity_for(np.full(len(trading_dates), 0.0002)),
+            trading_dates[0],
+            trading_dates[-1],
+            config.selection.rolling_window_days,
+        )
+        candidate_metrics = calculate_segment_metrics(
+            equity_for(np.full(len(trading_dates), 0.0005)),
+            trading_dates[0],
+            trading_dates[-1],
+            config.selection.rolling_window_days,
+        )
+        decision = evaluate_promotion(
+            candidate_metrics, baseline_metrics, config.selection
+        )
+
+        self.assertEqual(candidate_metrics["trade_days"], 117)
+        self.assertEqual(candidate_metrics["rolling_window_count"], 54)
+        self.assertTrue(decision.eligible, decision.reasons)
+
+        risky_returns = np.full(len(trading_dates), 0.0005)
+        risky_returns[80] = -0.45
+        risky_returns[81] = 0.90
+        risky_metrics = calculate_segment_metrics(
+            equity_for(risky_returns),
+            trading_dates[0],
+            trading_dates[-1],
+            config.selection.rolling_window_days,
+        )
+        risky_decision = evaluate_promotion(
+            risky_metrics, baseline_metrics, config.selection
+        )
+
+        self.assertLess(risky_metrics["max_drawdown"], -0.40)
+        self.assertFalse(risky_decision.eligible)
+        self.assertIn("最大回撤超过限制", risky_decision.reasons)
+
     def test_build_trading_folds_uses_actual_index_positions(self):
         dates = pd.DatetimeIndex(
             ["2026-01-02", "2026-01-05", "2026-01-08", "2026-01-09", "2026-01-12", "2026-01-16"]
