@@ -10,6 +10,7 @@ from run_daily_model_pipeline import (
     append_daily_run_state,
     build_daily_pipeline_steps,
     build_daily_run_state,
+    ensure_fetch_status_ok,
     latest_daily_date,
     metrics_path_for_date,
     names_source_for_date,
@@ -37,6 +38,13 @@ class DailyModelPipelineTest(unittest.TestCase):
 
         steps = build_daily_pipeline_steps(config)
         names = [step.name for step in steps]
+
+        self.assertIn("regime_shadow_compare", names)
+        shadow_step = steps[names.index("regime_shadow_compare")]
+        shadow_args = " ".join(str(part) for part in shadow_step.command)
+        self.assertIn("run_daily_regime_shadow_compare.py", shadow_args)
+        self.assertIn("regime_shadow_compare_20260629", shadow_args)
+        self.assertIn("daily-market-data\\benchmarks\\510300.csv", shadow_args)
 
         self.assertEqual(
             names[-7:],
@@ -79,6 +87,24 @@ class DailyModelPipelineTest(unittest.TestCase):
         stability_args = " ".join(str(part) for part in stability_step.command)
         self.assertIn("summarize_core_risk_filter_stability.py", stability_args)
         self.assertIn("core_risk_filter_finalist_stability_20260629", stability_args)
+
+    def test_pipeline_can_skip_regime_shadow_compare(self):
+        config = PipelineConfig(
+            asof_date="2026-06-29",
+            python_exe="python",
+            project_root=Path("C:/model"),
+            include_regime_shadow_compare=False,
+        )
+
+        names = [step.name for step in build_daily_pipeline_steps(config)]
+
+        self.assertNotIn("regime_shadow_compare", names)
+
+    def test_fetch_status_must_be_ok_before_real_run(self):
+        ensure_fetch_status_ok({"status": "ok", "run_id": "run-1"})
+
+        with self.assertRaisesRegex(RuntimeError, "not ready"):
+            ensure_fetch_status_ok({"status": "status_error", "message": "offline"})
 
     def test_names_source_for_date_falls_back_to_xls_when_csv_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,6 +150,24 @@ class DailyModelPipelineTest(unittest.TestCase):
             self._write_csv(output / f"daily_personal_overlay_selected_{token}.csv", [{"symbol": "000001"}])
             self._write_csv(output / f"daily_personal_overlay_changes_{token}.csv", [{"symbol": "000002"}])
             (output / f"daily_personal_overlay_report_{token}.md").write_text("report", encoding="utf-8")
+            shadow_dir = output / f"regime_shadow_compare_{token}"
+            shadow_dir.mkdir()
+            (shadow_dir / "comparison.json").write_text(
+                json.dumps(
+                    {
+                        "decision": "experimental_only",
+                        "benchmark_last_date": "2026-07-10",
+                        "benchmark_fresh": False,
+                        "delta": {"total_return": 0.03, "max_drawdown": 0.01},
+                        "latest_dynamic_state": {
+                            "risk_regime": "strong",
+                            "target_leverage": 0.75,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (shadow_dir / "report.md").write_text("shadow report", encoding="utf-8")
             config = PipelineConfig(
                 asof_date="2026-06-29",
                 python_exe="python",
@@ -152,6 +196,12 @@ class DailyModelPipelineTest(unittest.TestCase):
             )
             self.assertEqual(record["top10"][0]["symbol"], "000001")
             self.assertEqual(record["fallback_fetch_status"]["status"], "missing_utils")
+            self.assertEqual(record["verification"]["regime_shadow_decision"], "experimental_only")
+            self.assertIsNone(record["verification"]["regime_shadow_risk_regime"])
+            self.assertIsNone(record["verification"]["regime_shadow_target_leverage"])
+            self.assertEqual(record["verification"]["regime_shadow_total_return_delta"], 0.03)
+            self.assertFalse(record["verification"]["regime_shadow_benchmark_fresh"])
+            self.assertTrue(str(record["artifacts"]["regime_shadow_report"]).endswith("report.md"))
 
     def test_daily_run_state_uses_newest_pending_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
