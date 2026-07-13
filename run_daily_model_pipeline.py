@@ -68,6 +68,7 @@ class PipelineConfig:
     include_strategy_family_forward_report: bool = True
     include_benchmark_refresh: bool = True
     include_regime_shadow_compare: bool = True
+    include_regime_shadow_tracking: bool = True
     regime_shadow_config: Path = Path("configs/evolution_strong_pullback.yaml")
     regime_shadow_candidate_id: str = "regime_090_balanced"
 
@@ -120,6 +121,30 @@ def _missing_count(rows: list[dict[str, str]], column: str) -> int | None:
 
 def _top_rows(rows: list[dict[str, str]], columns: list[str], limit: int = 10) -> list[dict[str, str]]:
     return [{column: row.get(column, "") for column in columns} for row in rows[:limit]]
+
+
+def _tracking_state_gate(
+    steps: list[PipelineStep],
+    run_status: str,
+    failure: dict[str, object] | None,
+) -> tuple[str | None, bool]:
+    step_names = [step.name for step in steps]
+    if "regime_shadow_tracking" not in step_names:
+        return ("missing" if run_status == "failed" else None), run_status != "failed"
+    if run_status != "failed":
+        return None, True
+    if not isinstance(failure, dict):
+        return "missing", False
+    failure_step = failure.get("step")
+    if not isinstance(failure_step, str) or failure_step not in step_names:
+        return "missing", False
+    failure_index = step_names.index(failure_step)
+    tracking_index = step_names.index("regime_shadow_tracking")
+    if failure_index < tracking_index:
+        return "not_run", False
+    if failure_index == tracking_index:
+        return "failed", False
+    return None, True
 
 
 def _jsonable(value: object) -> object:
@@ -249,11 +274,17 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "regime_shadow_dir": output_root / f"regime_shadow_compare_{token}",
         "regime_shadow_report": output_root / f"regime_shadow_compare_{token}" / "report.md",
         "regime_shadow_comparison": output_root / f"regime_shadow_compare_{token}" / "comparison.json",
+        "regime_shadow_tracking_ledger": output_root / "regime_shadow_tracking.csv",
+        "regime_shadow_tracking_summary": output_root / "regime_shadow_tracking_summary.json",
+        "regime_shadow_tracking_report": output_root / "regime_shadow_tracking_report.md",
         "benchmark_refresh_status": output_root / f"benchmark_refresh_status_{token}.json",
     }
 
 
 def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
+    tracking_enabled = getattr(config, "include_regime_shadow_tracking", True)
+    if tracking_enabled and not config.include_regime_shadow_compare:
+        raise ValueError("regime shadow tracking requires regime shadow comparison output")
     paths = _paths(config)
     token = _date_token(config.asof_date)
     base_target_weight = min(config.max_position_weight, config.leverage / max(config.top_n, 1))
@@ -329,6 +360,26 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                     config.regime_shadow_candidate_id,
                     "--python",
                     config.python_exe,
+                ),
+            )
+        )
+    if tracking_enabled:
+        steps.append(
+            PipelineStep(
+                "regime_shadow_tracking",
+                (
+                    config.python_exe,
+                    str(config.project_root / "update_regime_shadow_tracking.py"),
+                    "--comparison-dir",
+                    str(paths["regime_shadow_dir"]),
+                    "--ledger",
+                    str(paths["regime_shadow_tracking_ledger"]),
+                    "--summary",
+                    str(paths["regime_shadow_tracking_summary"]),
+                    "--report",
+                    str(paths["regime_shadow_tracking_report"]),
+                    "--target-days",
+                    "20",
                 ),
             )
         )
@@ -575,6 +626,7 @@ def build_daily_run_state(
     failure: dict[str, object] | None = None,
 ) -> dict[str, object]:
     paths = _paths(config)
+    tracking_enabled = getattr(config, "include_regime_shadow_tracking", True)
     priority_path = _latest_artifact(paths["merged_priority_watchlist"])
     early_path = _latest_artifact(paths["early_watchlist"])
     hidden_tracking_path = _latest_artifact(paths["hidden_accumulation_tracking"])
@@ -595,6 +647,69 @@ def build_daily_run_state(
     selected_rows = _read_csv_rows(selected_path)
     change_rows = _read_csv_rows(changes_path)
     regime_shadow = _read_json_object(paths["regime_shadow_comparison"])
+    if tracking_enabled:
+        tracking_status_override, tracking_may_be_current = _tracking_state_gate(
+            steps,
+            run_status,
+            failure,
+        )
+        if tracking_may_be_current:
+            tracking_summary = _read_json_object(paths["regime_shadow_tracking_summary"])
+            if tracking_summary.get("latest_asof_date") != config.asof_date:
+                tracking_status = "missing"
+                tracking_valid = None
+                tracking_target = None
+                tracking_remaining = None
+                tracking_invalid = None
+                tracking_return_delta = None
+                tracking_benchmark_fresh = None
+                tracking_risk_regime = None
+                tracking_target_leverage = None
+                tracking_ledger_artifact = None
+                tracking_summary_artifact = None
+                tracking_report_artifact = None
+            else:
+                tracking_risk_state = tracking_summary.get("latest_risk_state")
+                if not isinstance(tracking_risk_state, dict):
+                    tracking_risk_state = {}
+                tracking_status = tracking_summary.get("status", "missing")
+                tracking_valid = tracking_summary.get("valid_observation_count")
+                tracking_target = tracking_summary.get("target_days")
+                tracking_remaining = tracking_summary.get("remaining_days")
+                tracking_invalid = tracking_summary.get("invalid_observation_count")
+                tracking_return_delta = tracking_summary.get("cumulative_return_delta")
+                tracking_benchmark_fresh = tracking_summary.get("latest_benchmark_fresh")
+                tracking_risk_regime = tracking_risk_state.get("risk_regime")
+                tracking_target_leverage = tracking_risk_state.get("target_leverage")
+                tracking_ledger_artifact = str(_latest_artifact(paths["regime_shadow_tracking_ledger"]))
+                tracking_summary_artifact = str(_latest_artifact(paths["regime_shadow_tracking_summary"]))
+                tracking_report_artifact = str(_latest_artifact(paths["regime_shadow_tracking_report"]))
+        else:
+            tracking_status = tracking_status_override or "missing"
+            tracking_valid = None
+            tracking_target = None
+            tracking_remaining = None
+            tracking_invalid = None
+            tracking_return_delta = None
+            tracking_benchmark_fresh = None
+            tracking_risk_regime = None
+            tracking_target_leverage = None
+            tracking_ledger_artifact = None
+            tracking_summary_artifact = None
+            tracking_report_artifact = None
+    else:
+        tracking_status = "skipped"
+        tracking_valid = None
+        tracking_target = None
+        tracking_remaining = None
+        tracking_invalid = None
+        tracking_return_delta = None
+        tracking_benchmark_fresh = None
+        tracking_risk_regime = None
+        tracking_target_leverage = None
+        tracking_ledger_artifact = None
+        tracking_summary_artifact = None
+        tracking_report_artifact = None
     if not config.include_benchmark_refresh:
         benchmark_refresh = {"status": "skipped"}
     elif paths["benchmark_refresh_status"].exists():
@@ -645,6 +760,15 @@ def build_daily_run_state(
             "regime_shadow_max_drawdown_delta": regime_delta.get("max_drawdown"),
             "regime_shadow_benchmark_last_date": regime_shadow.get("benchmark_last_date"),
             "regime_shadow_benchmark_fresh": regime_shadow.get("benchmark_fresh"),
+            "regime_shadow_tracking_status": tracking_status,
+            "regime_shadow_tracking_valid_observations": tracking_valid,
+            "regime_shadow_tracking_target_days": tracking_target,
+            "regime_shadow_tracking_remaining_days": tracking_remaining,
+            "regime_shadow_tracking_invalid_observations": tracking_invalid,
+            "regime_shadow_tracking_cumulative_return_delta": tracking_return_delta,
+            "regime_shadow_tracking_benchmark_fresh": tracking_benchmark_fresh,
+            "regime_shadow_tracking_risk_regime": tracking_risk_regime,
+            "regime_shadow_tracking_target_leverage": tracking_target_leverage,
             "benchmark_refresh_status": benchmark_refresh.get("status"),
             "benchmark_latest_date": benchmark_refresh.get("latest_date"),
             "benchmark_source_agreement": benchmark_refresh.get("source_agreement"),
@@ -666,6 +790,9 @@ def build_daily_run_state(
             "stability_report": str(_latest_artifact(paths["strategy_stability_report"])),
             "regime_shadow_report": str(_latest_artifact(paths["regime_shadow_report"])),
             "regime_shadow_comparison": str(_latest_artifact(paths["regime_shadow_comparison"])),
+            "regime_shadow_tracking_ledger": tracking_ledger_artifact,
+            "regime_shadow_tracking_summary": tracking_summary_artifact,
+            "regime_shadow_tracking_report": tracking_report_artifact,
             "benchmark_refresh_status": (
                 str(_latest_artifact(paths["benchmark_refresh_status"]))
                 if config.include_benchmark_refresh
@@ -740,6 +867,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-strategy-stability", action="store_true")
     parser.add_argument("--skip-benchmark-refresh", action="store_true")
     parser.add_argument("--skip-regime-shadow-compare", action="store_true")
+    parser.add_argument("--skip-regime-shadow-tracking", action="store_true")
     parser.add_argument("--regime-shadow-config", default="configs/evolution_strong_pullback.yaml")
     parser.add_argument("--regime-shadow-candidate-id", default="regime_090_balanced")
     parser.add_argument("--state-log", default="daily_run_state.jsonl")
@@ -774,6 +902,7 @@ def main() -> None:
         include_strategy_stability_report=not args.skip_strategy_stability,
         include_benchmark_refresh=not args.skip_benchmark_refresh,
         include_regime_shadow_compare=not args.skip_regime_shadow_compare,
+        include_regime_shadow_tracking=not args.skip_regime_shadow_tracking,
         regime_shadow_config=Path(args.regime_shadow_config),
         regime_shadow_candidate_id=args.regime_shadow_candidate_id,
     )
@@ -809,6 +938,10 @@ def main() -> None:
         print(output_root / f"core_risk_filter_finalist_stability_{token}.md")
     if config.include_regime_shadow_compare:
         print(output_root / f"regime_shadow_compare_{token}" / "report.md")
+    if config.include_regime_shadow_tracking:
+        print(output_root / "regime_shadow_tracking.csv")
+        print(output_root / "regime_shadow_tracking_summary.json")
+        print(output_root / "regime_shadow_tracking_report.md")
     if config.include_benchmark_refresh:
         print(output_root / f"benchmark_refresh_status_{token}.json")
     if not args.dry_run and not args.skip_state_log:

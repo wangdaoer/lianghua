@@ -113,6 +113,7 @@ def build_comparison_payload(
         }
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "asof": asof_date,
         "asof_date": asof_date,
         "baseline_id": "baseline",
         "dynamic_candidate_id": candidate_id,
