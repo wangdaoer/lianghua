@@ -126,12 +126,27 @@ class EvolutionCliTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_args(["--config", "configs/evolution_strong_pullback.yaml"])
 
-    def test_default_config_parses_and_has_three_hypothesis_groups(self):
+    def test_default_config_parses_and_has_regime_gated_risk_group(self):
         config = load_evolution_config(Path("configs/evolution_strong_pullback.yaml"))
 
         self.assertEqual(
             [group.group_id for group in config.search_groups],
-            ["risk_budget", "entry_depth", "rebound_exit"],
+            ["regime_risk_budget", "entry_depth", "rebound_exit"],
+        )
+        regime_group = config.search_groups[0]
+        self.assertEqual(
+            [candidate.candidate_id for candidate in regime_group.candidates],
+            ["regime_075_capped", "regime_090_balanced", "regime_090_strict"],
+        )
+        self.assertTrue(
+            all(candidate.overrides["max_position_weight"] == 0.12 for candidate in regime_group.candidates)
+        )
+        self.assertFalse(
+            any(
+                "leverage" in candidate.overrides
+                for group in config.search_groups
+                for candidate in group.candidates
+            )
         )
         self.assertEqual(config.selection.max_drawdown_floor, -0.40)
         self.assertEqual(config.selection.min_validation_days, 100)
@@ -262,6 +277,36 @@ class EvolutionCliTest(unittest.TestCase):
 
 
 class EvolutionConfigTest(unittest.TestCase):
+    def test_accepts_coherent_regime_gated_leverage_candidate(self):
+        raw = valid_raw_config()
+        overrides = {
+            "regime_strong_leverage": 0.75,
+            "regime_exceptional_leverage": 0.90,
+            "regime_strong_breadth_threshold": 0.55,
+            "regime_exceptional_breadth_threshold": 0.70,
+            "regime_strong_volatility_max": 0.28,
+            "regime_exceptional_volatility_max": 0.20,
+        }
+        raw["search_groups"][0]["candidates"][0]["overrides"] = overrides
+
+        candidate = parse_evolution_config(raw).search_groups[0].candidates[0]
+
+        self.assertEqual(candidate.overrides, overrides)
+
+    def test_rejects_incoherent_regime_gated_leverage_thresholds(self):
+        raw = valid_raw_config()
+        raw["search_groups"][0]["candidates"][0]["overrides"] = {
+            "regime_strong_leverage": 0.90,
+            "regime_exceptional_leverage": 0.75,
+            "regime_strong_breadth_threshold": 0.70,
+            "regime_exceptional_breadth_threshold": 0.55,
+            "regime_strong_volatility_max": 0.18,
+            "regime_exceptional_volatility_max": 0.28,
+        }
+
+        with self.assertRaisesRegex(ValueError, "regime"):
+            parse_evolution_config(raw)
+
     def test_rejects_unknown_fields_at_every_config_mapping_level(self):
         mutations = {
             "top_level": lambda raw: raw.__setitem__("future_top", True),
@@ -646,6 +691,16 @@ class EvolutionConfigTest(unittest.TestCase):
             "basket_guard_distance_ma60_min", "rebound_exit_return",
             "rebound_exit_market_exposure_max",
             "rebound_exit_market_exposure_min",
+            "regime_strong_leverage", "regime_exceptional_leverage",
+            "regime_strong_breadth_threshold",
+            "regime_exceptional_breadth_threshold",
+            "regime_strong_volatility_max", "regime_exceptional_volatility_max",
+        }
+        coupled_regime_controls = {
+            "regime_strong_leverage", "regime_exceptional_leverage",
+            "regime_strong_breadth_threshold",
+            "regime_exceptional_breadth_threshold",
+            "regime_strong_volatility_max", "regime_exceptional_volatility_max",
         }
         all_controls = integer_controls | numeric_controls | optional_numeric_controls
         self.assertEqual(all_controls, set(DEFAULT_STRATEGY_PARAMS))
@@ -688,6 +743,7 @@ class EvolutionConfigTest(unittest.TestCase):
                 if source == "baseline"
                 else optional_numeric_controls & evolution_adapter.ALLOWED_OVERRIDE_PARAMS
             )
+            tested_controls = tested_controls - coupled_regime_controls
             for key in sorted(tested_controls):
                 for value in (None, 0.25):
                     with self.subTest(
@@ -1125,12 +1181,13 @@ class EvolutionAdapterTest(unittest.TestCase):
             equity=pd.DataFrame(), weights=pd.DataFrame(), trades=pd.DataFrame(), candidates=pd.DataFrame()
         )
         price_bundle = type("PriceBundleStub", (), {
-            "close": pd.DataFrame({"000001": [10.0]}),
-            "open_px": pd.DataFrame({"000001": [10.0]}),
-            "high": pd.DataFrame({"000001": [10.0]}),
-            "low": pd.DataFrame({"000001": [10.0]}),
-            "amount": pd.DataFrame({"000001": [1_000.0]}),
-            "market_exposure": pd.Series([0.6]),
+            "close": pd.DataFrame({"000001": [10.0]}, index=[pd.Timestamp("2025-01-02")]),
+            "open_px": pd.DataFrame({"000001": [10.0]}, index=[pd.Timestamp("2025-01-02")]),
+            "high": pd.DataFrame({"000001": [10.0]}, index=[pd.Timestamp("2025-01-02")]),
+            "low": pd.DataFrame({"000001": [10.0]}, index=[pd.Timestamp("2025-01-02")]),
+            "amount": pd.DataFrame({"000001": [1_000.0]}, index=[pd.Timestamp("2025-01-02")]),
+            "market_exposure": pd.Series([0.6], index=[pd.Timestamp("2025-01-02")]),
+            "benchmark_close": pd.Series([100.0], index=[pd.Timestamp("2025-01-02")]),
         })()
         params = {
             **DEFAULT_STRATEGY_PARAMS,
@@ -1148,6 +1205,12 @@ class EvolutionAdapterTest(unittest.TestCase):
             "rebound_exit_scale": 0.25,
             "rebound_exit_market_exposure_max": 0.4,
             "rebound_exit_market_exposure_min": 0.1,
+            "regime_strong_leverage": 0.75,
+            "regime_exceptional_leverage": 0.90,
+            "regime_strong_breadth_threshold": 0.55,
+            "regime_exceptional_breadth_threshold": 0.70,
+            "regime_strong_volatility_max": 0.28,
+            "regime_exceptional_volatility_max": 0.20,
         }
         captured = {}
 
@@ -1192,6 +1255,10 @@ class EvolutionAdapterTest(unittest.TestCase):
         self.assertEqual(captured["rebound_exit_scale"], 0.25)
         self.assertEqual(captured["rebound_exit_market_exposure_max"], 0.4)
         self.assertEqual(captured["rebound_exit_market_exposure_min"], 0.1)
+        self.assertEqual(captured["regime_schedule"].iloc[0]["risk_regime"], "base")
+        self.assertAlmostEqual(
+            float(captured["regime_schedule"].iloc[0]["target_leverage"]), 0.75
+        )
 
     def test_execute_strategy_trial_rejects_empty_equity(self):
         price_bundle = type("PriceBundleStub", (), {
@@ -1208,6 +1275,26 @@ class EvolutionAdapterTest(unittest.TestCase):
 
 
 class EvolutionOrchestrationTest(unittest.TestCase):
+    def test_regime_enabled_config_requires_benchmark_before_run_directory_creation(self):
+        config_path = Path("configs/evolution_strong_pullback.yaml").resolve()
+        config = load_evolution_config(config_path)
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "runs"
+
+            with self.assertRaisesRegex(ValueError, "benchmark"):
+                run_evolution(
+                    config=config,
+                    data_path=Path(tmp) / "missing-panel.csv",
+                    config_path=config_path,
+                    benchmark_path=None,
+                    asof_date=pd.Timestamp("2026-07-10"),
+                    output_root=output_root,
+                    run_id="missing-benchmark",
+                    resume=False,
+                )
+
+            self.assertFalse((output_root / "missing-benchmark").exists())
+
     @staticmethod
     def _flat_bundle(end_date: pd.Timestamp) -> PriceBundle:
         dates = pd.date_range("2022-01-03", end=end_date, freq="B")

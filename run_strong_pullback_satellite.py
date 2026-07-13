@@ -22,6 +22,124 @@ from train_next_open_rank_model import (
 )
 
 
+def validate_regime_leverage_controls(
+    *,
+    base_leverage: float,
+    strong_leverage: float | None,
+    exceptional_leverage: float | None,
+    strong_breadth_threshold: float | None,
+    exceptional_breadth_threshold: float | None,
+    strong_volatility_max: float | None,
+    exceptional_volatility_max: float | None,
+) -> bool:
+    settings = (
+        strong_leverage,
+        exceptional_leverage,
+        strong_breadth_threshold,
+        exceptional_breadth_threshold,
+        strong_volatility_max,
+        exceptional_volatility_max,
+    )
+    if not any(value is not None for value in settings):
+        return False
+    if any(value is None for value in settings):
+        raise ValueError("regime-gated leverage controls must be configured together")
+
+    strong = float(strong_leverage)
+    exceptional = float(exceptional_leverage)
+    strong_breadth = float(strong_breadth_threshold)
+    exceptional_breadth = float(exceptional_breadth_threshold)
+    strong_volatility = float(strong_volatility_max)
+    exceptional_volatility = float(exceptional_volatility_max)
+    if not 0.0 <= float(base_leverage) <= strong <= exceptional <= 1.5:
+        raise ValueError(
+            "regime leverage must satisfy 0 <= base <= strong <= exceptional <= 1.5"
+        )
+    if not 0.0 <= strong_breadth <= exceptional_breadth <= 1.0:
+        raise ValueError(
+            "regime breadth must satisfy 0 <= strong <= exceptional <= 1"
+        )
+    if not 0.0 < exceptional_volatility <= strong_volatility:
+        raise ValueError(
+            "regime volatility must satisfy 0 < exceptional <= strong"
+        )
+    return True
+
+
+def build_regime_leverage_schedule(
+    benchmark_close: pd.Series,
+    close: pd.DataFrame,
+    market_exposure: pd.Series,
+    *,
+    base_leverage: float,
+    strong_leverage: float | None = None,
+    exceptional_leverage: float | None = None,
+    strong_breadth_threshold: float | None = None,
+    exceptional_breadth_threshold: float | None = None,
+    strong_volatility_max: float | None = None,
+    exceptional_volatility_max: float | None = None,
+) -> pd.DataFrame:
+    enabled = validate_regime_leverage_controls(
+        base_leverage=base_leverage,
+        strong_leverage=strong_leverage,
+        exceptional_leverage=exceptional_leverage,
+        strong_breadth_threshold=strong_breadth_threshold,
+        exceptional_breadth_threshold=exceptional_breadth_threshold,
+        strong_volatility_max=strong_volatility_max,
+        exceptional_volatility_max=exceptional_volatility_max,
+    )
+    dates = pd.DatetimeIndex(close.index)
+    benchmark = pd.to_numeric(benchmark_close, errors="coerce").reindex(dates).ffill()
+    if enabled and not bool(benchmark.notna().any()):
+        raise ValueError("benchmark close data is required for regime-gated leverage")
+    exposure = pd.to_numeric(market_exposure, errors="coerce").reindex(dates).ffill()
+    fast_ma = benchmark.rolling(20).mean()
+    slow_ma = benchmark.rolling(60).mean()
+    benchmark_return_20d = benchmark.pct_change(20, fill_method=None)
+    benchmark_volatility_20d = (
+        benchmark.pct_change(fill_method=None).rolling(20).std(ddof=0) * np.sqrt(252.0)
+    )
+    close_ma60 = close.rolling(60).mean()
+    breadth_ma60 = close.gt(close_ma60).where(close.notna() & close_ma60.notna()).mean(axis=1)
+    trend_on = (
+        benchmark.gt(slow_ma)
+        & fast_ma.gt(slow_ma)
+        & slow_ma.gt(slow_ma.shift(20))
+        & benchmark_return_20d.gt(0.0)
+        & exposure.ge(1.0 - 1e-12)
+    )
+    target_leverage = pd.Series(float(base_leverage), index=dates, dtype=float)
+    risk_regime = pd.Series("base", index=dates, dtype="object")
+
+    if enabled:
+        strong = (
+            trend_on
+            & breadth_ma60.ge(float(strong_breadth_threshold))
+            & benchmark_volatility_20d.le(float(strong_volatility_max))
+        )
+        exceptional = (
+            strong
+            & breadth_ma60.ge(float(exceptional_breadth_threshold))
+            & benchmark_volatility_20d.le(float(exceptional_volatility_max))
+        )
+        target_leverage.loc[strong] = float(strong_leverage)
+        risk_regime.loc[strong] = "strong"
+        target_leverage.loc[exceptional] = float(exceptional_leverage)
+        risk_regime.loc[exceptional] = "exceptional"
+
+    return pd.DataFrame(
+        {
+            "target_leverage": target_leverage,
+            "risk_regime": risk_regime,
+            "trend_on": trend_on.fillna(False),
+            "breadth_ma60": breadth_ma60,
+            "benchmark_return_20d": benchmark_return_20d,
+            "benchmark_volatility_20d": benchmark_volatility_20d,
+        },
+        index=dates,
+    )
+
+
 def build_raw_metric_frames(
     close: pd.DataFrame,
     open_px: pd.DataFrame,
@@ -239,6 +357,7 @@ def run_satellite_walk_forward(
     market_exposure: pd.Series,
     initial_capital: float,
     filter_kwargs: dict[str, float],
+    regime_schedule: pd.DataFrame | None = None,
     basket_guard_return_20d_min: float | None = None,
     basket_guard_distance_ma60_min: float | None = None,
     basket_guard_scale: float = 1.0,
@@ -266,9 +385,25 @@ def run_satellite_walk_forward(
         "avg_return_20d": np.nan,
         "avg_distance_ma60": np.nan,
     }
+    previous_target_gross_exposure: float | None = None
 
     for i in range(train_days + 1, len(close.index) - 2):
         date = close.index[i]
+        if regime_schedule is None or date not in regime_schedule.index:
+            regime_row = pd.Series(
+                {
+                    "target_leverage": float(leverage),
+                    "risk_regime": "base",
+                    "trend_on": False,
+                    "breadth_ma60": np.nan,
+                    "benchmark_return_20d": np.nan,
+                    "benchmark_volatility_20d": np.nan,
+                }
+            )
+        else:
+            regime_row = regime_schedule.loc[date]
+        target_leverage = float(regime_row["target_leverage"])
+        exposure = float(market_exposure.reindex([date]).iloc[0])
         rebound_hits: dict[str, str] = {}
         if (i - train_days - 1) % retrain_frequency == 0:
             current_weights = normalize_weights(
@@ -301,18 +436,39 @@ def run_satellite_walk_forward(
                 candidates,
                 all_symbols=close.columns,
                 top_n=top_n,
-                leverage=leverage,
+                leverage=target_leverage,
                 max_position_weight=max_position_weight,
                 min_score=min_score,
                 basket_guard_return_20d_min=basket_guard_return_20d_min,
                 basket_guard_distance_ma60_min=basket_guard_distance_ma60_min,
                 basket_guard_scale=basket_guard_scale,
             )
-            exposure = float(market_exposure.reindex([date]).iloc[0])
             target = target * exposure
         else:
             target = positions.copy()
-            exposure = float(market_exposure.reindex([date]).iloc[0])
+
+        target_gross_exposure = max(
+            target_leverage * exposure * float(guard_state["scale"]),
+            0.0,
+        )
+        if (
+            regime_schedule is not None
+            and (i - train_days - 1) % rebalance_frequency != 0
+            and previous_target_gross_exposure is not None
+            and not np.isclose(
+                target_gross_exposure,
+                previous_target_gross_exposure,
+                rtol=0.0,
+                atol=1e-12,
+            )
+        ):
+            if previous_target_gross_exposure > 0.0:
+                target = target * (
+                    target_gross_exposure / previous_target_gross_exposure
+                )
+                target = target.clip(lower=0.0, upper=max_position_weight)
+            elif target_gross_exposure <= 0.0:
+                target = target * 0.0
 
         rebound_exit_enabled = should_apply_rebound_exit(
             rebound_exit_return,
@@ -328,6 +484,11 @@ def run_satellite_walk_forward(
             rebound_exit_return=rebound_exit_return if rebound_exit_enabled else None,
             rebound_exit_scale=rebound_exit_scale,
         )
+        post_overlay_target_gross_exposure = float(target.abs().sum())
+        budget_gross_exposure_shortfall = max(
+            target_gross_exposure - post_overlay_target_gross_exposure,
+            0.0,
+        )
         target = apply_open_constraints(
             positions,
             target,
@@ -335,6 +496,15 @@ def run_satellite_walk_forward(
             close.iloc[i],
             max_buy_open_gap=max_buy_open_gap,
             limit_buffer=limit_buffer,
+        )
+        actual_gross_exposure = float(target.abs().sum())
+        execution_gross_exposure_shortfall = max(
+            post_overlay_target_gross_exposure - actual_gross_exposure,
+            0.0,
+        )
+        execution_gross_exposure_overshoot = max(
+            actual_gross_exposure - post_overlay_target_gross_exposure,
+            0.0,
         )
         active_rebound_hits = {
             str(symbol): reason
@@ -363,6 +533,13 @@ def run_satellite_walk_forward(
                         "avg_amount_20d": float(row["avg_amount_20d"]),
                         "basket_guard_scale": float(guard_state["scale"]),
                         "basket_guard_reason": str(guard_state["reason"]),
+                        "target_leverage": target_leverage,
+                        "target_gross_exposure": target_gross_exposure,
+                        "post_overlay_target_gross_exposure": post_overlay_target_gross_exposure,
+                        "budget_gross_exposure_shortfall": budget_gross_exposure_shortfall,
+                        "execution_gross_exposure_shortfall": execution_gross_exposure_shortfall,
+                        "execution_gross_exposure_overshoot": execution_gross_exposure_overshoot,
+                        "risk_regime": str(regime_row["risk_regime"]),
                     }
                 )
 
@@ -379,6 +556,7 @@ def run_satellite_walk_forward(
         entry_price.loc[new_entries] = next_open.loc[new_entries]
         entry_price.loc[exits] = np.nan
         positions = target
+        previous_target_gross_exposure = target_gross_exposure
 
         nav_rows.append(
             {
@@ -387,8 +565,19 @@ def run_satellite_walk_forward(
                 "gross_return": gross_return,
                 "cost": cost,
                 "turnover": turnover,
-                "gross_exposure": float(positions.abs().sum()),
+                "gross_exposure": actual_gross_exposure,
                 "market_exposure": exposure,
+                "target_leverage": target_leverage,
+                "target_gross_exposure": target_gross_exposure,
+                "post_overlay_target_gross_exposure": post_overlay_target_gross_exposure,
+                "budget_gross_exposure_shortfall": budget_gross_exposure_shortfall,
+                "execution_gross_exposure_shortfall": execution_gross_exposure_shortfall,
+                "execution_gross_exposure_overshoot": execution_gross_exposure_overshoot,
+                "risk_regime": str(regime_row["risk_regime"]),
+                "regime_trend_on": bool(regime_row["trend_on"]),
+                "breadth_ma60": float(regime_row["breadth_ma60"]),
+                "benchmark_return_20d": float(regime_row["benchmark_return_20d"]),
+                "benchmark_volatility_20d": float(regime_row["benchmark_volatility_20d"]),
                 "positions_count": int(positions.ne(0).sum()),
                 "candidate_count": int(len(candidates)) if not candidates.empty else 0,
                 "basket_guard_scale": float(guard_state["scale"]),
@@ -414,6 +603,17 @@ def run_satellite_walk_forward(
                 "cost": cost,
                 "positions_count": int(positions.ne(0).sum()),
                 "candidate_count": int(len(candidates)) if not candidates.empty else 0,
+                "target_leverage": target_leverage,
+                "target_gross_exposure": target_gross_exposure,
+                "post_overlay_target_gross_exposure": post_overlay_target_gross_exposure,
+                "budget_gross_exposure_shortfall": budget_gross_exposure_shortfall,
+                "execution_gross_exposure_shortfall": execution_gross_exposure_shortfall,
+                "execution_gross_exposure_overshoot": execution_gross_exposure_overshoot,
+                "risk_regime": str(regime_row["risk_regime"]),
+                "regime_trend_on": bool(regime_row["trend_on"]),
+                "breadth_ma60": float(regime_row["breadth_ma60"]),
+                "benchmark_return_20d": float(regime_row["benchmark_return_20d"]),
+                "benchmark_volatility_20d": float(regime_row["benchmark_volatility_20d"]),
                 "basket_guard_scale": float(guard_state["scale"]),
                 "basket_guard_reason": str(guard_state["reason"]),
                 "basket_avg_return_20d": float(guard_state["avg_return_20d"]),
@@ -453,6 +653,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--market-risk-off-drawdown-20d", type=float, default=-0.08)
     parser.add_argument("--market-below-ma-exposure", type=float, default=0.60)
     parser.add_argument("--market-crash-exposure", type=float, default=0.0)
+    parser.add_argument("--regime-strong-leverage", type=float, default=None)
+    parser.add_argument("--regime-exceptional-leverage", type=float, default=None)
+    parser.add_argument("--regime-strong-breadth-threshold", type=float, default=None)
+    parser.add_argument("--regime-exceptional-breadth-threshold", type=float, default=None)
+    parser.add_argument("--regime-strong-volatility-max", type=float, default=None)
+    parser.add_argument("--regime-exceptional-volatility-max", type=float, default=None)
     parser.add_argument("--breadth-filter", action="store_true")
     parser.add_argument("--breadth-ma-window", type=int, default=60)
     parser.add_argument("--breadth-threshold", type=float, default=0.45)
@@ -478,7 +684,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebound-exit-scale", type=float, default=0.0)
     parser.add_argument("--rebound-exit-market-exposure-max", type=float, default=None)
     parser.add_argument("--rebound-exit-market-exposure-min", type=float, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        enabled = validate_regime_leverage_controls(
+            base_leverage=args.leverage,
+            strong_leverage=args.regime_strong_leverage,
+            exceptional_leverage=args.regime_exceptional_leverage,
+            strong_breadth_threshold=args.regime_strong_breadth_threshold,
+            exceptional_breadth_threshold=args.regime_exceptional_breadth_threshold,
+            strong_volatility_max=args.regime_strong_volatility_max,
+            exceptional_volatility_max=args.regime_exceptional_volatility_max,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if enabled and not args.benchmark:
+        parser.error("--benchmark is required when regime-gated leverage is enabled")
+    return args
 
 
 def main() -> None:
@@ -508,6 +729,25 @@ def main() -> None:
             crash_exposure=args.breadth_crash_exposure,
         )
         market_exposure = pd.concat([market_exposure, breadth_exposure], axis=1).min(axis=1)
+    regime_schedule = None
+    if args.regime_strong_leverage is not None:
+        benchmark = pd.read_csv(args.benchmark, usecols=["date", "close"])
+        benchmark["date"] = pd.to_datetime(benchmark["date"], errors="coerce")
+        benchmark["close"] = pd.to_numeric(benchmark["close"], errors="coerce")
+        benchmark = benchmark.dropna(subset=["date", "close"]).sort_values("date")
+        benchmark_close = benchmark.set_index("date")["close"].reindex(close.index).ffill()
+        regime_schedule = build_regime_leverage_schedule(
+            benchmark_close,
+            close,
+            market_exposure,
+            base_leverage=args.leverage,
+            strong_leverage=args.regime_strong_leverage,
+            exceptional_leverage=args.regime_exceptional_leverage,
+            strong_breadth_threshold=args.regime_strong_breadth_threshold,
+            exceptional_breadth_threshold=args.regime_exceptional_breadth_threshold,
+            strong_volatility_max=args.regime_strong_volatility_max,
+            exceptional_volatility_max=args.regime_exceptional_volatility_max,
+        )
 
     filter_kwargs = {
         "min_close": args.min_close,
@@ -541,6 +781,7 @@ def main() -> None:
         market_exposure=market_exposure,
         initial_capital=args.initial_capital,
         filter_kwargs=filter_kwargs,
+        regime_schedule=regime_schedule,
         basket_guard_return_20d_min=args.basket_guard_return_20d_min if args.basket_risk_guard else None,
         basket_guard_distance_ma60_min=args.basket_guard_distance_ma60_min if args.basket_risk_guard else None,
         basket_guard_scale=args.basket_guard_scale,
@@ -574,11 +815,37 @@ def main() -> None:
         "avg_turnover": float(equity["turnover"].mean()),
         "avg_gross_exposure": float(equity["gross_exposure"].mean()),
         "avg_market_exposure": float(equity["market_exposure"].mean()),
+        "avg_target_leverage": float(equity["target_leverage"].mean()),
+        "avg_target_gross_exposure": float(equity["target_gross_exposure"].mean()),
+        "avg_post_overlay_target_gross_exposure": float(
+            equity["post_overlay_target_gross_exposure"].mean()
+        ),
+        "avg_budget_gross_exposure_shortfall": float(
+            equity["budget_gross_exposure_shortfall"].mean()
+        ),
+        "avg_execution_gross_exposure_shortfall": float(
+            equity["execution_gross_exposure_shortfall"].mean()
+        ),
+        "avg_execution_gross_exposure_overshoot": float(
+            equity["execution_gross_exposure_overshoot"].mean()
+        ),
+        "risk_regime_day_share": {
+            str(key): float(value)
+            for key, value in equity["risk_regime"].value_counts(normalize=True).items()
+        },
         "avg_positions_count": float(equity["positions_count"].mean()),
         "avg_candidate_count": float(equity["candidate_count"].mean()),
         "rebalance_frequency": args.rebalance_frequency,
         "top_n": args.top_n,
         "leverage": args.leverage,
+        "regime_gated_leverage": {
+            "strong_leverage": args.regime_strong_leverage,
+            "exceptional_leverage": args.regime_exceptional_leverage,
+            "strong_breadth_threshold": args.regime_strong_breadth_threshold,
+            "exceptional_breadth_threshold": args.regime_exceptional_breadth_threshold,
+            "strong_volatility_max": args.regime_strong_volatility_max,
+            "exceptional_volatility_max": args.regime_exceptional_volatility_max,
+        },
         "max_position_weight": args.max_position_weight,
         "min_score": args.min_score,
         "filter": filter_kwargs,

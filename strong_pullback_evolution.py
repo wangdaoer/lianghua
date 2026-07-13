@@ -47,6 +47,12 @@ DEFAULT_STRATEGY_PARAMS: dict[str, object] = {
     "market_risk_off_drawdown_20d": -0.08,
     "market_below_ma_exposure": 0.60,
     "market_crash_exposure": 0.0,
+    "regime_strong_leverage": None,
+    "regime_exceptional_leverage": None,
+    "regime_strong_breadth_threshold": None,
+    "regime_exceptional_breadth_threshold": None,
+    "regime_strong_volatility_max": None,
+    "regime_exceptional_volatility_max": None,
     "basket_guard_return_20d_min": None,
     "basket_guard_distance_ma60_min": None,
     "basket_guard_scale": 1.0,
@@ -64,6 +70,9 @@ ALLOWED_OVERRIDE_PARAMS = frozenset({
     "basket_guard_return_20d_min", "basket_guard_distance_ma60_min",
     "basket_guard_scale", "rebound_exit_return", "rebound_exit_scale",
     "rebound_exit_market_exposure_max", "rebound_exit_market_exposure_min",
+    "regime_strong_leverage", "regime_exceptional_leverage",
+    "regime_strong_breadth_threshold", "regime_exceptional_breadth_threshold",
+    "regime_strong_volatility_max", "regime_exceptional_volatility_max",
 })
 
 INTEGER_STRATEGY_PARAMS = frozenset({
@@ -74,6 +83,9 @@ OPTIONAL_NUMERIC_STRATEGY_PARAMS = frozenset({
     "min_score", "basket_guard_return_20d_min",
     "basket_guard_distance_ma60_min", "rebound_exit_return",
     "rebound_exit_market_exposure_max", "rebound_exit_market_exposure_min",
+    "regime_strong_leverage", "regime_exceptional_leverage",
+    "regime_strong_breadth_threshold", "regime_exceptional_breadth_threshold",
+    "regime_strong_volatility_max", "regime_exceptional_volatility_max",
 })
 NUMERIC_STRATEGY_PARAMS = frozenset(DEFAULT_STRATEGY_PARAMS) - (
     INTEGER_STRATEGY_PARAMS | OPTIONAL_NUMERIC_STRATEGY_PARAMS
@@ -307,6 +319,30 @@ def _validate_params(params: Mapping[str, object]) -> None:
             not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
         ):
             raise ValueError(f"{key} must be between 0 and 1")
+    regime_keys = (
+        "regime_strong_leverage",
+        "regime_exceptional_leverage",
+        "regime_strong_breadth_threshold",
+        "regime_exceptional_breadth_threshold",
+        "regime_strong_volatility_max",
+        "regime_exceptional_volatility_max",
+    )
+    regime_values = [params[key] for key in regime_keys]
+    if any(value is not None for value in regime_values):
+        if any(value is None for value in regime_values):
+            raise ValueError("regime parameters must be configured together")
+        strong_leverage = float(params["regime_strong_leverage"])
+        exceptional_leverage = float(params["regime_exceptional_leverage"])
+        strong_breadth = float(params["regime_strong_breadth_threshold"])
+        exceptional_breadth = float(params["regime_exceptional_breadth_threshold"])
+        strong_volatility = float(params["regime_strong_volatility_max"])
+        exceptional_volatility = float(params["regime_exceptional_volatility_max"])
+        if not float(params["leverage"]) <= strong_leverage <= exceptional_leverage <= 1.5:
+            raise ValueError("regime leverage must satisfy base <= strong <= exceptional <= 1.5")
+        if not 0.0 <= strong_breadth <= exceptional_breadth <= 1.0:
+            raise ValueError("regime breadth must satisfy 0 <= strong <= exceptional <= 1")
+        if not 0.0 < exceptional_volatility <= strong_volatility:
+            raise ValueError("regime volatility must satisfy 0 < exceptional <= strong")
     if float(params["min_pullback_5d"]) > float(params["max_pullback_5d"]):
         raise ValueError("min_pullback_5d must be <= max_pullback_5d")
 
