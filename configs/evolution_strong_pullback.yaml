@@ -50,17 +50,36 @@ baseline:
   rebound_exit_market_exposure_min:
 
 search_groups:
-  - id: risk_budget
-    hypothesis_cn: 适度扩大风险敞口能否提高收益且不突破回撤边界
+  - id: regime_risk_budget
+    hypothesis_cn: 仅在强势低波动且市场宽度扩张时提高风险敞口能否稳定增收
     candidates:
-      - id: risk_075
+      - id: regime_075_capped
         overrides:
-          leverage: 0.75
-          max_position_weight: 0.10
-      - id: risk_090
-        overrides:
-          leverage: 0.90
           max_position_weight: 0.12
+          regime_strong_leverage: 0.75
+          regime_exceptional_leverage: 0.75
+          regime_strong_breadth_threshold: 0.55
+          regime_exceptional_breadth_threshold: 0.70
+          regime_strong_volatility_max: 0.28
+          regime_exceptional_volatility_max: 0.20
+      - id: regime_090_balanced
+        overrides:
+          max_position_weight: 0.12
+          regime_strong_leverage: 0.75
+          regime_exceptional_leverage: 0.90
+          regime_strong_breadth_threshold: 0.55
+          regime_exceptional_breadth_threshold: 0.70
+          regime_strong_volatility_max: 0.28
+          regime_exceptional_volatility_max: 0.20
+      - id: regime_090_strict
+        overrides:
+          max_position_weight: 0.12
+          regime_strong_leverage: 0.75
+          regime_exceptional_leverage: 0.90
+          regime_strong_breadth_threshold: 0.60
+          regime_exceptional_breadth_threshold: 0.75
+          regime_strong_volatility_max: 0.24
+          regime_exceptional_volatility_max: 0.18
   - id: entry_depth
     hypothesis_cn: 收紧回调深度能否减少单边下跌标的
     candidates:

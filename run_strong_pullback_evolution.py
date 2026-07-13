@@ -21,7 +21,10 @@ import yaml
 from pandas.errors import EmptyDataError
 
 from run_backtest import load_prices, pivot_prices
-from run_strong_pullback_satellite import run_satellite_walk_forward
+from run_strong_pullback_satellite import (
+    build_regime_leverage_schedule,
+    run_satellite_walk_forward,
+)
 from strategy_evolution_core import (
     _exclusive_file_lock,
     EvolutionState,
@@ -96,6 +99,7 @@ class PriceBundle:
     amount: pd.DataFrame
     market_exposure: pd.Series
     benchmark_effective_date: pd.Timestamp | None = None
+    benchmark_close: pd.Series | None = None
 
 
 @dataclass(frozen=True)
@@ -702,6 +706,8 @@ def _bundle_has_holdout_dates(bundle: PriceBundle, validation_end: pd.Timestamp)
         "amount": bundle.amount,
         "market_exposure": bundle.market_exposure,
     }
+    if bundle.benchmark_close is not None:
+        members["benchmark_close"] = bundle.benchmark_close
     return any(
         not member.index.empty
         and pd.Timestamp(member.index.max()) > validation_end
@@ -867,6 +873,7 @@ def load_price_bundle(
         crash_exposure=float(params["market_crash_exposure"]),
     )
     benchmark_effective_date = None
+    benchmark_close = pd.Series(np.nan, index=close.index, dtype=float)
     if benchmark_path is not None:
         benchmark = pd.read_csv(benchmark_path, usecols=["date", "close"])
         benchmark["date"] = pd.to_datetime(benchmark["date"], errors="coerce")
@@ -877,16 +884,37 @@ def load_price_bundle(
         if benchmark.empty:
             raise ValueError("benchmark has no finite effective close")
         benchmark_effective_date = pd.Timestamp(benchmark["date"].max()).normalize()
+        benchmark_close = benchmark.set_index("date")["close"].reindex(close.index).ffill()
     if close.index.max() > end_date:
         raise AssertionError("Price bundle extends beyond requested end date")
     return PriceBundle(
         close, open_px, high, low, amount, market_exposure,
         benchmark_effective_date=benchmark_effective_date,
+        benchmark_close=benchmark_close,
     )
 
 
 def execute_strategy_trial(bundle: PriceBundle, params: Mapping[str, object]) -> StrategyRun:
     filter_kwargs = {key: float(params[key]) for key in FILTER_KEYS}
+    regime_schedule = None
+    if params["regime_strong_leverage"] is not None:
+        benchmark_close = getattr(bundle, "benchmark_close", None)
+        if benchmark_close is None:
+            raise ValueError(
+                "benchmark close data is required for regime-gated leverage"
+            )
+        regime_schedule = build_regime_leverage_schedule(
+            benchmark_close,
+            bundle.close,
+            bundle.market_exposure,
+            base_leverage=float(params["leverage"]),
+            strong_leverage=params["regime_strong_leverage"],
+            exceptional_leverage=params["regime_exceptional_leverage"],
+            strong_breadth_threshold=params["regime_strong_breadth_threshold"],
+            exceptional_breadth_threshold=params["regime_exceptional_breadth_threshold"],
+            strong_volatility_max=params["regime_strong_volatility_max"],
+            exceptional_volatility_max=params["regime_exceptional_volatility_max"],
+        )
     equity, weights, trades, candidates = run_satellite_walk_forward(
         close=bundle.close,
         open_px=bundle.open_px,
@@ -907,6 +935,7 @@ def execute_strategy_trial(bundle: PriceBundle, params: Mapping[str, object]) ->
         market_exposure=bundle.market_exposure,
         initial_capital=float(params["initial_capital"]),
         filter_kwargs=filter_kwargs,
+        regime_schedule=regime_schedule,
         basket_guard_return_20d_min=params["basket_guard_return_20d_min"],
         basket_guard_distance_ma60_min=params["basket_guard_distance_ma60_min"],
         basket_guard_scale=float(params["basket_guard_scale"]),
@@ -941,6 +970,11 @@ def _slice_price_bundle(bundle: PriceBundle, test_end: pd.Timestamp) -> PriceBun
             if bundle.benchmark_effective_date is not None
             else None
         ),
+        benchmark_close=(
+            series_slice(bundle.benchmark_close)
+            if bundle.benchmark_close is not None
+            else None
+        ),
     )
     members = (
         sliced.close,
@@ -950,6 +984,8 @@ def _slice_price_bundle(bundle: PriceBundle, test_end: pd.Timestamp) -> PriceBun
         sliced.amount,
         sliced.market_exposure,
     )
+    if sliced.benchmark_close is not None:
+        members = (*members, sliced.benchmark_close)
     if any(not member.index.empty and pd.Timestamp(member.index.max()) > end for member in members):
         raise AssertionError("Fold bundle extends beyond test_end")
     return sliced
@@ -1065,6 +1101,24 @@ def run_evolution(
     expected_previous_fingerprint: str | StateWriteExpectation | None = None,
 ) -> EvolutionOutcome:
     run_started = time.perf_counter()
+    regime_keys = (
+        "regime_strong_leverage",
+        "regime_exceptional_leverage",
+        "regime_strong_breadth_threshold",
+        "regime_exceptional_breadth_threshold",
+        "regime_strong_volatility_max",
+        "regime_exceptional_volatility_max",
+    )
+    config_uses_regime = any(
+        config.baseline.get(key) is not None for key in regime_keys
+    ) or any(
+        candidate.overrides.get(key) is not None
+        for group in config.search_groups
+        for candidate in group.candidates
+        for key in regime_keys
+    )
+    if config_uses_regime and benchmark_path is None:
+        raise ValueError("benchmark is required for regime-gated leverage evolution")
     if _state_path_is_config(output_root):
         raise ValueError("output_root must not be under configs")
     data_asof_date = pd.Timestamp(asof_date).normalize().strftime("%Y-%m-%d")
@@ -1083,6 +1137,10 @@ def run_evolution(
     default_state = EvolutionState.initial("baseline", config.baseline)
     reconcile_startup_transition(output_root, resolved_state_path, default_state)
     input_state = load_evolution_state(resolved_state_path, default_state)
+    if benchmark_path is None and any(
+        input_state.champion_parameters.get(key) is not None for key in regime_keys
+    ):
+        raise ValueError("benchmark is required for regime-gated champion replay")
     locked_champion_id = input_state.champion_version
     locked_champion_params = dict(input_state.champion_parameters)
     selected_experiment_id: str | None = None
