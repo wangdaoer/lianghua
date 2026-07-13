@@ -179,6 +179,51 @@ class RegimeShadowTrackingTest(unittest.TestCase):
             self.assertEqual(payload["invalid_observation_count"], 1)
             self.assertEqual(payload["remaining_days"], 20)
 
+    def test_raw_benchmark_fresh_true_with_mismatched_date_is_recorded_invalid(self):
+        self.assertIsNotNone(run_tracking, "update_regime_shadow_tracking.py must define run_tracking")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            comparison_dir = root / "comparison"
+            ledger = root / "regime_shadow_tracking.csv"
+            summary = root / "regime_shadow_tracking_summary.json"
+            report = root / "regime_shadow_tracking_report.md"
+            self._write_comparison_snapshot(
+                comparison_dir,
+                asof_date="2026-07-13",
+                benchmark_last_date="2026-07-10",
+                benchmark_fresh=True,
+                baseline_points=[
+                    {"date": "2026-07-10", "equity": 100.0, "turnover": 0.20, "cost": 0.0010, "gross_exposure": 0.60},
+                    {"date": "2026-07-13", "equity": 101.0, "turnover": 0.21, "cost": 0.0012, "gross_exposure": 0.61, "gross_return": 0.0112},
+                ],
+                dynamic_points=[
+                    {"date": "2026-07-10", "equity": 100.0, "turnover": 0.24, "cost": 0.0011, "gross_exposure": 0.66},
+                    {"date": "2026-07-13", "equity": 100.9, "turnover": 0.25, "cost": 0.0013, "gross_exposure": 0.68, "gross_return": 0.0103},
+                ],
+            )
+
+            run_tracking(
+                argparse.Namespace(
+                    comparison_dir=str(comparison_dir),
+                    ledger=str(ledger),
+                    summary=str(summary),
+                    report=str(report),
+                    target_days=20,
+                )
+            )
+
+            rows = self._read_csv_rows(ledger)
+            payload = json.loads(summary.read_text(encoding="utf-8"))
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["benchmark_last_date"], "2026-07-10")
+            self.assertEqual(rows[0]["benchmark_fresh"], "false")
+            self.assertEqual(rows[0]["observation_valid"], "false")
+            self.assertEqual(payload["valid_observation_count"], 0)
+            self.assertEqual(payload["invalid_observation_count"], 1)
+            self.assertFalse(payload["latest_benchmark_fresh"])
+
     def test_twenty_valid_observations_require_manual_review_only(self):
         self.assertIsNotNone(run_tracking, "update_regime_shadow_tracking.py must define run_tracking")
 

@@ -402,7 +402,8 @@ def run_tracking(args: argparse.Namespace) -> dict[str, object]:
         )
 
     benchmark_last_date = str(comparison.get("benchmark_last_date") or "").strip() or asof_date
-    benchmark_fresh = comparison.get("benchmark_fresh") is True
+    raw_benchmark_fresh = comparison.get("benchmark_fresh") is True
+    benchmark_fresh = raw_benchmark_fresh and benchmark_last_date == asof_date
     latest_dynamic_state = comparison.get("latest_dynamic_state")
     if not isinstance(latest_dynamic_state, dict):
         latest_dynamic_state = {}
