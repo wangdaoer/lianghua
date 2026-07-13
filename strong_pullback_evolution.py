@@ -4,6 +4,7 @@ import json
 import math
 from copy import deepcopy
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path, PureWindowsPath
 from typing import Callable, Mapping
 
@@ -64,6 +65,19 @@ ALLOWED_OVERRIDE_PARAMS = frozenset({
     "basket_guard_scale", "rebound_exit_return", "rebound_exit_scale",
     "rebound_exit_market_exposure_max", "rebound_exit_market_exposure_min",
 })
+
+INTEGER_STRATEGY_PARAMS = frozenset({
+    "train_days", "retrain_frequency", "top_n", "rebalance_frequency",
+    "market_ma_window",
+})
+OPTIONAL_NUMERIC_STRATEGY_PARAMS = frozenset({
+    "min_score", "basket_guard_return_20d_min",
+    "basket_guard_distance_ma60_min", "rebound_exit_return",
+    "rebound_exit_market_exposure_max", "rebound_exit_market_exposure_min",
+})
+NUMERIC_STRATEGY_PARAMS = frozenset(DEFAULT_STRATEGY_PARAMS) - (
+    INTEGER_STRATEGY_PARAMS | OPTIONAL_NUMERIC_STRATEGY_PARAMS
+)
 
 SELECTION_KEYS = frozenset({
     "min_validation_days",
@@ -220,6 +234,25 @@ def _validate_params(params: Mapping[str, object]) -> None:
     unknown = set(params) - set(DEFAULT_STRATEGY_PARAMS)
     if unknown:
         raise ValueError(f"Unknown strategy parameters: {sorted(unknown)}")
+    for key in INTEGER_STRATEGY_PARAMS:
+        if type(params[key]) is not int:
+            raise ValueError(f"{key} must be an integer")
+    for key in NUMERIC_STRATEGY_PARAMS:
+        value = params[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"{key} must be a finite real number")
+    for key in OPTIONAL_NUMERIC_STRATEGY_PARAMS:
+        value = params[key]
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"{key} must be null or a finite real number")
     for key in ("train_days", "retrain_frequency", "top_n", "rebalance_frequency"):
         if int(params[key]) <= 0:
             raise ValueError(f"{key} must be positive")

@@ -626,6 +626,82 @@ class EvolutionConfigTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, key):
                         parse_evolution_config(raw)
 
+    def test_baseline_and_overrides_require_exact_parameter_runtime_types(self):
+        integer_controls = {
+            "train_days", "retrain_frequency", "top_n",
+            "rebalance_frequency", "market_ma_window",
+        }
+        numeric_controls = {
+            "max_position_weight", "leverage", "commission_bps", "impact_bps",
+            "max_buy_open_gap", "limit_buffer", "initial_capital",
+            "max_abs_daily_return", "min_close", "min_avg_amount_20d",
+            "min_pullback_5d", "max_pullback_5d", "min_prior_return_20",
+            "min_prior_return_60", "min_return_20d", "min_return_60d",
+            "min_distance_ma60", "max_intraday_return",
+            "market_risk_off_drawdown_20d", "market_below_ma_exposure",
+            "market_crash_exposure", "basket_guard_scale", "rebound_exit_scale",
+        }
+        optional_numeric_controls = {
+            "min_score", "basket_guard_return_20d_min",
+            "basket_guard_distance_ma60_min", "rebound_exit_return",
+            "rebound_exit_market_exposure_max",
+            "rebound_exit_market_exposure_min",
+        }
+        all_controls = integer_controls | numeric_controls | optional_numeric_controls
+        self.assertEqual(all_controls, set(DEFAULT_STRATEGY_PARAMS))
+        self.assertTrue(evolution_adapter.ALLOWED_OVERRIDE_PARAMS <= all_controls)
+
+        invalid_by_category = (
+            (integer_controls, (True, 1.5, "5", float("nan"), float("inf"))),
+            (
+                numeric_controls,
+                (True, "0.5", float("nan"), float("inf"), float("-inf")),
+            ),
+            (
+                optional_numeric_controls,
+                (True, "0.5", float("nan"), float("inf"), float("-inf")),
+            ),
+        )
+        for source in ("baseline", "override"):
+            for controls, invalid_values in invalid_by_category:
+                tested_controls = (
+                    controls
+                    if source == "baseline"
+                    else controls & evolution_adapter.ALLOWED_OVERRIDE_PARAMS
+                )
+                for key in sorted(tested_controls):
+                    for value in invalid_values:
+                        with self.subTest(source=source, key=key, value=value):
+                            raw = valid_raw_config()
+                            if source == "baseline":
+                                raw["baseline"][key] = value
+                            else:
+                                raw["search_groups"][0]["candidates"][0][
+                                    "overrides"
+                                ] = {key: value}
+                            with self.assertRaisesRegex(ValueError, key):
+                                parse_evolution_config(raw)
+
+        for source in ("baseline", "override"):
+            tested_controls = (
+                optional_numeric_controls
+                if source == "baseline"
+                else optional_numeric_controls & evolution_adapter.ALLOWED_OVERRIDE_PARAMS
+            )
+            for key in sorted(tested_controls):
+                for value in (None, 0.25):
+                    with self.subTest(
+                        source=source, key=key, accepted_value=value
+                    ):
+                        raw = valid_raw_config()
+                        if source == "baseline":
+                            raw["baseline"][key] = value
+                        else:
+                            raw["search_groups"][0]["candidates"][0][
+                                "overrides"
+                            ] = {key: value}
+                        parse_evolution_config(raw)
+
 
 class EvolutionAdapterTest(unittest.TestCase):
     def test_effective_loaded_freshness_rejects_non_finite_latest_values(self):
@@ -1240,6 +1316,52 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             **kwargs,
         )
 
+    def _prepare_committed_success_recovery(self, root, run_id):
+        config = self._eligible_config()
+        output_root = root / "runs"
+        state_path = root / "evolution_state" / "strong_pullback.json"
+        initial = EvolutionState.initial(
+            "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+        )
+        target = promote_to_shadow(
+            initial,
+            challenger_version="prior-shadow",
+            challenger_parameters={**config.baseline, "leverage": 0.75},
+            experiment_id="prior-exp",
+            run_id=run_id,
+            data_fingerprint="prior-data",
+            data_asof_date="2026-07-08",
+            now="2026-07-08T01:00:00+00:00",
+        )
+        evolution_runner.commit_evolution_state_transition(
+            state_path,
+            target,
+            operation="promote",
+            run_id=run_id,
+            experiment_id="prior-exp",
+            expected_previous_fingerprint=evolution_runner.StateWriteExpectation.ABSENT,
+            now="2026-07-08T01:00:00+00:00",
+        )
+        run_dir = output_root / run_id
+        run_dir.mkdir(parents=True)
+        manifest = {
+            "run_id": run_id,
+            "status": "success",
+            "champion_id": "prior-shadow",
+            "selected_experiment_id": "prior-exp",
+            "test_status": "ready_for_manual_review",
+            "promotion_persistence_status": "committed",
+            "global_state_changed": True,
+            "completed_at_utc": "2026-07-08T01:00:00+00:00",
+        }
+        (run_dir / "manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        (run_dir / "shadow_decision.md").write_text(
+            "# committed\n", encoding="utf-8"
+        )
+        return output_root, state_path, initial, run_dir, manifest
+
     def test_core_rejection_keeps_final_holdout_untouched_after_selection_lock(self):
         raw = valid_raw_config()
         raw["evolution_core"].update({
@@ -1598,7 +1720,7 @@ class EvolutionOrchestrationTest(unittest.TestCase):
         raw["selection"].update({
             "min_annualized_return_delta": 0.0,
             "min_sharpe_delta": -10.0,
-            "max_turnover_ratio": 1.50,
+            "max_turnover_ratio": 2.0,
         })
         raw["search_groups"] = [
             {
@@ -1655,6 +1777,106 @@ class EvolutionOrchestrationTest(unittest.TestCase):
         self.assertEqual(outcome.champion_id, "step_two_candidate")
         self.assertEqual(snapshot["shadow_status"], "none")
         self.assertIn("turnover_ratio", manifest["failed_gates"])
+
+    def test_final_accumulated_legacy_rejection_is_persisted_before_holdout(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 1.50,
+        })
+        raw["search_groups"] = [
+            {
+                "id": "legacy_step_one",
+                "hypothesis_cn": "first legal turnover step",
+                "candidates": [{
+                    "id": "legacy_step_one_candidate",
+                    "overrides": {"leverage": 0.75},
+                }],
+            },
+            {
+                "id": "legacy_step_two",
+                "hypothesis_cn": "second legal but cumulatively excessive step",
+                "candidates": [{
+                    "id": "legacy_step_two_candidate",
+                    "overrides": {"top_n": 7},
+                }],
+            },
+        ]
+        config = parse_evolution_config(raw)
+        requested_ends: list[pd.Timestamp] = []
+
+        def loader(data_path, end_date, benchmark_path, params):
+            requested_ends.append(pd.Timestamp(end_date))
+            return self._flat_bundle(pd.Timestamp(end_date))
+
+        def executor(bundle, params):
+            if int(params["top_n"]) == 7:
+                daily, turnover = 0.0004, 0.19
+            elif float(params["leverage"]) == 0.75:
+                daily, turnover = 0.0003, 0.14
+            else:
+                daily, turnover = 0.0002, 0.10
+            return self._controlled_run(
+                bundle, daily_return=daily, turnover=turnover
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                root / "runs", "final-legacy-direct-gate", False,
+                loader, executor, "test-commit",
+            )
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            scores = pd.read_csv(outcome.run_dir / "candidate_scores.csv")
+            selected_score = scores.loc[
+                scores["experiment_id"] == manifest["selected_experiment_id"]
+            ].iloc[0]
+            experiment = json.loads(
+                (
+                    outcome.run_dir / "experiments"
+                    / f"{manifest['selected_experiment_id']}.json"
+                ).read_text(encoding="utf-8")
+            )
+            decision = (outcome.run_dir / "shadow_decision.md").read_text(
+                encoding="utf-8"
+            )
+            final_artifact_exists = (outcome.run_dir / "final").exists()
+
+        expected_reason = "换手率放大超过限制"
+        self.assertEqual(outcome.champion_id, "legacy_step_two_candidate")
+        self.assertEqual(outcome.test_status, "not_opened_final_legacy_rejected")
+        self.assertEqual(requested_ends, [config.periods.validation_end])
+        self.assertFalse(final_artifact_exists)
+        self.assertEqual(selected_score["status"], "final_legacy_rejected")
+        self.assertEqual(selected_score["final_legacy_status"], "rejected")
+        self.assertIn(
+            expected_reason, json.loads(selected_score["final_legacy_reasons"])
+        )
+        self.assertEqual(experiment["status"], "final_legacy_rejected")
+        self.assertEqual(experiment["final_legacy_status"], "rejected")
+        self.assertIn(expected_reason, experiment["final_legacy_reasons"])
+        self.assertEqual(manifest["final_legacy_status"], "rejected")
+        self.assertIn(expected_reason, manifest["final_legacy_reasons"])
+        self.assertIn(f"legacy:{expected_reason}", manifest["failed_gates"])
+        self.assertIn("Final locked-candidate legacy status: `rejected`", decision)
+        self.assertIn(expected_reason, decision)
 
     def test_existing_shadow_is_reevaluated_and_used_as_candidate_parent(self):
         raw = valid_raw_config()
@@ -2605,6 +2827,88 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 [record["run_id"] for record in registry_records],
                 ["committed-crash"],
             )
+
+    def test_startup_committed_success_manifest_repairs_missing_metadata_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (
+                output_root,
+                state_path,
+                initial,
+                run_dir,
+                manifest,
+            ) = self._prepare_committed_success_recovery(root, "metadata-crash")
+            state_bytes = state_path.read_bytes()
+            manifest_bytes = (run_dir / "manifest.json").read_bytes()
+            decision_bytes = (run_dir / "shadow_decision.md").read_bytes()
+
+            evolution_runner.reconcile_startup_transition(
+                output_root, state_path, initial
+            )
+
+            latest = json.loads(
+                (output_root / "latest.json").read_text(encoding="utf-8")
+            )
+            registry = [
+                json.loads(line)
+                for line in (output_root / "evolution_registry.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+            state_after = state_path.read_bytes()
+            manifest_after = (run_dir / "manifest.json").read_bytes()
+            decision_after = (run_dir / "shadow_decision.md").read_bytes()
+
+        self.assertEqual(state_after, state_bytes)
+        self.assertEqual(manifest_after, manifest_bytes)
+        self.assertEqual(decision_after, decision_bytes)
+        self.assertEqual(latest, manifest)
+        self.assertEqual(registry, [manifest])
+
+    def test_startup_committed_success_metadata_repair_is_repeatable_and_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (
+                output_root,
+                state_path,
+                initial,
+                run_dir,
+                manifest,
+            ) = self._prepare_committed_success_recovery(root, "partial-metadata")
+            output_root.mkdir(parents=True, exist_ok=True)
+            (output_root / "evolution_registry.jsonl").write_text(
+                json.dumps(manifest) + "\n", encoding="utf-8"
+            )
+            state_bytes = state_path.read_bytes()
+            manifest_bytes = (run_dir / "manifest.json").read_bytes()
+
+            evolution_runner.reconcile_startup_transition(
+                output_root, state_path, initial
+            )
+            first_latest = (output_root / "latest.json").read_bytes()
+            first_registry = (output_root / "evolution_registry.jsonl").read_bytes()
+            evolution_runner.reconcile_startup_transition(
+                output_root, state_path, initial
+            )
+
+            registry = [
+                json.loads(line)
+                for line in (output_root / "evolution_registry.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+            state_after = state_path.read_bytes()
+            manifest_after = (run_dir / "manifest.json").read_bytes()
+            latest_after = (output_root / "latest.json").read_bytes()
+            registry_after = (output_root / "evolution_registry.jsonl").read_bytes()
+
+        self.assertEqual(state_after, state_bytes)
+        self.assertEqual(manifest_after, manifest_bytes)
+        self.assertEqual(latest_after, first_latest)
+        self.assertEqual(registry_after, first_registry)
+        self.assertEqual([record["run_id"] for record in registry], ["partial-metadata"])
 
     def test_startup_recovery_rejects_unsafe_journal_run_ids_before_any_probe(self):
         bad_run_ids = (

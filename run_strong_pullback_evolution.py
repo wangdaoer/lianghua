@@ -495,6 +495,13 @@ def reconcile_startup_transition(
         manifest.get("status") not in {"running", "pending"}
         and manifest.get("promotion_persistence_status") != "pending"
     ):
+        if (
+            reconciled.status == "committed"
+            and manifest.get("status") == "success"
+            and manifest.get("promotion_persistence_status") == "committed"
+            and manifest.get("global_state_changed") is True
+        ):
+            publish_run_metadata(resolved_root, manifest)
         return
     recovered_at = datetime.now(timezone.utc).isoformat()
     committed = reconciled.status == "committed"
@@ -512,6 +519,15 @@ def reconcile_startup_transition(
         manifest.setdefault(
             "error", reconciled.reason or "state transition was not committed"
         )
+    recovered_legacy_status = manifest.get("final_legacy_status")
+    if not isinstance(recovered_legacy_status, str):
+        recovered_legacy_status = None
+    recovered_legacy_reasons_raw = manifest.get("final_legacy_reasons")
+    recovered_legacy_reasons = (
+        tuple(str(reason) for reason in recovered_legacy_reasons_raw)
+        if isinstance(recovered_legacy_reasons_raw, list)
+        else ()
+    )
     _atomic_write_text(
         manifest_path.parent / "shadow_decision.md",
         _promotion_decision_markdown(
@@ -522,6 +538,8 @@ def reconcile_startup_transition(
             else None,
             reconciled.status,
             reconciled.reason or "state transition reconciled at startup",
+            recovered_legacy_status,
+            recovered_legacy_reasons,
         ),
     )
     _atomic_write_json(manifest_path, manifest)
@@ -535,8 +553,10 @@ def _promotion_decision_markdown(
     selected_experiment_id: str | None,
     persistence_status: str,
     reason: str,
+    final_legacy_status: str | None = None,
+    final_legacy_reasons: tuple[str, ...] = (),
 ) -> str:
-    return "\n".join([
+    lines = [
         "# 影子决定",
         "",
         f"- 运行：`{run_id}`",
@@ -544,11 +564,20 @@ def _promotion_decision_markdown(
         f"- 实验：`{selected_experiment_id or 'none'}`",
         f"- 持久化状态：`{persistence_status}`",
         f"- 全局状态已改变：`{'true' if persistence_status == 'committed' else 'false'}`",
+    ]
+    if final_legacy_status is not None:
+        lines.extend([
+            f"- Final locked-candidate legacy status: `{final_legacy_status}`",
+            "- Final locked-candidate legacy reasons: "
+            + ("; ".join(final_legacy_reasons) if final_legacy_reasons else "none"),
+        ])
+    lines.extend([
         f"- 原因：{reason}",
         "",
         "正式 YAML 未修改，也未产生任何券商订单。",
         "",
     ])
+    return "\n".join(lines)
 
 
 def _state_records_promotion(
@@ -1058,6 +1087,8 @@ def run_evolution(
     locked_champion_params = dict(input_state.champion_parameters)
     selected_experiment_id: str | None = None
     champion_id = "unselected"
+    final_legacy_status: str | None = None
+    final_legacy_reasons: tuple[str, ...] = ()
     previous_fingerprint = expected_previous_fingerprint
     if previous_fingerprint is None:
         previous_fingerprint = (
@@ -1206,6 +1237,8 @@ def run_evolution(
                 "promotion_persistence_status": persistence_status,
                 "selected_experiment_id": selected_experiment_id,
                 "failed_gates": failed_gates,
+                "final_legacy_status": final_legacy_status,
+                "final_legacy_reasons": list(final_legacy_reasons),
                 "shadow_reevaluation_reason": shadow_reevaluation_reason,
                 "data_asof_date": snapshot.data_asof_date or data_asof_date,
             })
@@ -1221,6 +1254,8 @@ def run_evolution(
                     selected_experiment_id,
                     persistence_status,
                     persistence_reason,
+                    final_legacy_status,
+                    final_legacy_reasons,
                 ),
                 dry_run=dry_run or not persist_rollback,
                 promote_shadow=promote_shadow,
@@ -1242,6 +1277,8 @@ def run_evolution(
                     selected_experiment_id,
                     persistence_status,
                     persistence_reason,
+                    final_legacy_status,
+                    final_legacy_reasons,
                 ),
             )
             pd.DataFrame(trial_rows).to_csv(
@@ -1747,6 +1784,87 @@ def run_evolution(
                 core_test_status="not_opened",
             )
 
+        selected_legacy_decision = evaluate_promotion(
+            trial_metrics[incumbent_trial_id]["validation"],
+            trial_metrics["baseline"]["validation"],
+            config.selection,
+        )
+        final_legacy_status = (
+            "eligible" if selected_legacy_decision.eligible else "rejected"
+        )
+        final_legacy_reasons = tuple(selected_legacy_decision.reasons)
+        final_legacy_failed_gates = [
+            f"legacy:{reason}" for reason in final_legacy_reasons
+        ]
+        manifest.update({
+            "champion_id": champion_id,
+            "selected_experiment_id": selected_experiment_id,
+            "final_legacy_status": final_legacy_status,
+            "final_legacy_reasons": list(final_legacy_reasons),
+        })
+        if final_legacy_failed_gates:
+            manifest["failed_gates"] = final_legacy_failed_gates
+        _atomic_write_json(manifest_path, manifest)
+        for score in candidate_scores:
+            if score.get("experiment_id") == selected_experiment_id:
+                score.update({
+                    "final_legacy_status": final_legacy_status,
+                    "final_legacy_reasons": json.dumps(
+                        final_legacy_reasons, ensure_ascii=False
+                    ),
+                })
+                if not selected_legacy_decision.eligible:
+                    score.update({
+                        "status": "final_legacy_rejected",
+                        "failed_gates": json.dumps(
+                            final_legacy_failed_gates, ensure_ascii=False
+                        ),
+                    })
+        for experiment in experiments:
+            if experiment.get("experiment_id") == selected_experiment_id:
+                experiment.update({
+                    "final_legacy_status": final_legacy_status,
+                    "final_legacy_reasons": final_legacy_reasons,
+                })
+                if not selected_legacy_decision.eligible:
+                    experiment.update({
+                        "status": "final_legacy_rejected",
+                        "failed_gates": tuple(final_legacy_failed_gates),
+                    })
+        persist_evolution_outcome(
+            run_dir=run_dir,
+            snapshot=base_snapshot,
+            candidate_scores=candidate_scores,
+            experiments=experiments,
+            decision_markdown=_promotion_decision_markdown(
+                run_id,
+                champion_id,
+                selected_experiment_id,
+                "not_changed",
+                "Final locked-candidate legacy selection evaluated.",
+                final_legacy_status,
+                final_legacy_reasons,
+            ),
+            dry_run=True,
+            promote_shadow=False,
+            state_path=resolved_state_path,
+            expected_previous_fingerprint=None,
+        )
+        if not selected_legacy_decision.eligible:
+            rejection_reason = (
+                "Final locked candidate failed legacy selection gates: "
+                + ",".join(final_legacy_reasons)
+            )
+            return finish_without_holdout(
+                final_champion_id=champion_id,
+                final_champion_params=champion_params,
+                snapshot=base_snapshot,
+                test_status="not_opened_final_legacy_rejected",
+                test_reason=rejection_reason,
+                failed_gates=final_legacy_failed_gates,
+                core_test_status="not_opened",
+            )
+
         core_bundle = bundle_loader(
             data_path,
             config.periods.core_test_end,
@@ -1830,9 +1948,14 @@ def run_evolution(
             snapshot=base_snapshot,
             candidate_scores=candidate_scores,
             experiments=experiments,
-            decision_markdown=(
-                "# Shadow decision\n\nCore tests completed; final holdout remains gated.\n"
-                "Formal YAML was not modified and no broker orders were created.\n"
+            decision_markdown=_promotion_decision_markdown(
+                run_id,
+                champion_id,
+                selected_experiment_id,
+                "not_changed",
+                "Core tests completed; final holdout remains gated.",
+                final_legacy_status,
+                final_legacy_reasons,
             ),
             dry_run=True,
             promote_shadow=False,
@@ -1956,19 +2079,10 @@ def run_evolution(
                 comparison_metrics=final_metrics,
             )
 
-        selected_legacy_decision = (
-            evaluate_promotion(
-                trial_metrics[incumbent_trial_id]["validation"],
-                trial_metrics["baseline"]["validation"],
-                config.selection,
-            )
-            if champion_id != locked_champion_id else None
-        )
         snapshot = base_snapshot
         shadow_eligible = (
             bool(selected_experiment_id)
             and selected_core_decision.status == "eligible_for_shadow"
-            and selected_legacy_decision is not None
             and selected_legacy_decision.eligible
             and test_status == "ready_for_manual_review"
         )
@@ -2002,6 +2116,8 @@ def run_evolution(
             "promotion_persistence_status": persistence_status,
             "selected_experiment_id": selected_experiment_id,
             "failed_gates": list(selected_core_decision.failed_gates),
+            "final_legacy_status": final_legacy_status,
+            "final_legacy_reasons": list(final_legacy_reasons),
             "shadow_reevaluation_reason": shadow_reevaluation_reason,
             "data_asof_date": effective_data_asof,
         })
@@ -2012,6 +2128,8 @@ def run_evolution(
             selected_experiment_id,
             persistence_status,
             persistence_reason,
+            final_legacy_status,
+            final_legacy_reasons,
         )
         global_state_changed = persist_evolution_outcome(
             run_dir=run_dir,
@@ -2039,6 +2157,8 @@ def run_evolution(
                 selected_experiment_id,
                 persistence_status,
                 persistence_reason,
+                final_legacy_status,
+                final_legacy_reasons,
             ),
         )
         _atomic_write_json(manifest_path, manifest)
@@ -2106,6 +2226,8 @@ def run_evolution(
                 selected_experiment_id,
                 persistence_status,
                 persistence_reason,
+                final_legacy_status,
+                final_legacy_reasons,
             ),
         )
         _atomic_write_json(manifest_path, manifest)
