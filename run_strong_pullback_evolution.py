@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Callable, Mapping
@@ -38,10 +38,11 @@ from strategy_evolution_core import (
     rollback_shadow,
 )
 from strong_pullback_evolution import (
+    CoreTestSegment,
     EvolutionConfig,
     TradingFold,
     assess_test_result,
-    build_trading_folds,
+    build_core_test_segments,
     build_group_candidates,
     calculate_fold_metrics,
     calculate_segment_metrics,
@@ -72,6 +73,16 @@ TRIAL_ARTIFACTS = {
     "trade_audit.csv": ("signal_date",),
     "selected_candidates.csv": ("signal_date",),
 }
+STRATEGY_CODE_DEPENDENCIES = (
+    "strategy_evolution_core.py",
+    "strong_pullback_evolution.py",
+    "run_strong_pullback_evolution.py",
+    "run_strong_pullback_satellite.py",
+    "train_next_open_rank_model.py",
+    "run_backtest.py",
+    "execution_rules.py",
+    "generate_strong_pullback_candidates.py",
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,7 @@ class PriceBundle:
     low: pd.DataFrame
     amount: pd.DataFrame
     market_exposure: pd.Series
+    benchmark_effective_date: pd.Timestamp | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +164,14 @@ def _file_content_hash(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def build_code_fingerprint(project_root: Path | None = None) -> str:
+    root = Path(project_root) if project_root is not None else Path(__file__).resolve().parent
+    return stable_hash({
+        filename: _file_content_hash(root / filename)
+        for filename in STRATEGY_CODE_DEPENDENCIES
+    })
 
 
 def _group_seed(random_seed: int, group_id: str) -> int:
@@ -240,16 +260,7 @@ def build_run_evidence(
             "selection": asdict(config.selection),
         }),
         git_commit=git_commit,
-        code_fingerprint=stable_hash({
-            filename: _file_content_hash(Path(__file__).resolve().parent / filename)
-            for filename in (
-                "strategy_evolution_core.py",
-                "strong_pullback_evolution.py",
-                "run_strong_pullback_evolution.py",
-                "run_strong_pullback_satellite.py",
-                "execution_rules.py",
-            )
-        }),
+        code_fingerprint=build_code_fingerprint(),
     )
 
 
@@ -326,6 +337,31 @@ def _resolve_run_dir(output_root: Path, run_id: str) -> tuple[Path, Path]:
     if _state_path_is_config(resolved_run_dir):
         raise ValueError("run_dir must remain outside configs")
     return resolved_root, resolved_run_dir
+
+
+def _resolve_trial_dir(run_dir: Path, trial_id: str) -> Path:
+    if (
+        not isinstance(trial_id, str)
+        or not trial_id.strip()
+        or trial_id in {".", ".."}
+        or "/" in trial_id
+        or "\\" in trial_id
+        or Path(trial_id).is_absolute()
+        or PureWindowsPath(trial_id).is_absolute()
+        or any(ord(character) < 32 or ord(character) == 127 for character in trial_id)
+        or any(character in '<>:"|?*' for character in trial_id)
+        or trial_id.endswith(".")
+    ):
+        raise ValueError("trial_id must be a safe single relative path component")
+    trials_root = (Path(run_dir).resolve() / "trials").resolve()
+    trial_dir = (trials_root / trial_id).resolve()
+    try:
+        relative = trial_dir.relative_to(trials_root)
+    except ValueError as exc:
+        raise ValueError("trial_id resolves outside trials") from exc
+    if len(relative.parts) != 1 or relative.parts[0] in {"", ".", ".."}:
+        raise ValueError("trial_id must resolve to one direct child of trials")
+    return trial_dir
 
 
 def _json_safe(value: object) -> object:
@@ -426,9 +462,13 @@ def reconcile_startup_transition(
     default_state: EvolutionState,
 ) -> None:
     before = load_evolution_transition_journal(state_path)
-    if before is None or before.status != "pending":
+    if before is None:
         return
-    reconciled = reconcile_evolution_transition(state_path, default_state)
+    reconciled = (
+        reconcile_evolution_transition(state_path, default_state)
+        if before.status == "pending"
+        else before
+    )
     if reconciled is None:
         return
     run_id = reconciled.run_id
@@ -447,13 +487,42 @@ def reconcile_startup_transition(
         raise ValueError("Could not reconcile interrupted run manifest") from exc
     if not isinstance(manifest, dict) or manifest.get("run_id") != run_id:
         raise ValueError("Interrupted run manifest does not match transition journal")
+    if (
+        manifest.get("status") not in {"running", "pending"}
+        and manifest.get("promotion_persistence_status") != "pending"
+    ):
+        return
+    recovered_at = datetime.now(timezone.utc).isoformat()
+    committed = reconciled.status == "committed"
     manifest.update({
+        "status": "success" if committed else "failed",
         "promotion_persistence_status": reconciled.status,
-        "global_state_changed": reconciled.status == "committed",
-        "state_transition_recovered_at_utc": datetime.now(timezone.utc).isoformat(),
+        "global_state_changed": committed,
+        "state_transition_recovered_at_utc": recovered_at,
         "state_transition_recovery_reason": reconciled.reason,
     })
+    if committed:
+        manifest.setdefault("completed_at_utc", recovered_at)
+    else:
+        manifest.setdefault("failed_at_utc", recovered_at)
+        manifest.setdefault(
+            "error", reconciled.reason or "state transition was not committed"
+        )
+    _atomic_write_text(
+        manifest_path.parent / "shadow_decision.md",
+        _promotion_decision_markdown(
+            run_id,
+            str(manifest.get("champion_id") or "unknown"),
+            manifest.get("selected_experiment_id")
+            if isinstance(manifest.get("selected_experiment_id"), str)
+            else None,
+            reconciled.status,
+            reconciled.reason or "state transition reconciled at startup",
+        ),
+    )
     _atomic_write_json(manifest_path, manifest)
+    if committed:
+        publish_run_metadata(output_root, manifest)
 
 
 def _promotion_decision_markdown(
@@ -663,6 +732,66 @@ def validate_state_mutation_freshness(
     return panel_max.strftime("%Y-%m-%d")
 
 
+def validate_loaded_bundle_freshness(
+    bundle: PriceBundle,
+    asof_date: pd.Timestamp,
+) -> str:
+    selected_asof = pd.Timestamp(asof_date).normalize()
+    effective_dates: dict[str, pd.Timestamp] = {}
+    common_valid: pd.DataFrame | None = None
+    common_index: pd.DatetimeIndex | None = None
+    common_columns: pd.Index | None = None
+    for name in ("close", "open_px", "high", "low", "amount"):
+        frame = getattr(bundle, name)
+        if frame.empty:
+            raise ValueError(f"effective loaded {name} data is empty")
+        valid_rows = frame.notna().any(axis=1)
+        valid_index = pd.DatetimeIndex(frame.index[valid_rows]).normalize()
+        if valid_index.empty:
+            raise ValueError(f"effective loaded {name} data is empty")
+        effective_dates[name] = pd.Timestamp(valid_index.max()).normalize()
+        if common_valid is None:
+            common_index = pd.DatetimeIndex(frame.index)
+            common_columns = frame.columns
+            common_valid = frame.notna()
+        else:
+            assert common_index is not None and common_columns is not None
+            common_valid &= frame.reindex(
+                index=common_index, columns=common_columns
+            ).notna()
+
+    assert common_valid is not None and common_index is not None
+    common_dates = common_index[common_valid.any(axis=1)]
+    if common_dates.empty:
+        raise ValueError("common effective loaded price observation is empty")
+    common_effective_date = pd.Timestamp(common_dates.max()).normalize()
+    if common_effective_date < selected_asof:
+        raise ValueError(
+            "common effective loaded price observation must reach asof_date"
+        )
+    effective_dates["common_price"] = common_effective_date
+
+    exposure = bundle.market_exposure.dropna()
+    if exposure.empty:
+        raise ValueError("effective loaded benchmark series is empty")
+    effective_dates["benchmark"] = (
+        pd.Timestamp(bundle.benchmark_effective_date).normalize()
+        if bundle.benchmark_effective_date is not None
+        else pd.Timestamp(exposure.index.max()).normalize()
+    )
+    stale = {
+        name: value.strftime("%Y-%m-%d")
+        for name, value in effective_dates.items()
+        if value < selected_asof
+    }
+    if stale:
+        raise ValueError(
+            "effective loaded data must reach asof_date; stale members: "
+            + json.dumps(stale, sort_keys=True)
+        )
+    return min(effective_dates.values()).strftime("%Y-%m-%d")
+
+
 def load_price_bundle(
     data_path: Path,
     end_date: pd.Timestamp,
@@ -685,9 +814,21 @@ def load_price_bundle(
         below_ma_exposure=float(params["market_below_ma_exposure"]),
         crash_exposure=float(params["market_crash_exposure"]),
     )
+    benchmark_effective_date = None
+    if benchmark_path is not None:
+        benchmark = pd.read_csv(benchmark_path, usecols=["date", "close"])
+        benchmark["date"] = pd.to_datetime(benchmark["date"], errors="coerce")
+        benchmark["close"] = pd.to_numeric(benchmark["close"], errors="coerce")
+        benchmark = benchmark.dropna(subset=["date", "close"])
+        benchmark = benchmark.loc[benchmark["date"] <= end_date]
+        if not benchmark.empty:
+            benchmark_effective_date = pd.Timestamp(benchmark["date"].max()).normalize()
     if close.index.max() > end_date:
         raise AssertionError("Price bundle extends beyond requested end date")
-    return PriceBundle(close, open_px, high, low, amount, market_exposure)
+    return PriceBundle(
+        close, open_px, high, low, amount, market_exposure,
+        benchmark_effective_date=benchmark_effective_date,
+    )
 
 
 def execute_strategy_trial(bundle: PriceBundle, params: Mapping[str, object]) -> StrategyRun:
@@ -741,6 +882,11 @@ def _slice_price_bundle(bundle: PriceBundle, test_end: pd.Timestamp) -> PriceBun
         low=frame_slice(bundle.low),
         amount=frame_slice(bundle.amount),
         market_exposure=series_slice(bundle.market_exposure),
+        benchmark_effective_date=(
+            min(pd.Timestamp(bundle.benchmark_effective_date), end)
+            if bundle.benchmark_effective_date is not None
+            else None
+        ),
     )
     members = (
         sliced.close,
@@ -757,7 +903,7 @@ def _slice_price_bundle(bundle: PriceBundle, test_end: pd.Timestamp) -> PriceBun
 
 def evaluate_strategy_folds(
     bundle: PriceBundle,
-    folds: tuple[TradingFold, ...],
+    folds: tuple[TradingFold | CoreTestSegment, ...],
     trial_executor: Callable[[PriceBundle, Mapping[str, object]], StrategyRun],
     params: Mapping[str, object],
 ) -> tuple[FoldMetrics, ...]:
@@ -952,53 +1098,138 @@ def run_evolution(
             yaml.safe_dump(resolved_config_dict(config), allow_unicode=True, sort_keys=False),
             encoding="utf-8",
         )
-        research_bundle = bundle_loader(
+        selection_bundle = bundle_loader(
             data_path, config.periods.validation_end, benchmark_path, locked_champion_params
         )
-        if _bundle_has_holdout_dates(research_bundle, config.periods.validation_end):
-            raise AssertionError("Research bundle contains holdout dates")
+        if _bundle_has_holdout_dates(selection_bundle, config.periods.validation_end):
+            raise AssertionError("Selection bundle contains post-selection dates")
 
         core = config.evolution_core
-        folds = build_trading_folds(
-            research_bundle.close.index,
-            train_days=core.train_days,
-            validation_days=core.validation_days,
-            test_days=core.test_days,
-            step_days=core.step_days,
-        )
-        fold_rows = [
-            {
-                "fold_id": fold.fold_id,
-                "train_start": fold.train_dates[0],
-                "train_end": fold.train_dates[-1],
-                "validation_start": fold.validation_dates[0],
-                "validation_end": fold.validation_dates[-1],
-                "test_start": fold.test_dates[0],
-                "test_end": fold.test_dates[-1],
-                "fingerprint": fingerprint_payload(fold),
-            }
-            for fold in folds
-        ]
-        (run_dir / "folds.json").write_text(
-            json.dumps(fold_rows, default=str, sort_keys=True, ensure_ascii=True, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        fold_rows: list[dict[str, object]] = []
 
         trial_rows: list[dict[str, object]] = []
         round_rows: list[dict[str, object]] = []
         trial_metrics: dict[str, dict[str, dict[str, float]]] = {}
-        trial_fold_metrics: dict[str, tuple[FoldMetrics, ...]] = {}
         candidate_scores: list[dict[str, object]] = []
         experiments: list[dict[str, object]] = []
         experiment_ids: dict[str, str] = {}
-        core_decisions: dict[str, object] = {}
-        transition_blocking_core_decision = None
         trial_params: dict[str, dict[str, object]] = {
             "baseline": dict(locked_champion_params)
         }
 
+        def finish_without_holdout(
+            *,
+            final_champion_id: str,
+            final_champion_params: Mapping[str, object],
+            snapshot: EvolutionState,
+            test_status: str,
+            test_reason: str,
+            failed_gates: list[str],
+            core_test_status: str,
+            persist_rollback: bool = False,
+        ) -> EvolutionOutcome:
+            state_transition_pending = (
+                persist_rollback and not dry_run and promote_shadow
+            )
+            persistence_status = (
+                "pending" if state_transition_pending else "not_changed"
+            )
+            persistence_reason = (
+                "Waiting for durable shadow rollback CAS."
+                if state_transition_pending
+                else "Research-only result; global shadow state was not changed."
+            )
+            manifest.update({
+                "champion_id": final_champion_id,
+                "test_status": test_status,
+                "test_reason": test_reason,
+                "core_test_status": core_test_status,
+                "global_state_changed": False,
+                "promotion_persistence_status": persistence_status,
+                "selected_experiment_id": selected_experiment_id,
+                "failed_gates": failed_gates,
+                "shadow_reevaluation_reason": shadow_reevaluation_reason,
+                "data_asof_date": snapshot.data_asof_date or data_asof_date,
+            })
+            _atomic_write_json(manifest_path, manifest)
+            changed = persist_evolution_outcome(
+                run_dir=run_dir,
+                snapshot=snapshot,
+                candidate_scores=candidate_scores,
+                experiments=experiments,
+                decision_markdown=_promotion_decision_markdown(
+                    run_id,
+                    final_champion_id,
+                    selected_experiment_id,
+                    persistence_status,
+                    persistence_reason,
+                ),
+                dry_run=dry_run or not persist_rollback,
+                promote_shadow=promote_shadow,
+                state_path=resolved_state_path,
+                expected_previous_fingerprint=previous_fingerprint,
+            )
+            if changed:
+                persistence_status = "committed"
+                persistence_reason = "Shadow rollback CAS committed."
+            manifest.update({
+                "global_state_changed": changed,
+                "promotion_persistence_status": persistence_status,
+            })
+            _atomic_write_text(
+                run_dir / "shadow_decision.md",
+                _promotion_decision_markdown(
+                    run_id,
+                    final_champion_id,
+                    selected_experiment_id,
+                    persistence_status,
+                    persistence_reason,
+                ),
+            )
+            pd.DataFrame(trial_rows).to_csv(
+                run_dir / "trials.csv", index=False, encoding="utf-8-sig"
+            )
+            pd.DataFrame(round_rows).to_csv(
+                run_dir / "rounds.csv", index=False, encoding="utf-8-sig"
+            )
+            pd.DataFrame(columns=("version", *TRIAL_METRIC_KEYS)).to_csv(
+                run_dir / "test_comparison.csv", index=False, encoding="utf-8-sig"
+            )
+            (run_dir / "champion_candidate.yaml").write_text(
+                yaml.safe_dump(
+                    dict(final_champion_params), allow_unicode=True, sort_keys=False
+                ),
+                encoding="utf-8",
+            )
+            summary_path = write_chinese_summary(
+                run_dir,
+                asof_date,
+                final_champion_id,
+                round_rows,
+                {},
+                test_status,
+                test_reason,
+            )
+            manifest.update({
+                "summary": str(summary_path),
+                "status": "success",
+                "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                "elapsed_seconds": round(time.perf_counter() - run_started, 6),
+                "peak_memory_bytes": _peak_memory_bytes(),
+            })
+            _atomic_write_json(manifest_path, manifest)
+            publish_run_metadata(output_root, manifest)
+            return EvolutionOutcome(
+                run_id,
+                run_dir,
+                final_champion_id,
+                dict(final_champion_params),
+                test_status,
+                test_reason,
+            )
+
         def cached_trial(trial_id: str, params_hash: str) -> StrategyRun | None:
-            trial_dir = run_dir / "trials" / trial_id
+            trial_dir = _resolve_trial_dir(run_dir, trial_id)
             state_path = trial_dir / "trial_state.json"
             if not resume or not state_path.exists():
                 return None
@@ -1011,36 +1242,6 @@ def run_evolution(
                 metrics = json.loads((trial_dir / "metrics.json").read_text(encoding="utf-8"))
                 if not _has_complete_cached_metrics(metrics):
                     return None
-                fold_payloads = metrics.get("folds")
-                if not isinstance(fold_payloads, list):
-                    return None
-                expected_fold_ids = [fold.fold_id for fold in folds]
-                parsed_fold_metrics: list[FoldMetrics] = []
-                expected_fold_fields = {
-                    field.name for field in fields(FoldMetrics)
-                }
-                for payload in fold_payloads:
-                    if not isinstance(payload, Mapping) or set(payload) != expected_fold_fields:
-                        return None
-                    metric = FoldMetrics(**dict(payload))
-                    numeric_values = (
-                        metric.total_return,
-                        metric.max_drawdown,
-                        metric.sharpe,
-                        metric.filled_trades,
-                        metric.average_turnover,
-                        metric.pnl_concentration,
-                    )
-                    if not all(
-                        isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        and math.isfinite(float(value))
-                        for value in numeric_values
-                    ):
-                        return None
-                    parsed_fold_metrics.append(metric)
-                if [metric.fold_id for metric in parsed_fold_metrics] != expected_fold_ids:
-                    return None
                 run = load_trial_artifacts(trial_dir)
                 if not _has_complete_trial_artifacts(trial_dir, run):
                     return None
@@ -1048,18 +1249,17 @@ def run_evolution(
                     "train": dict(metrics["train"]),
                     "validation": dict(metrics["validation"]),
                 }
-                trial_fold_metrics[trial_id] = tuple(parsed_fold_metrics)
                 return run
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 return None
 
         def execute_one(trial_id: str, params: dict[str, object]) -> StrategyRun:
-            trial_dir = run_dir / "trials" / trial_id
+            trial_dir = _resolve_trial_dir(run_dir, trial_id)
             params_hash = stable_hash(params)
             cached = cached_trial(trial_id, params_hash)
             if cached is not None:
                 return cached
-            run = trial_executor(research_bundle, params)
+            run = trial_executor(selection_bundle, params)
             train_metrics = calculate_segment_metrics(
                 run.equity, config.periods.research_start, config.periods.train_end,
                 config.selection.rolling_window_days,
@@ -1069,20 +1269,10 @@ def run_evolution(
                 config.selection.rolling_window_days,
             )
             trial_metrics[trial_id] = {"train": train_metrics, "validation": validation_metrics}
-            trial_fold_metrics[trial_id] = evaluate_strategy_folds(
-                research_bundle,
-                folds,
-                trial_executor,
-                params,
-            )
-            metrics_payload = {
-                **trial_metrics[trial_id],
-                "folds": [asdict(metric) for metric in trial_fold_metrics[trial_id]],
-            }
             write_trial_artifacts(
                 trial_dir,
                 run,
-                metrics_payload,
+                trial_metrics[trial_id],
                 {
                     "status": "completed",
                     "trial_id": trial_id,
@@ -1112,7 +1302,6 @@ def run_evolution(
         incumbent_trial_id = "baseline"
         incumbent_params = dict(locked_champion_params)
         incumbent_metrics = trial_metrics["baseline"]["validation"]
-        rollback_snapshot: EvolutionState | None = None
         shadow_reevaluation_reason: str | None = None
         if input_state.shadow_status == "shadow":
             shadow_trial_id = "__shadow_incumbent__"
@@ -1121,28 +1310,18 @@ def run_evolution(
             trial_params[shadow_trial_id] = shadow_params
             try:
                 execute_one(shadow_trial_id, shadow_params)
-                shadow_core_decision = evaluate_candidate(
-                    trial_fold_metrics[shadow_trial_id],
-                    trial_fold_metrics["baseline"],
-                    _promotion_policy(config),
-                )
                 shadow_legacy_decision = evaluate_promotion(
                     trial_metrics[shadow_trial_id]["validation"],
                     trial_metrics["baseline"]["validation"],
                     config.selection,
                 )
-                shadow_is_eligible = (
-                    shadow_core_decision.status == "eligible_for_shadow"
-                    and shadow_legacy_decision.eligible
-                )
+                shadow_is_eligible = shadow_legacy_decision.eligible
                 shadow_reevaluation_reason = (
                     "shadow reevaluation passed"
                     if shadow_is_eligible
                     else (
                         "shadow reevaluation failed: legacy="
                         + ",".join(shadow_legacy_decision.reasons or ("passed",))
-                        + "; core="
-                        + ",".join(shadow_core_decision.failed_gates or ("passed",))
                     )
                 )
                 trial_rows.append({
@@ -1162,10 +1341,35 @@ def run_evolution(
                     incumbent_params = shadow_params
                     incumbent_metrics = trial_metrics[shadow_trial_id]["validation"]
                 else:
+                    effective_data_asof = data_asof_date
+                    if not dry_run and promote_shadow:
+                        freshness_bundle = bundle_loader(
+                            data_path, asof_date, benchmark_path, locked_champion_params
+                        )
+                        effective_data_asof = validate_loaded_bundle_freshness(
+                            freshness_bundle, asof_date
+                        )
                     rollback_snapshot = rollback_shadow(
                         input_state,
                         reason=shadow_reevaluation_reason,
-                        data_asof_date=data_asof_date,
+                        data_asof_date=effective_data_asof,
+                    )
+                    rollback_snapshot = replace(
+                        rollback_snapshot,
+                        last_completed_run_id=run_id,
+                        last_data_fingerprint=evidence.data_fingerprint,
+                        updated_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    selected_experiment_id = input_state.shadow_experiment_id
+                    return finish_without_holdout(
+                        final_champion_id=rollback_snapshot.champion_version,
+                        final_champion_params=rollback_snapshot.champion_parameters,
+                        snapshot=rollback_snapshot,
+                        test_status="not_opened_shadow_rollback",
+                        test_reason=shadow_reevaluation_reason,
+                        failed_gates=["shadow_reevaluation"],
+                        core_test_status="not_opened",
+                        persist_rollback=True,
                     )
             except Exception as exc:
                 shadow_reevaluation_reason = (
@@ -1199,26 +1403,25 @@ def run_evolution(
                     "parameters": params,
                     "data_fingerprint": evidence.data_fingerprint,
                     "code_fingerprint": evidence.code_fingerprint,
-                    "fold_fingerprints": [row["fingerprint"] for row in fold_rows],
+                    "selection_period": {
+                        "start": config.periods.validation_start,
+                        "end": config.periods.validation_end,
+                    },
                 })[:20]
                 experiment_ids[candidate_id] = experiment_id
                 try:
                     execute_one(candidate_id, params)
                     candidate_pairs.append((candidate_id, trial_metrics[candidate_id]["validation"]))
-                    core_decision = evaluate_candidate(
-                        trial_fold_metrics[candidate_id],
-                        trial_fold_metrics[incumbent_trial_id],
-                        _promotion_policy(config),
-                    )
-                    core_decisions[candidate_id] = core_decision
                     candidate_scores.append({
                         "group_id": group.group_id,
                         "candidate_id": candidate_id,
                         "parent_id": incumbent_id,
                         "experiment_id": experiment_id,
-                        "status": core_decision.status,
-                        "failed_gates": json.dumps(core_decision.failed_gates, ensure_ascii=True),
-                        "gates": json.dumps(core_decision.gates, ensure_ascii=True, sort_keys=True),
+                        "status": "selection_evaluated",
+                        "selection_status": "selection_evaluated",
+                        "core_status": "not_evaluated",
+                        "failed_gates": "[]",
+                        "gates": "{}",
                     })
                     experiments.append({
                         "experiment_id": experiment_id,
@@ -1228,16 +1431,21 @@ def run_evolution(
                         "parameters": params,
                         "data_fingerprint": evidence.data_fingerprint,
                         "code_fingerprint": evidence.code_fingerprint,
-                        "fold_metrics": [asdict(metric) for metric in trial_fold_metrics[candidate_id]],
-                        "status": core_decision.status,
-                        "failed_gates": core_decision.failed_gates,
-                        "gates": core_decision.gates,
+                        "selection_metrics": trial_metrics[candidate_id]["validation"],
+                        "fold_metrics": [],
+                        "status": "selection_evaluated",
+                        "selection_status": "selection_evaluated",
+                        "core_status": "not_evaluated",
+                        "failed_gates": (),
+                        "gates": {},
                     })
                 except Exception as exc:
                     trial_rows.append({
                         "group_id": group.group_id,
                         "trial_id": candidate_id,
                         "status": "trial_error",
+                        "selection_status": "trial_error",
+                        "core_status": "not_evaluated",
                         "reason_cn": str(exc),
                     })
                     candidate_scores.append({
@@ -1246,6 +1454,8 @@ def run_evolution(
                         "parent_id": incumbent_id,
                         "experiment_id": experiment_id,
                         "status": "trial_error",
+                        "selection_status": "trial_error",
+                        "core_status": "not_evaluated",
                         "failed_gates": json.dumps(("trial_error",)),
                         "gates": "{}",
                     })
@@ -1282,6 +1492,28 @@ def run_evolution(
                 incumbent_id, incumbent_metrics, tuple(candidate_pairs), config.selection
             )
             for decision in decisions:
+                selection_status = (
+                    "selection_eligible"
+                    if decision.promotion.eligible
+                    else "selection_rejected"
+                )
+                failed_selection_gates = tuple(decision.promotion.reasons)
+                for score in candidate_scores:
+                    if score.get("candidate_id") == decision.candidate_id:
+                        score.update({
+                            "status": selection_status,
+                            "selection_status": selection_status,
+                            "failed_gates": json.dumps(
+                                failed_selection_gates, ensure_ascii=True
+                            ),
+                        })
+                for experiment in experiments:
+                    if experiment.get("candidate_id") == decision.candidate_id:
+                        experiment.update({
+                            "status": selection_status,
+                            "selection_status": selection_status,
+                            "failed_gates": failed_selection_gates,
+                        })
                 trial_rows.append({
                     "group_id": group.group_id,
                     "trial_id": decision.candidate_id,
@@ -1294,16 +1526,7 @@ def run_evolution(
                     "turnover_ratio": decision.promotion.turnover_ratio,
                     "robust_score": decision.promotion.robust_score,
                 })
-            legacy_promoted = legacy_winner_id != incumbent_id
-            winner_core_decision = core_decisions.get(legacy_winner_id)
-            core_eligible = (
-                legacy_promoted
-                and winner_core_decision is not None
-                and winner_core_decision.status == "eligible_for_shadow"
-            )
-            if legacy_promoted and not core_eligible:
-                transition_blocking_core_decision = winner_core_decision
-            winner_id = legacy_winner_id if core_eligible else incumbent_id
+            winner_id = legacy_winner_id
             promoted = winner_id != incumbent_id
             round_rows.append({
                 "group_id": group.group_id,
@@ -1312,13 +1535,9 @@ def run_evolution(
                 "winner_id": winner_id,
                 "decision": "保留" if promoted else "回滚",
                 "reason_cn": (
-                    "验证期与通用折门槛均通过"
+                    "验证期参数选择门槛通过；候选路径现已锁定"
                     if promoted
-                    else (
-                        "验证期赢家未通过通用折门槛"
-                        if legacy_promoted
-                        else "没有候选通过全部门槛"
-                    )
+                    else "没有候选通过参数选择门槛"
                 ),
             })
             if promoted:
@@ -1329,6 +1548,130 @@ def run_evolution(
 
         champion_id = incumbent_id
         champion_params = incumbent_params
+        selected_experiment_id = experiment_ids.get(champion_id)
+        base_snapshot = replace(
+            input_state,
+            last_completed_run_id=run_id,
+            last_data_fingerprint=evidence.data_fingerprint,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        if champion_id == locked_champion_id:
+            return finish_without_holdout(
+                final_champion_id=champion_id,
+                final_champion_params=champion_params,
+                snapshot=base_snapshot,
+                test_status="not_opened_no_challenger",
+                test_reason="No parameter-selection challenger was locked.",
+                failed_gates=["no_selected_experiment"],
+                core_test_status="not_opened",
+            )
+
+        core_bundle = bundle_loader(
+            data_path,
+            config.periods.core_test_end,
+            benchmark_path,
+            locked_champion_params,
+        )
+        if _bundle_has_holdout_dates(core_bundle, config.periods.core_test_end):
+            raise AssertionError("Core-test bundle contains final holdout dates")
+        core_segments = build_core_test_segments(
+            core_bundle.close.index,
+            config.periods.core_test_start,
+            config.periods.core_test_end,
+            core.min_folds,
+        )
+        fold_rows = [
+            {
+                "fold_id": segment.fold_id,
+                "test_start": segment.test_start,
+                "test_end": segment.test_end,
+                "fingerprint": fingerprint_payload(segment),
+            }
+            for segment in core_segments
+        ]
+        (run_dir / "folds.json").write_text(
+            json.dumps(
+                fold_rows,
+                default=str,
+                sort_keys=True,
+                ensure_ascii=True,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        locked_core_metrics = evaluate_strategy_folds(
+            core_bundle,
+            core_segments,
+            trial_executor,
+            locked_champion_params,
+        )
+        candidate_core_metrics = evaluate_strategy_folds(
+            core_bundle,
+            core_segments,
+            trial_executor,
+            champion_params,
+        )
+        selected_core_decision = evaluate_candidate(
+            candidate_core_metrics,
+            locked_core_metrics,
+            _promotion_policy(config),
+        )
+        for score in candidate_scores:
+            if score.get("experiment_id") == selected_experiment_id:
+                score.update({
+                    "status": selected_core_decision.status,
+                    "core_status": selected_core_decision.status,
+                    "failed_gates": json.dumps(
+                        selected_core_decision.failed_gates, ensure_ascii=True
+                    ),
+                    "gates": json.dumps(
+                        selected_core_decision.gates,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                })
+        for experiment in experiments:
+            if experiment.get("experiment_id") == selected_experiment_id:
+                experiment.update({
+                    "status": selected_core_decision.status,
+                    "core_status": selected_core_decision.status,
+                    "fold_metrics": [
+                        asdict(metric) for metric in candidate_core_metrics
+                    ],
+                    "champion_fold_metrics": [
+                        asdict(metric) for metric in locked_core_metrics
+                    ],
+                    "failed_gates": selected_core_decision.failed_gates,
+                    "gates": selected_core_decision.gates,
+                })
+        persist_evolution_outcome(
+            run_dir=run_dir,
+            snapshot=base_snapshot,
+            candidate_scores=candidate_scores,
+            experiments=experiments,
+            decision_markdown=(
+                "# Shadow decision\n\nCore tests completed; final holdout remains gated.\n"
+                "Formal YAML was not modified and no broker orders were created.\n"
+            ),
+            dry_run=True,
+            promote_shadow=False,
+            state_path=resolved_state_path,
+            expected_previous_fingerprint=None,
+        )
+        if selected_core_decision.status != "eligible_for_shadow":
+            return finish_without_holdout(
+                final_champion_id=champion_id,
+                final_champion_params=champion_params,
+                snapshot=base_snapshot,
+                test_status="not_opened_core_rejected",
+                test_reason=(
+                    "Locked candidate failed core tests: "
+                    + ",".join(selected_core_decision.failed_gates)
+                ),
+                failed_gates=list(selected_core_decision.failed_gates),
+                core_test_status=selected_core_decision.status,
+            )
+
         test_end = min(
             asof_date,
             config.periods.test_end if config.periods.test_end is not None else asof_date,
@@ -1336,6 +1679,11 @@ def run_evolution(
         full_bundle = bundle_loader(
             data_path, test_end, benchmark_path, locked_champion_params
         )
+        effective_data_asof = data_asof_date
+        if not dry_run and promote_shadow:
+            effective_data_asof = validate_loaded_bundle_freshness(
+                full_bundle, asof_date
+            )
         final_runs = {
             "baseline": trial_executor(full_bundle, locked_champion_params),
             "champion": trial_executor(full_bundle, champion_params),
@@ -1366,34 +1714,17 @@ def run_evolution(
             final_metrics["baseline"], final_metrics["champion"], config.selection
         )
 
-        selected_experiment_id = experiment_ids.get(champion_id)
-        selected_core_decision = (
-            evaluate_candidate(
-                trial_fold_metrics[incumbent_trial_id],
-                trial_fold_metrics["baseline"],
-                _promotion_policy(config),
-            )
-            if champion_id != locked_champion_id
-            else None
-        )
         selected_legacy_decision = (
             evaluate_promotion(
                 trial_metrics[incumbent_trial_id]["validation"],
                 trial_metrics["baseline"]["validation"],
                 config.selection,
             )
-            if champion_id != locked_champion_id
-            else None
+            if champion_id != locked_champion_id else None
         )
-        snapshot = replace(
-            rollback_snapshot or input_state,
-            last_completed_run_id=run_id,
-            last_data_fingerprint=evidence.data_fingerprint,
-            updated_at=datetime.now(timezone.utc).isoformat(),
-        )
+        snapshot = base_snapshot
         shadow_eligible = (
             bool(selected_experiment_id)
-            and selected_core_decision is not None
             and selected_core_decision.status == "eligible_for_shadow"
             and selected_legacy_decision is not None
             and selected_legacy_decision.eligible
@@ -1401,19 +1732,18 @@ def run_evolution(
         )
         if shadow_eligible:
             snapshot = promote_to_shadow(
-                rollback_snapshot or input_state,
+                input_state,
                 challenger_version=champion_id,
                 challenger_parameters=champion_params,
                 experiment_id=selected_experiment_id,
                 run_id=run_id,
                 data_fingerprint=evidence.data_fingerprint,
-                data_asof_date=data_asof_date,
+                data_asof_date=effective_data_asof,
             )
-        rollback_pending = rollback_snapshot is not None and not shadow_eligible
         state_transition_pending = (
             not dry_run
             and promote_shadow
-            and (shadow_eligible or rollback_pending)
+            and shadow_eligible
         )
         persistence_status = "pending" if state_transition_pending else "not_changed"
         persistence_reason = (
@@ -1425,23 +1755,13 @@ def run_evolution(
             "champion_id": champion_id,
             "test_status": test_status,
             "test_reason": test_reason,
+            "core_test_status": selected_core_decision.status,
             "global_state_changed": False,
             "promotion_persistence_status": persistence_status,
             "selected_experiment_id": selected_experiment_id,
-            "failed_gates": (
-                list(selected_core_decision.failed_gates)
-                if selected_core_decision is not None
-                else (
-                    list(transition_blocking_core_decision.failed_gates)
-                    if transition_blocking_core_decision is not None
-                    else (
-                        ["shadow_reevaluation"]
-                        if rollback_pending
-                        else ["no_selected_experiment"]
-                    )
-                )
-            ),
+            "failed_gates": list(selected_core_decision.failed_gates),
             "shadow_reevaluation_reason": shadow_reevaluation_reason,
+            "data_asof_date": effective_data_asof,
         })
         _atomic_write_json(manifest_path, manifest)
         decision_markdown = _promotion_decision_markdown(
@@ -1457,7 +1777,7 @@ def run_evolution(
             candidate_scores=candidate_scores,
             experiments=experiments,
             decision_markdown=decision_markdown,
-            dry_run=dry_run or not (shadow_eligible or rollback_pending),
+            dry_run=dry_run or not shadow_eligible,
             promote_shadow=promote_shadow,
             state_path=resolved_state_path,
             expected_previous_fingerprint=previous_fingerprint,

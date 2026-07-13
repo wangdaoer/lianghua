@@ -4,7 +4,7 @@ import json
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Mapping
 
 import pandas as pd
@@ -84,6 +84,11 @@ EVOLUTION_CORE_KEYS = frozenset({
     "max_drawdown_worsening", "max_turnover_ratio", "max_pnl_concentration",
 })
 
+RESERVED_EVOLUTION_IDS = frozenset({
+    "baseline", "champion", "final", "experiments", "trials",
+    "__shadow_incumbent__",
+})
+
 
 @dataclass(frozen=True)
 class EvolutionPeriods:
@@ -91,6 +96,8 @@ class EvolutionPeriods:
     train_end: pd.Timestamp
     validation_start: pd.Timestamp
     validation_end: pd.Timestamp
+    core_test_start: pd.Timestamp
+    core_test_end: pd.Timestamp
     test_start: pd.Timestamp
     test_end: pd.Timestamp | None
 
@@ -175,6 +182,20 @@ class TradingFold:
         return self.test_dates[-1]
 
 
+@dataclass(frozen=True)
+class CoreTestSegment:
+    fold_id: str
+    test_dates: tuple[pd.Timestamp, ...]
+
+    @property
+    def test_start(self) -> pd.Timestamp:
+        return self.test_dates[0]
+
+    @property
+    def test_end(self) -> pd.Timestamp:
+        return self.test_dates[-1]
+
+
 def _timestamp(value: object, name: str, allow_none: bool = False) -> pd.Timestamp | None:
     if value is None:
         if allow_none:
@@ -251,7 +272,21 @@ def _validate_params(params: Mapping[str, object]) -> None:
 def _identifier(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a non-empty string")
-    return value.strip()
+    identifier = value.strip()
+    normalized = identifier.casefold()
+    if (
+        identifier in {".", ".."}
+        or "/" in identifier
+        or "\\" in identifier
+        or Path(identifier).is_absolute()
+        or PureWindowsPath(identifier).is_absolute()
+        or any(ord(character) < 32 or ord(character) == 127 for character in identifier)
+        or any(character in '<>:"|?*' for character in identifier)
+        or identifier.endswith(".")
+        or normalized in RESERVED_EVOLUTION_IDS
+    ):
+        raise ValueError(f"{label} must be a safe non-reserved filename component")
+    return identifier
 
 
 def _strict_integer(value: object, name: str, *, minimum: int | None = None) -> int:
@@ -366,6 +401,8 @@ def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
         train_end=_timestamp(period_raw.get("train_end"), "train_end"),
         validation_start=_timestamp(period_raw.get("validation_start"), "validation_start"),
         validation_end=_timestamp(period_raw.get("validation_end"), "validation_end"),
+        core_test_start=_timestamp(period_raw.get("core_test_start"), "core_test_start"),
+        core_test_end=_timestamp(period_raw.get("core_test_end"), "core_test_end"),
         test_start=_timestamp(period_raw.get("test_start"), "test_start"),
         test_end=_timestamp(period_raw.get("test_end"), "test_end", allow_none=True),
     )
@@ -373,10 +410,15 @@ def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
         periods.research_start <= periods.train_end
         and periods.train_end < periods.validation_start
         and periods.validation_start <= periods.validation_end
-        and periods.validation_end < periods.test_start
+        and periods.validation_end < periods.core_test_start
+        and periods.core_test_start <= periods.core_test_end
+        and periods.core_test_end < periods.test_start
         and (periods.test_end is None or periods.test_start <= periods.test_end)
     ):
-        raise ValueError("Periods must satisfy train_end < validation_start <= validation_end < test_start")
+        raise ValueError(
+            "Periods must satisfy train_end < validation_start <= validation_end "
+            "< core_test_start <= core_test_end < test_start"
+        )
 
     baseline = {**DEFAULT_STRATEGY_PARAMS, **dict(raw.get("baseline") or {})}
     _validate_params(baseline)
@@ -387,17 +429,19 @@ def parse_evolution_config(raw: Mapping[str, object]) -> EvolutionConfig:
         if not isinstance(group_raw, Mapping):
             raise ValueError("search_groups entries must be mappings")
         group_id = _identifier(group_raw.get("id"), "Group id")
-        if group_id in group_ids:
-            raise ValueError(f"Duplicate or empty group id: {group_id!r}")
-        group_ids.add(group_id)
+        normalized_group_id = group_id.casefold()
+        if normalized_group_id in group_ids:
+            raise ValueError(f"Duplicate group id: {group_id!r}")
+        group_ids.add(normalized_group_id)
         candidates: list[SearchCandidate] = []
         for candidate_raw in list(group_raw.get("candidates") or []):
             if not isinstance(candidate_raw, Mapping):
                 raise ValueError("candidates entries must be mappings")
             candidate_id = _identifier(candidate_raw.get("id"), "Candidate id")
-            if candidate_id in candidate_ids:
+            normalized_candidate_id = candidate_id.casefold()
+            if normalized_candidate_id in candidate_ids:
                 raise ValueError(f"Duplicate candidate id: {candidate_id!r}")
-            candidate_ids.add(candidate_id)
+            candidate_ids.add(normalized_candidate_id)
             overrides_raw = candidate_raw.get("overrides") or {}
             if not isinstance(overrides_raw, Mapping):
                 raise ValueError("candidate overrides must be a mapping")
@@ -508,7 +552,51 @@ def build_trading_folds(
     return tuple(folds)
 
 
-def _slice_fold_rows(frame: pd.DataFrame, fold: TradingFold | None, date_column: str) -> pd.DataFrame:
+def build_core_test_segments(
+    trading_dates: object,
+    core_test_start: object,
+    core_test_end: object,
+    min_folds: int,
+) -> tuple[CoreTestSegment, ...]:
+    min_folds = _positive_window_size(min_folds, "min_folds")
+    try:
+        dates = pd.DatetimeIndex(pd.to_datetime(trading_dates)).normalize()
+        start = pd.Timestamp(core_test_start).normalize()
+        end = pd.Timestamp(core_test_end).normalize()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Core-test dates must be valid datetimes") from exc
+    if dates.hasnans:
+        raise ValueError("trading_dates must not contain NaT")
+    if not dates.is_unique:
+        raise ValueError("trading_dates must be unique")
+    if start > end:
+        raise ValueError("core_test_start must not be after core_test_end")
+    core_dates = dates.sort_values()
+    core_dates = core_dates[(core_dates >= start) & (core_dates <= end)]
+    if len(core_dates) < min_folds:
+        raise ValueError("Core-test period has fewer trading dates than min_folds")
+
+    base_size, remainder = divmod(len(core_dates), min_folds)
+    segments: list[CoreTestSegment] = []
+    offset = 0
+    for index in range(min_folds):
+        size = base_size + (1 if index < remainder else 0)
+        segment_dates = tuple(core_dates[offset:offset + size])
+        segments.append(
+            CoreTestSegment(
+                fold_id=f"core_{index:03d}",
+                test_dates=segment_dates,
+            )
+        )
+        offset += size
+    return tuple(segments)
+
+
+def _slice_fold_rows(
+    frame: pd.DataFrame,
+    fold: TradingFold | CoreTestSegment | None,
+    date_column: str,
+) -> pd.DataFrame:
     if date_column not in frame:
         raise ValueError(f"Fold evidence requires {date_column}")
     if fold is None:
@@ -547,7 +635,7 @@ def _positive_symbol_contributions(trades: pd.DataFrame) -> dict[str, float]:
 def calculate_fold_metrics(
     equity: pd.DataFrame,
     trades: pd.DataFrame,
-    fold: TradingFold | None = None,
+    fold: TradingFold | CoreTestSegment | None = None,
     *,
     fold_id: str | None = None,
 ) -> FoldMetrics:
@@ -590,12 +678,12 @@ def calculate_fold_metrics(
 
 def run_strong_pullback_folds(
     panel: object,
-    folds: tuple[TradingFold, ...],
+    folds: tuple[TradingFold | CoreTestSegment, ...],
     executor: Callable[[object, Mapping[str, object]], object],
     params: Mapping[str, object],
     *,
     slicer: Callable[[object, pd.Timestamp], object] | None = None,
-) -> tuple[tuple[TradingFold, object], ...]:
+) -> tuple[tuple[TradingFold | CoreTestSegment, object], ...]:
     if slicer is None:
         if not isinstance(panel, pd.DataFrame) or "date" not in panel:
             raise ValueError("panel must contain a date column")

@@ -12,6 +12,9 @@ import pandas as pd
 import pytest
 import yaml
 
+import run_strong_pullback_evolution as evolution_runner
+import strong_pullback_evolution as evolution_adapter
+
 from strategy_evolution_core import (
     EvolutionState,
     PromotionPolicy as CorePromotionPolicy,
@@ -91,7 +94,9 @@ def valid_raw_config() -> dict[str, object]:
             "research_start": "2022-01-01",
             "train_end": "2024-12-31",
             "validation_start": "2025-01-01",
-            "validation_end": "2025-12-31",
+            "validation_end": "2025-06-30",
+            "core_test_start": "2025-07-01",
+            "core_test_end": "2025-12-31",
             "test_start": "2026-01-01",
             "test_end": None,
         },
@@ -135,6 +140,9 @@ class EvolutionCliTest(unittest.TestCase):
         self.assertEqual(config.evolution_core.train_days, 504)
         self.assertEqual(config.evolution_core.random_seed, 20260712)
         self.assertEqual(config.evolution_core.min_positive_fold_ratio, 0.6666666667)
+        self.assertEqual(config.periods.validation_end, pd.Timestamp("2025-06-30"))
+        self.assertEqual(config.periods.core_test_start, pd.Timestamp("2025-07-01"))
+        self.assertEqual(config.periods.core_test_end, pd.Timestamp("2025-12-31"))
 
     def test_cli_defaults_to_dry_run_and_requires_explicit_shadow_promotion(self):
         args = parse_args([
@@ -160,8 +168,10 @@ class EvolutionCliTest(unittest.TestCase):
             "research_start": dates[0].strftime("%Y-%m-%d"),
             "train_end": dates[89].strftime("%Y-%m-%d"),
             "validation_start": dates[90].strftime("%Y-%m-%d"),
-            "validation_end": dates[119].strftime("%Y-%m-%d"),
-            "test_start": dates[120].strftime("%Y-%m-%d"),
+            "validation_end": dates[109].strftime("%Y-%m-%d"),
+            "core_test_start": dates[110].strftime("%Y-%m-%d"),
+            "core_test_end": dates[129].strftime("%Y-%m-%d"),
+            "test_start": dates[130].strftime("%Y-%m-%d"),
             "test_end": dates[-1].strftime("%Y-%m-%d"),
         }
         raw["baseline"].update({
@@ -241,10 +251,36 @@ class EvolutionCliTest(unittest.TestCase):
             self.assertTrue((outcome.run_dir / "manifest.json").exists())
             self.assertTrue((outcome.run_dir / "champion_candidate.yaml").exists())
             self.assertTrue((outcome.run_dir / "test_comparison.csv").exists())
-            self.assertTrue((outcome.run_dir / "final" / "baseline" / "equity_curve.csv").exists())
+            if outcome.test_status == "ready_for_manual_review":
+                self.assertTrue(
+                    (outcome.run_dir / "final" / "baseline" / "equity_curve.csv").exists()
+                )
+            else:
+                self.assertTrue(outcome.test_status.startswith("not_opened_"))
 
 
 class EvolutionConfigTest(unittest.TestCase):
+    def test_requires_disjoint_selection_core_and_holdout_periods(self):
+        raw = valid_raw_config()
+        raw["periods"].update({
+            "validation_end": "2025-06-30",
+            "core_test_start": "2025-07-01",
+            "core_test_end": "2025-12-31",
+        })
+
+        periods = parse_evolution_config(raw).periods
+
+        self.assertEqual(periods.validation_end, pd.Timestamp("2025-06-30"))
+        self.assertEqual(periods.core_test_start, pd.Timestamp("2025-07-01"))
+        self.assertEqual(periods.core_test_end, pd.Timestamp("2025-12-31"))
+
+        raw["periods"]["core_test_start"] = "2025-06-30"
+        with self.assertRaisesRegex(
+            ValueError,
+            "validation_end < core_test_start <= core_test_end < test_start",
+        ):
+            parse_evolution_config(raw)
+
     def test_rejects_missing_and_unknown_evolution_core_keys(self):
         raw = valid_raw_config()
         del raw["evolution_core"]["train_days"]
@@ -292,7 +328,10 @@ class EvolutionConfigTest(unittest.TestCase):
         raw = valid_raw_config()
         raw["periods"]["test_start"] = "2025-12-31"
 
-        with self.assertRaisesRegex(ValueError, "train_end < validation_start <= validation_end < test_start"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "validation_end < core_test_start <= core_test_end < test_start",
+        ):
             parse_evolution_config(raw)
 
     def test_rejects_unknown_strategy_override(self):
@@ -356,6 +395,36 @@ class EvolutionConfigTest(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, "Candidate id must be a non-empty string"):
                     parse_evolution_config(raw)
+
+    def test_rejects_unsafe_reserved_and_case_colliding_group_candidate_ids(self):
+        unsafe_ids = (
+            ".", "..", "../escape", "..\\escape", "/absolute", "C:\\absolute",
+            "nested/name", "nested\\name", "baseline", "Champion", "FINAL",
+            "experiments", "control\x01name", "unsafe:name", "trailing.",
+        )
+        for field, label in (("group", "Group id"), ("candidate", "Candidate id")):
+            for unsafe_id in unsafe_ids:
+                with self.subTest(field=field, unsafe_id=unsafe_id):
+                    raw = valid_raw_config()
+                    if field == "group":
+                        raw["search_groups"][0]["id"] = unsafe_id
+                    else:
+                        raw["search_groups"][0]["candidates"][0]["id"] = unsafe_id
+                    with self.assertRaisesRegex(ValueError, label):
+                        parse_evolution_config(raw)
+
+        raw = valid_raw_config()
+        raw["search_groups"].append(copy.deepcopy(raw["search_groups"][0]))
+        raw["search_groups"][1]["id"] = "RISK_BUDGET"
+        raw["search_groups"][1]["candidates"][0]["id"] = "other_candidate"
+        raw["search_groups"][1]["candidates"][1]["id"] = "another_candidate"
+        with self.assertRaisesRegex(ValueError, "Duplicate group id"):
+            parse_evolution_config(raw)
+
+        raw = valid_raw_config()
+        raw["search_groups"][0]["candidates"][1]["id"] = "RISK_075"
+        with self.assertRaisesRegex(ValueError, "Duplicate candidate id"):
+            parse_evolution_config(raw)
 
     def test_group_candidates_are_deeply_independent(self):
         incumbent = {"nested": {"values": ["incumbent"]}}
@@ -503,6 +572,191 @@ class EvolutionConfigTest(unittest.TestCase):
 
 
 class EvolutionAdapterTest(unittest.TestCase):
+    def test_effective_loaded_freshness_rejects_raw_latest_row_dropped_by_cleaning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            pd.DataFrame([
+                {
+                    "date": "2026-07-08", "symbol": "000001", "open": 10.0,
+                    "high": 10.2, "low": 9.8, "close": 10.0, "volume": 1000.0,
+                    "amount": 10_000.0,
+                },
+                {
+                    "date": "2026-07-09", "symbol": "000001", "open": "invalid",
+                    "high": "invalid", "low": "invalid", "close": "invalid",
+                    "volume": 1000.0, "amount": 10_000.0,
+                },
+            ]).to_csv(data, index=False)
+            pd.DataFrame({
+                "date": ["2026-07-08", "2026-07-09"],
+                "close": [100.0, 101.0],
+            }).to_csv(benchmark, index=False)
+
+            bundle = load_price_bundle(
+                data,
+                pd.Timestamp("2026-07-09"),
+                benchmark,
+                DEFAULT_STRATEGY_PARAMS,
+            )
+
+            self.assertEqual(bundle.close.index.max(), pd.Timestamp("2026-07-08"))
+            with self.assertRaisesRegex(ValueError, "effective.*asof_date"):
+                evolution_runner.validate_loaded_bundle_freshness(
+                    bundle, pd.Timestamp("2026-07-09")
+                )
+
+    def test_effective_loaded_freshness_rejects_invalid_latest_benchmark_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            pd.DataFrame([
+                {
+                    "date": date, "symbol": "000001", "open": price,
+                    "high": price * 1.01, "low": price * 0.99, "close": price,
+                    "volume": 1000.0, "amount": price * 1000.0,
+                }
+                for date, price in (("2026-07-08", 10.0), ("2026-07-09", 10.1))
+            ]).to_csv(data, index=False)
+            pd.DataFrame({
+                "date": ["2026-07-08", "2026-07-09"],
+                "close": [100.0, "invalid"],
+            }).to_csv(benchmark, index=False)
+
+            bundle = load_price_bundle(
+                data,
+                pd.Timestamp("2026-07-09"),
+                benchmark,
+                DEFAULT_STRATEGY_PARAMS,
+            )
+
+            with self.assertRaisesRegex(ValueError, "effective loaded.*asof_date"):
+                evolution_runner.validate_loaded_bundle_freshness(
+                    bundle, pd.Timestamp("2026-07-09")
+                )
+
+    def test_effective_loaded_freshness_requires_common_valid_price_observation(self):
+        dates = pd.DatetimeIndex(["2026-07-08", "2026-07-09"])
+        close = pd.DataFrame(
+            {"000001": [10.0, 10.1], "000002": [20.0, np.nan]}, index=dates
+        )
+        open_px = pd.DataFrame(
+            {"000001": [10.0, np.nan], "000002": [20.0, 20.1]}, index=dates
+        )
+        high = pd.DataFrame(
+            {"000001": [10.1, 10.2], "000002": [20.1, np.nan]}, index=dates
+        )
+        low = pd.DataFrame(
+            {"000001": [9.9, np.nan], "000002": [19.9, 20.0]}, index=dates
+        )
+        amount = pd.DataFrame(
+            {"000001": [1000.0, 1010.0], "000002": [2000.0, np.nan]}, index=dates
+        )
+        bundle = PriceBundle(
+            close, open_px, high, low, amount, pd.Series(1.0, index=dates)
+        )
+
+        with self.assertRaisesRegex(ValueError, "common.*asof_date"):
+            evolution_runner.validate_loaded_bundle_freshness(
+                bundle, pd.Timestamp("2026-07-09")
+            )
+
+    def test_transitive_strategy_dependencies_change_code_and_resume_identity(self):
+        required_dependencies = {
+            "strategy_evolution_core.py",
+            "strong_pullback_evolution.py",
+            "run_strong_pullback_evolution.py",
+            "run_strong_pullback_satellite.py",
+            "train_next_open_rank_model.py",
+            "run_backtest.py",
+            "execution_rules.py",
+            "generate_strong_pullback_candidates.py",
+        }
+        self.assertTrue(
+            required_dependencies.issubset(evolution_runner.STRATEGY_CODE_DEPENDENCIES)
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for filename in evolution_runner.STRATEGY_CODE_DEPENDENCIES:
+                (root / filename).write_text(f"{filename}:v1\n", encoding="utf-8")
+            baseline = evolution_runner.build_code_fingerprint(root)
+            for filename in evolution_runner.STRATEGY_CODE_DEPENDENCIES:
+                path = root / filename
+                original = path.read_text(encoding="utf-8")
+                path.write_text(original + "changed\n", encoding="utf-8")
+                with self.subTest(filename=filename):
+                    self.assertNotEqual(
+                        evolution_runner.build_code_fingerprint(root), baseline
+                    )
+                path.write_text(original, encoding="utf-8")
+
+            config = parse_evolution_config(valid_raw_config())
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("panel", encoding="utf-8")
+            config_path.write_text("config", encoding="utf-8")
+            with patch.object(
+                evolution_runner, "build_code_fingerprint", return_value="a" * 64
+            ):
+                first = evolution_runner.build_run_evidence(
+                    data, config_path, config, None, "commit"
+                )
+            with patch.object(
+                evolution_runner, "build_code_fingerprint", return_value="b" * 64
+            ):
+                second = evolution_runner.build_run_evidence(
+                    data, config_path, config, None, "commit"
+                )
+            self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+    def test_trial_path_resolver_keeps_every_trial_as_a_direct_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            trial_dir = evolution_runner._resolve_trial_dir(run_dir, "safe_trial")
+
+            self.assertEqual(trial_dir.parent, (run_dir / "trials").resolve())
+            self.assertEqual(trial_dir.name, "safe_trial")
+            for unsafe_id in (".", "..", "../escape", "..\\escape", "/absolute", "C:\\absolute"):
+                with self.subTest(unsafe_id=unsafe_id):
+                    with self.assertRaisesRegex(ValueError, "trial_id"):
+                        evolution_runner._resolve_trial_dir(run_dir, unsafe_id)
+
+    def test_default_core_test_segments_are_complete_disjoint_and_non_overlapping(self):
+        config = load_evolution_config(Path("configs/evolution_strong_pullback.yaml"))
+        dates = pd.bdate_range(
+            config.periods.validation_start,
+            config.periods.core_test_end,
+        )
+
+        segments = evolution_adapter.build_core_test_segments(
+            dates,
+            config.periods.core_test_start,
+            config.periods.core_test_end,
+            config.evolution_core.min_folds,
+        )
+
+        self.assertGreaterEqual(len(segments), config.evolution_core.min_folds)
+        core_dates = set(dates[dates >= config.periods.core_test_start])
+        segment_dates = [set(segment.test_dates) for segment in segments]
+        self.assertEqual(set().union(*segment_dates), core_dates)
+        self.assertTrue(all(
+            left.isdisjoint(right)
+            for index, left in enumerate(segment_dates)
+            for right in segment_dates[index + 1:]
+        ))
+        self.assertTrue(all(
+            date > config.periods.validation_end
+            for segment in segments
+            for date in segment.test_dates
+        ))
+        self.assertEqual(
+            [segment.test_start for segment in segments],
+            sorted(segment.test_start for segment in segments),
+        )
+
     def test_dry_run_writes_snapshot_without_changing_global_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -891,6 +1145,221 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             **kwargs,
         )
 
+    def test_core_rejection_keeps_final_holdout_untouched_after_selection_lock(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.6666666667,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [{
+            "id": "selection_only",
+            "hypothesis_cn": "selection winner must fail locked core tests",
+            "candidates": [{"id": "selection_winner", "overrides": {"leverage": 0.75}}],
+        }]
+        config = parse_evolution_config(raw)
+        requested_ends: list[pd.Timestamp] = []
+
+        def loader(data_path, end_date, benchmark_path, params):
+            requested_ends.append(pd.Timestamp(end_date))
+            return self._flat_bundle(pd.Timestamp(end_date))
+
+        def executor(bundle, params):
+            end = pd.Timestamp(bundle.close.index.max())
+            is_candidate = float(params["leverage"]) == 0.75
+            if end <= config.periods.validation_end:
+                daily = 0.0004 if is_candidate else 0.0002
+            elif end <= config.periods.core_test_end:
+                daily = 0.0001 if is_candidate else 0.0002
+            else:
+                raise AssertionError("final holdout opened before core gates passed")
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                root / "runs", "core-rejected", False, loader, executor, "test-commit",
+            )
+            rounds = pd.read_csv(outcome.run_dir / "rounds.csv")
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(rounds.loc[0, "winner_id"], "selection_winner")
+        self.assertEqual(outcome.champion_id, "selection_winner")
+        self.assertEqual(outcome.test_status, "not_opened_core_rejected")
+        self.assertEqual(manifest["core_test_status"], "rejected")
+        self.assertTrue(all(end <= config.periods.core_test_end for end in requested_ends))
+
+    def test_core_and_holdout_changes_cannot_reopen_locked_selection_path(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [{
+            "id": "locked_group",
+            "hypothesis_cn": "lock before later evidence",
+            "candidates": [{"id": "locked_candidate", "overrides": {"leverage": 0.75}}],
+        }]
+        config = parse_evolution_config(raw)
+
+        def run_variant(root: Path, label: str, core_daily: float, holdout_daily: float):
+            data = root / f"{label}-panel.csv"
+            config_path = root / f"{label}-config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            requested_ends: list[pd.Timestamp] = []
+
+            def loader(data_path, end_date, benchmark_path, params):
+                requested_ends.append(pd.Timestamp(end_date))
+                bundle = self._flat_bundle(pd.Timestamp(end_date))
+                if pd.Timestamp(end_date) > config.periods.validation_end:
+                    core_rows = (
+                        (bundle.close.index >= config.periods.core_test_start)
+                        & (bundle.close.index <= config.periods.core_test_end)
+                    )
+                    bundle.close.loc[core_rows, :] = core_daily
+                    if pd.Timestamp(end_date) > config.periods.core_test_end:
+                        holdout_rows = bundle.close.index >= config.periods.test_start
+                        bundle.close.loc[holdout_rows, :] = holdout_daily
+                return bundle
+
+            def executor(bundle, params):
+                end = pd.Timestamp(bundle.close.index.max())
+                is_candidate = float(params["leverage"]) == 0.75
+                if end <= config.periods.validation_end:
+                    daily = 0.0004 if is_candidate else 0.0002
+                elif end <= config.periods.core_test_end:
+                    daily = float(bundle.close.iloc[-1, 0]) if is_candidate else 0.0002
+                else:
+                    daily = float(bundle.close.iloc[-1, 0]) if is_candidate else 0.0002
+                return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+            try:
+                outcome = run_evolution(
+                    config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                    root / f"runs-{label}", label, False, loader, executor, "test-commit",
+                )
+                run_dir = outcome.run_dir
+            except RuntimeError as exc:
+                self.assertIn("Holdout test", str(exc))
+                run_dir = root / f"runs-{label}" / label
+            return {
+                "rounds": pd.read_csv(run_dir / "rounds.csv"),
+                "manifest": json.loads((run_dir / "manifest.json").read_text(encoding="utf-8")),
+                "scores": pd.read_csv(run_dir / "candidate_scores.csv"),
+                "folds": (run_dir / "folds.json").read_text(encoding="utf-8"),
+                "requested_ends": requested_ends,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pass_all = run_variant(root, "pass-all", 0.0004, 0.0004)
+            reject_core = run_variant(root, "reject-core", 0.0001, 0.0004)
+            reject_holdout = run_variant(root, "reject-holdout", 0.0004, 0.0001)
+
+        for result in (pass_all, reject_core, reject_holdout):
+            self.assertEqual(result["rounds"].loc[0, "winner_id"], "locked_candidate")
+        self.assertEqual(pass_all["manifest"]["core_test_status"], "eligible_for_shadow")
+        self.assertEqual(reject_core["manifest"]["core_test_status"], "rejected")
+        self.assertEqual(
+            reject_holdout["manifest"]["core_test_status"], "eligible_for_shadow"
+        )
+        self.assertEqual(pass_all["folds"], reject_holdout["folds"])
+        self.assertEqual(
+            pass_all["scores"].loc[0, "gates"],
+            reject_holdout["scores"].loc[0, "gates"],
+        )
+        self.assertTrue(all(
+            end <= config.periods.core_test_end
+            for end in reject_core["requested_ends"]
+        ))
+
+    def test_old_full_2025_selection_winner_no_longer_uses_core_test_rows(self):
+        raw = valid_raw_config()
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [{
+            "id": "old_interval",
+            "hypothesis_cn": "benefit exists only after selection ends",
+            "candidates": [{"id": "late_only", "overrides": {"leverage": 0.75}}],
+        }]
+        config = parse_evolution_config(raw)
+
+        def executor(bundle, params):
+            is_candidate = float(params["leverage"]) == 0.75
+            full_old_interval = bundle.close.index.max() > config.periods.validation_end
+            daily = (
+                0.0005 if is_candidate and full_old_interval
+                else 0.0001 if is_candidate
+                else 0.0002
+            )
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        old_bundle = self._flat_bundle(config.periods.core_test_end)
+        old_baseline = calculate_segment_metrics(
+            executor(old_bundle, config.baseline).equity,
+            config.periods.validation_start,
+            config.periods.core_test_end,
+            config.selection.rolling_window_days,
+        )
+        old_candidate = calculate_segment_metrics(
+            executor(old_bundle, {**config.baseline, "leverage": 0.75}).equity,
+            config.periods.validation_start,
+            config.periods.core_test_end,
+            config.selection.rolling_window_days,
+        )
+        self.assertTrue(evaluate_promotion(
+            old_candidate, old_baseline, config.selection
+        ).eligible)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            config_path = root / "config.yaml"
+            data.write_text("evidence", encoding="utf-8")
+            config_path.write_text("evidence", encoding="utf-8")
+            outcome = run_evolution(
+                config, data, config_path, None, pd.Timestamp("2026-07-09"),
+                root / "runs", "old-interval-rejected", False,
+                lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                    pd.Timestamp(end_date)
+                ),
+                executor, "test-commit",
+            )
+
+        self.assertEqual(outcome.champion_id, "baseline")
+        self.assertEqual(outcome.test_status, "not_opened_no_challenger")
+
     def test_stale_cas_marks_decision_and_manifest_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -916,7 +1385,7 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             self.assertIn("previous state fingerprint", decision)
             self.assertEqual(load_evolution_state(state_path, initial), initial)
 
-    def test_core_ineligible_group_winner_never_becomes_next_parent_or_shadow(self):
+    def test_intermediate_selection_winner_is_not_core_gated_before_path_lock(self):
         raw = valid_raw_config()
         raw["evolution_core"].update({
             "min_filled_trades_per_fold": 1,
@@ -984,13 +1453,13 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(rounds.loc[0, "winner_id"], "baseline")
-        self.assertEqual(rounds.loc[1, "parent_id"], "baseline")
+        self.assertEqual(rounds.loc[0, "winner_id"], "bad_core")
+        self.assertEqual(rounds.loc[1, "parent_id"], "bad_core")
         self.assertEqual(outcome.champion_id, "clean_candidate")
-        self.assertEqual(outcome.champion_params["leverage"], 0.60)
+        self.assertEqual(outcome.champion_params["leverage"], 0.75)
         self.assertTrue(seen_clean_params)
-        self.assertTrue(all(params["leverage"] == 0.60 for params in seen_clean_params))
-        self.assertEqual(snapshot["shadow_parameters"]["leverage"], 0.60)
+        self.assertTrue(all(params["leverage"] == 0.75 for params in seen_clean_params))
+        self.assertEqual(snapshot["shadow_parameters"]["leverage"], 0.75)
 
     def test_final_accumulated_candidate_must_pass_core_gates_against_locked_champion(self):
         raw = valid_raw_config()
@@ -1222,6 +1691,94 @@ class EvolutionOrchestrationTest(unittest.TestCase):
         self.assertTrue(manifest["global_state_changed"])
         self.assertEqual(manifest["promotion_persistence_status"], "committed")
 
+    def test_failing_shadow_persists_rollback_and_stops_before_strong_replacement_search(self):
+        raw = valid_raw_config()
+        raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_positive_fold_ratio": 0.0,
+            "min_mean_return_improvement": 0.0,
+            "max_drawdown_floor": -1.0,
+            "max_drawdown_worsening": 1.0,
+            "max_turnover_ratio": 2.0,
+            "max_pnl_concentration": 0.50,
+        })
+        raw["selection"].update({
+            "min_annualized_return_delta": 0.0,
+            "min_sharpe_delta": -10.0,
+            "max_turnover_ratio": 2.0,
+        })
+        raw["search_groups"] = [{
+            "id": "strong_replacement_group",
+            "hypothesis_cn": "must wait for the next evolution run",
+            "candidates": [{
+                "id": "strong_replacement", "overrides": {"top_n": 7}
+            }],
+        }]
+        config = parse_evolution_config(raw)
+
+        def executor(bundle, params):
+            if float(params["leverage"]) == 0.75:
+                daily = -0.0002
+            elif int(params["top_n"]) == 7:
+                daily = 0.0008
+            else:
+                daily = 0.0002
+            return self._controlled_run(bundle, daily_return=daily, turnover=0.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            shadow = promote_to_shadow(
+                initial,
+                challenger_version="failing-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="prior-exp",
+                run_id="prior-run",
+                data_fingerprint="prior-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            write_evolution_state_atomic(state_path, shadow)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": ["2026-07-09"]}).to_csv(data, index=False)
+            pd.DataFrame({"date": ["2026-07-09"], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            with patch(
+                "run_strong_pullback_evolution.build_group_candidates",
+                wraps=build_group_candidates,
+            ) as candidate_search:
+                outcome = run_evolution(
+                    config, data, config_path, benchmark, pd.Timestamp("2026-07-09"),
+                    root / "runs", "rollback-stop", False,
+                    lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
+                        pd.Timestamp(end_date)
+                    ),
+                    executor, "test-commit", dry_run=False, promote_shadow=True,
+                    state_path=state_path,
+                )
+
+            persisted = load_evolution_state(state_path, initial)
+            journal = load_evolution_transition_journal(state_path)
+            manifest = json.loads(
+                (outcome.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+
+        candidate_search.assert_not_called()
+        self.assertEqual(outcome.test_status, "not_opened_shadow_rollback")
+        self.assertEqual(persisted.shadow_status, "rolled_back")
+        self.assertIsNotNone(journal)
+        self.assertEqual(journal.operation, "rollback")
+        self.assertEqual(journal.status, "committed")
+        self.assertEqual(manifest["selected_experiment_id"], "prior-exp")
+
     def test_shadow_evidence_error_aborts_without_mutating_state(self):
         raw = valid_raw_config()
         raw["evolution_core"]["min_mean_return_improvement"] = 0.0
@@ -1394,8 +1951,93 @@ class EvolutionOrchestrationTest(unittest.TestCase):
         )
         self.assertTrue(recovered_manifest["global_state_changed"])
 
-    def test_research_load_finishes_at_validation_end_before_test_load(self):
-        config = parse_evolution_config(valid_raw_config())
+    def test_startup_finalizes_committed_but_unfinalized_run_idempotently(self):
+        config = self._eligible_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_root = root / "runs"
+            state_path = root / "evolution_state" / "strong_pullback.json"
+            initial = EvolutionState.initial(
+                "baseline", config.baseline, now="2026-07-08T00:00:00+00:00"
+            )
+            target = promote_to_shadow(
+                initial,
+                challenger_version="prior-shadow",
+                challenger_parameters={**config.baseline, "leverage": 0.75},
+                experiment_id="prior-exp",
+                run_id="committed-crash",
+                data_fingerprint="prior-data",
+                data_asof_date="2026-07-08",
+                now="2026-07-08T01:00:00+00:00",
+            )
+            evolution_runner.commit_evolution_state_transition(
+                state_path,
+                target,
+                operation="promote",
+                run_id="committed-crash",
+                experiment_id="prior-exp",
+                expected_previous_fingerprint=evolution_runner.StateWriteExpectation.ABSENT,
+                now="2026-07-08T01:00:00+00:00",
+            )
+            state_bytes = state_path.read_bytes()
+            prior_run_dir = output_root / "committed-crash"
+            prior_run_dir.mkdir(parents=True)
+            (prior_run_dir / "manifest.json").write_text(
+                json.dumps({
+                    "run_id": "committed-crash",
+                    "status": "running",
+                    "champion_id": "prior-shadow",
+                    "selected_experiment_id": "prior-exp",
+                    "test_status": "ready_for_manual_review",
+                    "promotion_persistence_status": "pending",
+                    "global_state_changed": False,
+                }),
+                encoding="utf-8",
+            )
+            (prior_run_dir / "shadow_decision.md").write_text(
+                "# pending\n", encoding="utf-8"
+            )
+
+            evolution_runner.reconcile_startup_transition(
+                output_root, state_path, initial
+            )
+            first_manifest_text = (prior_run_dir / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+            evolution_runner.reconcile_startup_transition(
+                output_root, state_path, initial
+            )
+
+            recovered_manifest = json.loads(first_manifest_text)
+            registry_records = [
+                json.loads(line)
+                for line in (output_root / "evolution_registry.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(state_path.read_bytes(), state_bytes)
+            self.assertEqual(recovered_manifest["status"], "success")
+            self.assertEqual(
+                recovered_manifest["promotion_persistence_status"], "committed"
+            )
+            self.assertTrue(recovered_manifest["global_state_changed"])
+            self.assertIn(
+                "committed",
+                (prior_run_dir / "shadow_decision.md").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (prior_run_dir / "manifest.json").read_text(encoding="utf-8"),
+                first_manifest_text,
+            )
+            self.assertEqual(
+                [record["run_id"] for record in registry_records],
+                ["committed-crash"],
+            )
+
+    def test_selection_load_precedes_core_and_gated_holdout_load(self):
+        config = self._eligible_config()
         requested_ends: list[pd.Timestamp] = []
 
         def loader(data_path, end_date, benchmark_path, params):
@@ -1418,22 +2060,22 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 run_id="isolation-test",
                 resume=False,
                 bundle_loader=loader,
-                trial_executor=self._run_for_params,
+                trial_executor=self._eligible_run_for_params,
                 git_commit="test-commit",
             )
 
-        self.assertEqual(requested_ends[0], pd.Timestamp("2025-12-31"))
-        self.assertTrue(all(value <= pd.Timestamp("2025-12-31") for value in requested_ends[:-1]))
+        self.assertEqual(requested_ends[0], config.periods.validation_end)
+        self.assertEqual(requested_ends[1], config.periods.core_test_end)
         self.assertEqual(requested_ends[-1], pd.Timestamp("2026-07-09"))
-        self.assertIn(outcome.test_status, {"ready_for_manual_review", "rollback_recommended"})
+        self.assertEqual(outcome.test_status, "ready_for_manual_review")
 
-    def test_orchestration_executes_every_trial_at_each_physical_fold_end(self):
-        config = parse_evolution_config(valid_raw_config())
+    def test_orchestration_replays_only_locked_candidate_at_core_segment_ends(self):
+        config = self._eligible_config()
         seen: list[tuple[float, pd.Timestamp]] = []
 
         def executor(bundle, params):
             seen.append((float(params["leverage"]), pd.Timestamp(bundle.close.index.max())))
-            return self._run_for_params(bundle, params)
+            return self._eligible_run_for_params(bundle, params)
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1457,18 +2099,23 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 git_commit="test-commit",
             )
 
-        research_bundle = self._flat_bundle(config.periods.validation_end)
-        folds = build_trading_folds(
-            research_bundle.close.index,
-            train_days=config.evolution_core.train_days,
-            validation_days=config.evolution_core.validation_days,
-            test_days=config.evolution_core.test_days,
-            step_days=config.evolution_core.step_days,
+        core_bundle = self._flat_bundle(config.periods.core_test_end)
+        segments = evolution_adapter.build_core_test_segments(
+            core_bundle.close.index,
+            config.periods.core_test_start,
+            config.periods.core_test_end,
+            config.evolution_core.min_folds,
         )
-        fold_ends = {fold.test_end for fold in folds}
-        for leverage in (0.60, 0.75, 0.90):
+        segment_ends = {segment.test_end for segment in segments}
+        locked_leverage = max(value for value, end in seen if end == config.periods.validation_end)
+        for leverage in (0.60, locked_leverage):
             observed_ends = {end for value, end in seen if value == leverage}
-            self.assertTrue(fold_ends.issubset(observed_ends), leverage)
+            self.assertTrue(segment_ends.issubset(observed_ends), leverage)
+        non_locked = {0.75, 0.90} - {locked_leverage}
+        for leverage in non_locked:
+            self.assertFalse(
+                segment_ends.intersection(end for value, end in seen if value == leverage)
+            )
 
     def test_research_bundle_rejects_holdout_dates_in_any_member(self):
         config = parse_evolution_config(valid_raw_config())
@@ -1501,7 +2148,9 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                         bundle.close, bundle.open_px, bundle.high, bundle.low, bundle.amount, exposure
                     )
 
-                with self.assertRaisesRegex(AssertionError, "Research bundle contains holdout dates"):
+                with self.assertRaisesRegex(
+                    AssertionError, "Selection bundle contains post-selection dates"
+                ):
                     run_evolution(
                         config, data, config_path, None, pd.Timestamp("2026-07-09"), root / "runs",
                         f"late-{late_member}", False, loader, self._run_for_params, "test-commit",
@@ -1561,6 +2210,39 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                         pd.Timestamp(end_date)
                     ),
                     self._eligible_run_for_params, "test-commit",
+                    dry_run=False, promote_shadow=True,
+                    state_path=root / "evolution_state" / "strong_pullback.json",
+                )
+
+            self.assertFalse(
+                (root / "evolution_state" / "strong_pullback.json").exists()
+            )
+
+    def test_shadow_promotion_rejects_effective_loaded_bundle_older_than_raw_max(self):
+        config = self._eligible_config()
+        asof_date = pd.Timestamp("2026-07-09")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "panel.csv"
+            benchmark = root / "benchmark.csv"
+            config_path = root / "config.yaml"
+            pd.DataFrame({"date": [asof_date]}).to_csv(data, index=False)
+            pd.DataFrame({"date": [asof_date], "close": [100.0]}).to_csv(
+                benchmark, index=False
+            )
+            config_path.write_text("evidence", encoding="utf-8")
+
+            def loader(data_path, end_date, benchmark_path, params):
+                effective_end = pd.Timestamp(end_date)
+                if effective_end == asof_date:
+                    effective_end -= pd.offsets.BDay(1)
+                return self._flat_bundle(effective_end)
+
+            with self.assertRaisesRegex(ValueError, "effective loaded.*asof_date"):
+                run_evolution(
+                    config, data, config_path, benchmark, asof_date,
+                    root / "runs", "stale-loaded-bundle", False,
+                    loader, self._eligible_run_for_params, "test-commit",
                     dry_run=False, promote_shadow=True,
                     state_path=root / "evolution_state" / "strong_pullback.json",
                 )
@@ -1740,17 +2422,10 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                     call for call in calls
                     if call[0] <= config.periods.validation_end and call[1] == config.baseline["leverage"]
                 ]
-                fold_count = len(build_trading_folds(
-                    self._flat_bundle(config.periods.validation_end).close.index,
-                    train_days=config.evolution_core.train_days,
-                    validation_days=config.evolution_core.validation_days,
-                    test_days=config.evolution_core.test_days,
-                    step_days=config.evolution_core.step_days,
-                ))
-                self.assertEqual(len(research_baseline_calls), fold_count + 1)
+                self.assertEqual(len(research_baseline_calls), 1)
 
     def test_successful_run_writes_manifest_versioned_artifacts_and_chinese_report(self):
-        config = parse_evolution_config(valid_raw_config())
+        config = self._eligible_config()
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1762,7 +2437,7 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 config, data, config_path, None, pd.Timestamp("2026-07-09"), root / "runs",
                 "successful-run", False,
                 lambda data_path, end_date, benchmark_path, params: self._flat_bundle(pd.Timestamp(end_date)),
-                self._run_for_params, "test-commit",
+                self._eligible_run_for_params, "test-commit",
             )
             run_dir = outcome.run_dir
             manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -2030,7 +2705,7 @@ class EvolutionOrchestrationTest(unittest.TestCase):
 
         def rollback_executor(bundle, params):
             run = self._eligible_run_for_params(bundle, params)
-            if bundle.close.index.max() > config.periods.validation_end:
+            if bundle.close.index.max() > config.periods.core_test_end:
                 daily = 0.0002 if float(params["leverage"]) == config.baseline["leverage"] else -0.0002
                 equity = run.equity.copy()
                 equity["equity"] = 1_000_000.0 * (1.0 + daily) ** pd.RangeIndex(1, len(equity) + 1)
@@ -2095,8 +2770,18 @@ class EvolutionOrchestrationTest(unittest.TestCase):
             )
 
     def test_holdout_warning_preserves_artifacts_but_does_not_publish(self):
-        published_config = parse_evolution_config(valid_raw_config())
+        published_raw = valid_raw_config()
+        published_raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_mean_return_improvement": 0.0,
+        })
+        published_raw["selection"]["min_annualized_return_delta"] = 0.0
+        published_config = parse_evolution_config(published_raw)
         warning_raw = valid_raw_config()
+        warning_raw["evolution_core"].update({
+            "min_filled_trades_per_fold": 1,
+            "min_mean_return_improvement": 0.0,
+        })
         warning_raw["selection"].update({
             "min_annualized_return_delta": 0.0,
             "min_test_days": 1_000,
@@ -2122,7 +2807,7 @@ class EvolutionOrchestrationTest(unittest.TestCase):
                 bundle_loader=lambda data_path, end_date, benchmark_path, params: self._flat_bundle(
                     pd.Timestamp(end_date)
                 ),
-                trial_executor=self._run_for_params,
+                trial_executor=self._eligible_run_for_params,
                 git_commit="test-commit",
             )
             run_evolution(
