@@ -250,6 +250,12 @@ class BacktestEngine:
         self.signal_cache: Optional[pd.DataFrame] = None
         self.universe_cache: Optional[pd.DataFrame] = None
 
+    def _record_execution_constraint_counts(self, counts: dict[str, int]) -> None:
+        for name, count in counts.items():
+            self.execution_constraint_counts[name] = (
+                self.execution_constraint_counts.get(name, 0) + count
+            )
+
     def _generate_signal(self, close: pd.DataFrame, idx: int, trade_dates: pd.Index) -> pd.Series:
         if idx < self.cfg.long_window:
             return pd.Series(dtype=float)
@@ -789,8 +795,7 @@ class BacktestEngine:
                         else None
                     ),
                 )
-                for name, count in counts.items():
-                    self.execution_constraint_counts[name] += count
+                self._record_execution_constraint_counts(counts)
 
             turnover = float((target_to_execute - positions.reindex(close.columns).fillna(0.0)).abs().sum())
             self.turnover_history.append(turnover)

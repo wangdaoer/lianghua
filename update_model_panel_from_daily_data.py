@@ -15,6 +15,7 @@ DEFAULT_BASE_PANEL = Path("data_panel_history_main_chinext_20220101_20260626.csv
 DEFAULT_DAILY_DIR = Path(r"D:\codex\daily-market-data\ths_exports\normalized")
 DEFAULT_OUTPUT = Path("data_panel_history_main_chinext_20220101_latest.csv")
 DEFAULT_PREFIXES = ("000", "001", "002", "003", "300", "301", "600", "601", "603", "605")
+ZERO_PLACEHOLDER_COLUMNS = ("open", "high", "low", "close", "volume", "amount")
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,28 @@ def clean_code(value: object) -> str:
         text = text[:-2]
     digits = "".join(ch for ch in text if ch.isdigit())
     return digits.zfill(6)[-6:] if digits else ""
+
+
+def resolve_base_panel(path: Path) -> Path:
+    if path.exists() or path != DEFAULT_BASE_PANEL:
+        return path
+    prefix = "data_panel_history_main_chinext_20220101_"
+    panels = sorted(
+        candidate
+        for candidate in Path.cwd().glob(f"{prefix}*.csv")
+        if len(candidate.stem.removeprefix(prefix)) == 8
+        and candidate.stem.removeprefix(prefix).isdigit()
+    )
+    return panels[-1] if panels else path
+
+
+def drop_all_zero_placeholders(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [column for column in ZERO_PLACEHOLDER_COLUMNS if column in df.columns]
+    if len(columns) != len(ZERO_PLACEHOLDER_COLUMNS):
+        return df
+    values = df[columns].apply(pd.to_numeric, errors="coerce")
+    mask = values.notna().all(axis=1) & values.eq(0.0).all(axis=1)
+    return df.loc[~mask].copy()
 
 
 def allowed_code(code: str, prefixes: tuple[str, ...]) -> bool:
@@ -235,15 +258,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    base_path = Path(args.base_panel)
+    base_path = resolve_base_panel(Path(args.base_panel))
     daily_dir = Path(args.daily_dir)
     output = Path(args.output)
     prefixes = tuple(x.strip() for x in args.prefixes.split(",") if x.strip())
 
-    base = pd.read_csv(base_path, parse_dates=["date"])
+    base = drop_all_zero_placeholders(pd.read_csv(base_path, parse_dates=["date"]))
     base["symbol"] = base["symbol"].map(clean_code)
     base_cut = base[base["date"] < pd.Timestamp(args.daily_start)].copy()
     daily, summaries = load_daily_panel(daily_dir, args.daily_start, args.daily_end, prefixes)
+    daily = drop_all_zero_placeholders(daily)
     if daily.empty:
         raise ValueError(f"No daily rows loaded from {daily_dir}")
 
