@@ -94,6 +94,19 @@ python run_daily_model_pipeline.py `
 合格行数、覆盖率、固定分桶和训练截止日。该步骤始终标记 `research_only=true`、
 `trade_instruction=false`、`ranking_modified=false`。
 
+两特征短名单已冻结为下一未见时期的预注册研究对象，不能继续调参后沿用同一注册编号。
+配置锁定特征、标签、训练截止日、验收门槛和模型文件 SHA-256；每日排名、仓位和实盘控制
+均保持关闭。验证配置与冻结模型：
+
+```powershell
+python validate_trend_ignition_preregistration.py `
+  --config configs\trend_ignition_shortlist_preregistered.yaml
+```
+
+只有信号日严格晚于 `2025-06-12`、完成至少 500 个一年期结果，并且每个固定分桶和每个
+未见时期都通过预注册门槛的证据 JSON 才可提交复核。届时使用 `--evidence <path>` 校验；
+校验通过仍需人工审查，不能自动晋级。
+
 把已有主库中的通达信表合并到独立历史库时，默认保留源数据。目标库允许保留此前汇总的
 其他历史记录；只有核验本次源库的每一行都已写入目标库，并显式添加 `--delete-source` 时，
 才会删除源库中的通达信行。需要覆盖已有重建库时也必须显式添加 `--overwrite-rebuilt`。
