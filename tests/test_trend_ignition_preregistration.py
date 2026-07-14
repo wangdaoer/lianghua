@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from validate_trend_ignition_preregistration import (
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "trend_ignition_shortlist_preregistered.yaml"
+REJECTED_RESULT = ROOT / "docs" / "research-results" / "trend_ignition_shortlist_20260714_v1.json"
 
 
 def test_checked_in_preregistration_matches_frozen_model():
@@ -83,4 +85,27 @@ def test_unseen_evidence_rejects_training_period_dates():
     }
 
     with pytest.raises(ValueError, match="strictly unseen"):
+        validate_unseen_evidence(evidence, registration)
+
+
+def test_checked_in_unseen_result_remains_rejected_by_locked_gates():
+    registration = load_preregistration(CONFIG)
+    result = json.loads(REJECTED_RESULT.read_text(encoding="utf-8"))
+    evidence = {
+        "registration_id": result["registration_id"],
+        "model_sha256": result["model_sha256"],
+        "signal_start_date": result["signal_start_date"],
+        "completed_samples": result["completed_samples"],
+        "periods": [
+            {
+                "period": "unseen_20250613_20250714",
+                "bucket_counts": result["bucket_counts"],
+                "fixed_bucket_spread": result["fixed_bucket_spread"],
+                "score_label_corr": result["score_label_corr"],
+            }
+        ],
+    }
+
+    assert result["status"] == "rejected"
+    with pytest.raises(ValueError, match="bucket-spread gate"):
         validate_unseen_evidence(evidence, registration)
