@@ -13,6 +13,43 @@
 
 > 说明：本框架为研究用途示例，不构成投资建议；请先在纸面环境复核。
 
+## 本地研究数据库
+
+研究行情、每日候选和通达信历史数据可以汇总到本地 SQLite。默认仅用于研究查询，
+不包含券商、订单或账户操作。构建器会自动选择当前目录中日期最新的历史面板，
+并导入输出目录中最新交易日的 CSV；也可用 `--panel` 和 `--asof-date` 显式固定输入。
+
+```powershell
+python build_research_database.py `
+  --db data/research.sqlite3 `
+  --daily-dir D:\codex\daily-market-data\ths_exports\normalized `
+  --output-dir outputs\high_return_v2 `
+  --tdx-root D:\数据源
+```
+
+通达信历史库可以单独查询：
+
+```powershell
+python query_tdx_history.py `
+  --db data/research.sqlite3 `
+  --tdx-db data/tdx_history.sqlite3 `
+  --market SZ `
+  --symbol 000001
+```
+
+把已有主库中的通达信表合并到独立历史库时，默认保留源数据。目标库允许保留此前汇总的
+其他历史记录；只有核验本次源库的每一行都已写入目标库，并显式添加 `--delete-source` 时，
+才会删除源库中的通达信行。需要覆盖已有重建库时也必须显式添加 `--overwrite-rebuilt`。
+
+通达信归档按内部 `.day` 成员记录断点，重复执行会逐成员跳过已完成文件并继续补齐剩余文件，
+不会因为归档中已有部分数据而跳过整个压缩包。
+
+```powershell
+python migrate_tdx_history.py `
+  --source-db data/research.sqlite3 `
+  --target-db data/tdx_history.sqlite3
+```
+
 ## 每日基准刷新
 
 默认每日入口会在股票面板更新和双轨影子回测之前刷新
