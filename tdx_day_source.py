@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 from zipfile import ZipFile
@@ -34,14 +35,15 @@ def parse_tdx_day_bytes(data: bytes, symbol: str, market: str, asset_type: str, 
     rows = []
     for offset in range(0, len(data), TDX_DAY_RECORD.size):
         date_int, open_i, high_i, low_i, close_i, amount, volume, _reserved = TDX_DAY_RECORD.unpack_from(data, offset)
-        date = pd.to_datetime(str(date_int), format="%Y%m%d", errors="coerce")
-        if pd.isna(date):
+        try:
+            trade_date = date(date_int // 10_000, date_int // 100 % 100, date_int % 100).isoformat()
+        except ValueError:
             continue
         rows.append(
             {
                 "market": market,
                 "symbol": symbol,
-                "date": date.strftime("%Y-%m-%d"),
+                "date": trade_date,
                 "open": open_i / 100.0,
                 "high": high_i / 100.0,
                 "low": low_i / 100.0,

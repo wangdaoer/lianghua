@@ -10,15 +10,32 @@ from research_database import ResearchDatabase
 from tdx_day_source import infer_tdx_archive_specs, iter_tdx_day_archive_member_frames
 
 
-DATE_TOKEN = re.compile(r"(?<!\d)(20\d{6})(?!\d)")
+DATE_TOKEN = re.compile(r"(?<!\d)(20\d{2}-\d{2}-\d{2}|20\d{6})(?!\d)")
 
 
 def extract_date_tokens(path: Path) -> list[str]:
     tokens = []
-    for token in DATE_TOKEN.findall(path.stem):
+    for raw_token in DATE_TOKEN.findall(path.stem):
+        token = raw_token.replace("-", "")
         if not pd.isna(pd.to_datetime(token, format="%Y%m%d", errors="coerce")):
             tokens.append(token)
     return tokens
+
+
+def infer_file_date(path: Path) -> str | None:
+    tokens = extract_date_tokens(path)
+    if not tokens:
+        return None
+    return pd.to_datetime(max(tokens), format="%Y%m%d").strftime("%Y-%m-%d")
+
+
+def normalize_asof_date(value: str) -> str:
+    if re.fullmatch(r"(?:20\d{6}|20\d{2}-\d{2}-\d{2})", value) is None:
+        raise ValueError(f"Invalid as-of date: {value!r}; expected YYYYMMDD or YYYY-MM-DD")
+    token = value.replace("-", "")
+    if pd.isna(pd.to_datetime(token, format="%Y%m%d", errors="coerce")):
+        raise ValueError(f"Invalid as-of date: {value!r}; expected YYYYMMDD or YYYY-MM-DD")
+    return token
 
 
 def discover_latest_panel(root: Path = Path(".")) -> Path | None:
@@ -30,12 +47,15 @@ def discover_latest_panel(root: Path = Path(".")) -> Path | None:
 def select_observation_files(output_dir: Path, asof_date: str | None = None) -> list[Path]:
     candidates = sorted(output_dir.glob("*.csv"))
     dated = [(path, tokens) for path in candidates if (tokens := extract_date_tokens(path))]
+    selected_date = normalize_asof_date(asof_date) if asof_date else None
     if not dated:
         return []
-    selected_date = asof_date or max(max(tokens) for _, tokens in dated)
-    if pd.isna(pd.to_datetime(selected_date, format="%Y%m%d", errors="coerce")):
-        raise ValueError(f"Invalid as-of date: {selected_date!r}; expected YYYYMMDD")
+    selected_date = selected_date or max(max(tokens) for _, tokens in dated)
     return [path for path, tokens in dated if selected_date in tokens]
+
+
+def unresolved_observation_files(output_dir: Path) -> list[Path]:
+    return [path for path in sorted(output_dir.glob("*.csv")) if not extract_date_tokens(path)]
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -52,7 +72,7 @@ def main() -> None:
     parser.add_argument("--skip-panel", action="store_true")
     parser.add_argument("--daily-dir", default="D:/codex/daily-market-data/ths_exports/normalized")
     parser.add_argument("--output-dir", default="outputs/high_return_v2")
-    parser.add_argument("--asof-date", help="Observation date in YYYYMMDD. Defaults to the latest dated output.")
+    parser.add_argument("--asof-date", help="Observation date in YYYYMMDD or YYYY-MM-DD. Defaults to the latest dated output.")
     parser.add_argument("--tdx-root", default="D:/数据源")
     parser.add_argument("--skip-tdx", action="store_true")
     parser.add_argument("--tdx-symbols-from-panel", action="store_true")
@@ -82,24 +102,30 @@ def main() -> None:
         })
         frame = frame.rename(columns=mapping)
         if "date" not in frame.columns:
-            token = next((part for part in path.stem.split("_") if len(part) == 8 and part.isdigit()), None)
-            if token:
-                frame["date"] = pd.to_datetime(token, format="%Y%m%d").strftime("%Y-%m-%d")
+            inferred_date = infer_file_date(path)
+            if inferred_date:
+                frame["date"] = inferred_date
         if {"symbol", "date", "close"}.issubset(frame.columns):
             for column in ("open", "high", "low", "volume", "amount"):
                 if column not in frame.columns:
                     frame[column] = None
             print(f"prices {path.name}: {db.import_prices(frame, str(path))}")
+        else:
+            print(f"prices {path.name}: skipped; symbol/date/close could not be resolved", flush=True)
 
     output_dir = Path(args.output_dir)
+    for path in unresolved_observation_files(output_dir):
+        print(f"observations {path.name}: skipped; filename date could not be resolved", flush=True)
     for path in select_observation_files(output_dir, args.asof_date):
         frame = pd.read_csv(path, low_memory=False)
         if "date" not in frame.columns:
-            token = next((part for part in path.stem.split("_") if len(part) == 8 and part.isdigit()), None)
-            if token:
-                frame["date"] = pd.to_datetime(token, format="%Y%m%d").strftime("%Y-%m-%d")
+            inferred_date = infer_file_date(path)
+            if inferred_date:
+                frame["date"] = inferred_date
         if "date" in frame.columns:
             print(f"observations {path.name}: {db.import_observations(frame, path.stem, str(path))}")
+        else:
+            print(f"observations {path.name}: skipped; date could not be resolved", flush=True)
 
     tdx_symbol_filter = None
     if args.tdx_symbols_from_panel and panel.exists():

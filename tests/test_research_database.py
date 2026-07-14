@@ -85,6 +85,13 @@ def test_parse_tdx_day_bytes_uses_native_cent_scale():
     assert frame.iloc[0]["close"] == 11.24
 
 
+def test_parse_tdx_day_bytes_skips_invalid_calendar_dates():
+    invalid = struct.pack("<iiiiifII", 20260230, 100, 100, 100, 100, 1.0, 1, 0)
+    valid = struct.pack("<iiiiifII", 20260228, 100, 100, 100, 100, 1.0, 1, 0)
+    frame = parse_tdx_day_bytes(invalid + valid, symbol="000001", market="SZ", asset_type="stock", source="sample")
+    assert frame["date"].tolist() == ["2026-02-28"]
+
+
 def test_import_tdx_prices_keeps_market_separate_and_idempotent(tmp_path):
     db = ResearchDatabase(tmp_path / "research.sqlite3")
     frame = pd.DataFrame(
