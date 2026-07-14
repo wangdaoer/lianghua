@@ -16,6 +16,7 @@ from run_daily_model_pipeline import (
     build_daily_run_state,
     ensure_fetch_status_ok,
     execute_pipeline,
+    factor_decay_monitor_status,
     latest_daily_date,
     latest_shadow_account_review,
     metrics_path_for_date,
@@ -68,11 +69,12 @@ class DailyModelPipelineTest(unittest.TestCase):
         self.assertIn("--target-days 20", tracking_args)
 
         self.assertEqual(
-            names[-8:],
+            names[-9:],
             [
                 "personal_overlay",
                 "early_pattern_watchlist",
                 "hidden_accumulation_tracking",
+                "factor_decay_monitor",
                 "daily_chinese_report",
                 "merged_daily_outputs",
                 "strategy_family_forward_report",
@@ -80,13 +82,17 @@ class DailyModelPipelineTest(unittest.TestCase):
                 "research_database_sync",
             ],
         )
-        watch_step = steps[-7]
+        watch_step = steps[-8]
         watch_args = " ".join(str(part) for part in watch_step.command)
         self.assertIn("early_pattern_watchlist.py", watch_args)
-        tracking_step = steps[-6]
+        tracking_step = steps[-7]
         tracking_args = " ".join(str(part) for part in tracking_step.command)
         self.assertIn("track_hidden_accumulation_watch.py", tracking_args)
         self.assertIn("hidden_accumulation_trade_watch_tracking_20260629.csv", tracking_args)
+        monitor_step = steps[-6]
+        monitor_args = " ".join(str(part) for part in monitor_step.command)
+        self.assertIn("monitor_factor_decay.py", monitor_args)
+        self.assertIn("data_panel_history_main_chinext_20220101_20260629.csv", monitor_args)
         report_step = steps[-5]
         report_args = " ".join(str(part) for part in report_step.command)
         self.assertIn("build_daily_personal_overlay_report.py", report_args)
@@ -124,10 +130,46 @@ class DailyModelPipelineTest(unittest.TestCase):
         names = [step.name for step in build_daily_pipeline_steps(config)]
         self.assertNotIn("research_database_sync", names)
 
+    def test_pipeline_can_skip_factor_decay_monitor(self):
+        config = PipelineConfig(
+            asof_date="2026-06-29",
+            python_exe="python",
+            project_root=Path("C:/model"),
+            include_factor_decay_monitor=False,
+        )
+        names = [step.name for step in build_daily_pipeline_steps(config)]
+        self.assertNotIn("factor_decay_monitor", names)
+
     def test_parse_args_accepts_skip_research_database_sync_flag(self):
         with patch.object(sys, "argv", ["run_daily_model_pipeline.py", "--skip-research-db-sync"]):
             args = parse_args()
         self.assertTrue(args.skip_research_db_sync)
+
+    def test_parse_args_accepts_skip_factor_decay_monitor_flag(self):
+        with patch.object(sys, "argv", ["run_daily_model_pipeline.py", "--skip-factor-decay-monitor"]):
+            args = parse_args()
+        self.assertTrue(args.skip_factor_decay_monitor)
+
+    def test_factor_decay_status_preserves_observation_only_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "factor_decay_monitor_20260629.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "asof_date": "2026-06-29",
+                        "factor": "liquidity_stability_20",
+                        "overall_status": "direction_reversal",
+                        "automatic_model_change": False,
+                        "research_only": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            status = factor_decay_monitor_status(path, "2026-06-29")
+
+            self.assertEqual(status["status"], "direction_reversal")
+            self.assertFalse(status["automatic_model_change"])
 
     def test_pipeline_passes_latest_shadow_account_review_when_available(self):
         with tempfile.TemporaryDirectory() as tmp:
