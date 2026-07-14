@@ -75,8 +75,16 @@ class PipelineConfig:
     include_regime_shadow_compare: bool = True
     include_regime_shadow_tracking: bool = True
     include_research_db_sync: bool = True
+    include_trend_ignition_shadow: bool = False
     regime_shadow_config: Path = Path("configs/evolution_strong_pullback.yaml")
     regime_shadow_candidate_id: str = "regime_090_balanced"
+    trend_ignition_scorer: Path = Path(
+        "outputs/trend_ignition_training/scorer_v3_shortlist_exploratory/binned_scorer.json"
+    )
+    trend_ignition_scorer_summary: Path = Path(
+        "outputs/trend_ignition_training/scorer_v3_shortlist_exploratory/scorer_summary.json"
+    )
+    trend_ignition_selection_status: str = "exploratory_posthoc"
 
 
 def _date_token(asof_date: str) -> str:
@@ -214,6 +222,44 @@ def _research_database_sync_state(
     if _date_token(str(status.get("asof_date", ""))) != _date_token(config.asof_date):
         return {"status": "stale", "recorded_asof_date": status.get("asof_date")}, None
     return status, str(_latest_artifact(status_path))
+
+
+def _trend_ignition_shadow_state(
+    config: PipelineConfig,
+    steps: list[PipelineStep],
+    paths: dict[str, Path],
+    run_status: str,
+    failure: dict[str, object] | None,
+) -> tuple[dict[str, object], str | None]:
+    if not config.include_trend_ignition_shadow:
+        return {"status": "skipped"}, None
+    step_names = [step.name for step in steps]
+    shadow_step = "trend_ignition_shadow"
+    if run_status == "failed" and shadow_step in step_names and isinstance(failure, dict):
+        failed_step = failure.get("step")
+        if isinstance(failed_step, str) and failed_step in step_names:
+            if step_names.index(failed_step) < step_names.index(shadow_step):
+                return {"status": "not_run"}, None
+            if failed_step == shadow_step:
+                return {"status": "failed"}, None
+
+    manifest_path = paths["trend_ignition_shadow_manifest"]
+    if not manifest_path.exists():
+        return {"status": "missing"}, None
+    manifest = _read_json_object(manifest_path)
+    inputs = manifest.get("inputs")
+    if not isinstance(inputs, dict):
+        return {"status": "invalid_manifest"}, None
+    if inputs.get("start") != config.asof_date or inputs.get("end") != config.asof_date:
+        return {
+            "status": "stale",
+            "recorded_start": inputs.get("start"),
+            "recorded_end": inputs.get("end"),
+        }, None
+    if manifest.get("research_only") is not True or manifest.get("trade_instruction") is not False:
+        return {"status": "invalid_research_boundary"}, None
+    manifest["status"] = "complete"
+    return manifest, str(_latest_artifact(manifest_path))
 
 
 def _jsonable(value: object) -> object:
@@ -377,6 +423,16 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "benchmark_refresh_status": output_root / f"benchmark_refresh_status_{token}.json",
         "research_db": _resolve(root, config.research_db),
         "research_database_sync_status": output_root / f"research_database_sync_{token}.json",
+        "trend_ignition_scorer": _resolve(root, config.trend_ignition_scorer),
+        "trend_ignition_scorer_summary": _resolve(root, config.trend_ignition_scorer_summary),
+        "trend_ignition_shadow_dir": output_root / f"trend_ignition_shadow_{token}",
+        "trend_ignition_shadow_manifest": output_root / f"trend_ignition_shadow_{token}" / "manifest.json",
+        "trend_ignition_shadow_scores": output_root
+        / f"trend_ignition_shadow_{token}"
+        / "trend_ignition_shadow_scores.csv",
+        "trend_ignition_shadow_report": output_root
+        / f"trend_ignition_shadow_{token}"
+        / "trend_ignition_shadow_report.md",
     }
 
 
@@ -691,6 +747,34 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
             ),
         )
     )
+    if config.include_trend_ignition_shadow:
+        steps.append(
+            PipelineStep(
+                "trend_ignition_shadow",
+                (
+                    config.python_exe,
+                    str(config.project_root / "score_trend_ignition_shadow.py"),
+                    "--data",
+                    str(paths["panel"]),
+                    "--watchlist-dir",
+                    str(paths["output_root"]),
+                    "--scorer",
+                    str(paths["trend_ignition_scorer"]),
+                    "--scorer-summary",
+                    str(paths["trend_ignition_scorer_summary"]),
+                    "--output-dir",
+                    str(paths["trend_ignition_shadow_dir"]),
+                    "--start",
+                    config.asof_date,
+                    "--end",
+                    config.asof_date,
+                    "--selection-status",
+                    config.trend_ignition_selection_status,
+                    "--max-abs-daily-return",
+                    str(config.max_abs_daily_return),
+                ),
+            )
+        )
     if config.include_strategy_family_forward_report:
         steps.append(
             PipelineStep(
@@ -867,6 +951,15 @@ def build_daily_run_state(
         run_status,
         failure,
     )
+    trend_ignition_shadow, trend_ignition_shadow_manifest_artifact = (
+        _trend_ignition_shadow_state(config, steps, paths, run_status, failure)
+    )
+    trend_ignition_coverage = trend_ignition_shadow.get("coverage")
+    if not isinstance(trend_ignition_coverage, dict):
+        trend_ignition_coverage = {}
+    trend_ignition_scorer = trend_ignition_shadow.get("scorer")
+    if not isinstance(trend_ignition_scorer, dict):
+        trend_ignition_scorer = {}
     factor_decay = factor_decay_monitor_status(
         paths["factor_decay_monitor_json"],
         config.asof_date,
@@ -934,6 +1027,24 @@ def build_daily_run_state(
             "research_database_asof_rows": research_database_sync.get("database_asof_rows"),
             "research_database_daily_rows": research_database_sync.get("database_daily_rows"),
             "research_database_observation_rows": research_database_sync.get("database_observation_rows"),
+            "trend_ignition_shadow_status": trend_ignition_shadow.get("status"),
+            "trend_ignition_shadow_source_rows": trend_ignition_coverage.get("source_rows"),
+            "trend_ignition_shadow_eligible_rows": trend_ignition_coverage.get("eligible_rows"),
+            "trend_ignition_shadow_eligibility_ratio": trend_ignition_coverage.get(
+                "eligibility_ratio"
+            ),
+            "trend_ignition_shadow_bucket_counts": trend_ignition_coverage.get(
+                "score_bucket_counts"
+            ),
+            "trend_ignition_shadow_training_end_date": trend_ignition_scorer.get(
+                "training_end_date"
+            ),
+            "trend_ignition_shadow_selection_status": trend_ignition_scorer.get(
+                "selection_status"
+            ),
+            "trend_ignition_shadow_research_gate_passed": trend_ignition_scorer.get(
+                "passes_research_gate"
+            ),
             "factor_decay_monitor": factor_decay,
         },
         "top10": _top_rows(priority_rows, ["symbol", "stock_name", "strategy_family", "priority_bucket"]),
@@ -984,6 +1095,19 @@ def build_daily_run_state(
             ),
             "research_database": str(paths["research_db"]) if config.include_research_db_sync else None,
             "research_database_sync_status": research_database_sync_artifact,
+            "trend_ignition_shadow_manifest": trend_ignition_shadow_manifest_artifact,
+            "trend_ignition_shadow_scores": (
+                str(_latest_artifact(paths["trend_ignition_shadow_scores"]))
+                if trend_ignition_shadow.get("status") == "complete"
+                and paths["trend_ignition_shadow_scores"].exists()
+                else None
+            ),
+            "trend_ignition_shadow_report": (
+                str(_latest_artifact(paths["trend_ignition_shadow_report"]))
+                if trend_ignition_shadow.get("status") == "complete"
+                and paths["trend_ignition_shadow_report"].exists()
+                else None
+            ),
         },
     }
 
@@ -1088,8 +1212,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-regime-shadow-compare", action="store_true")
     parser.add_argument("--skip-regime-shadow-tracking", action="store_true")
     parser.add_argument("--skip-research-db-sync", action="store_true")
+    parser.add_argument("--enable-trend-ignition-shadow", action="store_true")
     parser.add_argument("--regime-shadow-config", default="configs/evolution_strong_pullback.yaml")
     parser.add_argument("--regime-shadow-candidate-id", default="regime_090_balanced")
+    parser.add_argument(
+        "--trend-ignition-scorer",
+        default="outputs/trend_ignition_training/scorer_v3_shortlist_exploratory/binned_scorer.json",
+    )
+    parser.add_argument(
+        "--trend-ignition-scorer-summary",
+        default="outputs/trend_ignition_training/scorer_v3_shortlist_exploratory/scorer_summary.json",
+    )
+    parser.add_argument(
+        "--trend-ignition-selection-status",
+        choices=("preregistered", "exploratory_posthoc"),
+        default="exploratory_posthoc",
+    )
     parser.add_argument("--state-log", default="daily_run_state.jsonl")
     parser.add_argument("--state-test-status", default="not_run_by_pipeline")
     parser.add_argument("--skip-state-log", action="store_true")
@@ -1132,8 +1270,12 @@ def main() -> None:
         include_regime_shadow_compare=not args.skip_regime_shadow_compare,
         include_regime_shadow_tracking=not args.skip_regime_shadow_tracking,
         include_research_db_sync=not args.skip_research_db_sync,
+        include_trend_ignition_shadow=args.enable_trend_ignition_shadow,
         regime_shadow_config=Path(args.regime_shadow_config),
         regime_shadow_candidate_id=args.regime_shadow_candidate_id,
+        trend_ignition_scorer=Path(args.trend_ignition_scorer),
+        trend_ignition_scorer_summary=Path(args.trend_ignition_scorer_summary),
+        trend_ignition_selection_status=args.trend_ignition_selection_status,
     )
     fetch_status = fetch_status_summary(config.fetch_status_utils)
     print("Daily market data fetch status:")
@@ -1163,6 +1305,9 @@ def main() -> None:
     print(output_root / f"merged_state_pattern_scan_{token}.csv")
     print(output_root / f"merged_model_decision_table_{token}.csv")
     print(output_root / f"merged_priority_watchlist_{token}.csv")
+    if config.include_trend_ignition_shadow:
+        print(output_root / f"trend_ignition_shadow_{token}" / "trend_ignition_shadow_report.md")
+        print(output_root / f"trend_ignition_shadow_{token}" / "manifest.json")
     if config.include_strategy_family_forward_report:
         print(output_root / f"strategy_family_forward_report_{token}.md")
     if config.include_strategy_stability_report:

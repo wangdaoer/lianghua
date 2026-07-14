@@ -77,6 +77,23 @@ python train_trend_ignition_scorer.py `
 每日选股或实盘。逐特征结果保存在 `walk_forward_feature_diagnostics*.csv`；使用
 `--feature-columns` 运行的事后短名单仍应标记为探索性，等待新的未见数据验证。
 
+冻结评分器可在不改变原观察清单和排序的前提下做影子记录。工具只保留当日满足原始
+起爆合同的观察行，强制要求观察日期晚于训练截止日，并把固定训练阈值、研究门槛和
+`exploratory_posthoc` 身份写入产物。每日流水线默认不启用；当前未见样本不足以授权
+自动接入排序。
+
+```powershell
+python run_daily_model_pipeline.py `
+  --asof-date 2026-07-14 `
+  --enable-trend-ignition-shadow `
+  --trend-ignition-scorer outputs\trend_ignition_training\scorer_v3_shortlist_exploratory\binned_scorer.json `
+  --trend-ignition-scorer-summary outputs\trend_ignition_training\scorer_v3_shortlist_exploratory\scorer_summary.json
+```
+
+影子结果写入 `outputs/high_return_v2/trend_ignition_shadow_<YYYYMMDD>`，每日运行卡记录
+合格行数、覆盖率、固定分桶和训练截止日。该步骤始终标记 `research_only=true`、
+`trade_instruction=false`、`ranking_modified=false`。
+
 把已有主库中的通达信表合并到独立历史库时，默认保留源数据。目标库允许保留此前汇总的
 其他历史记录；只有核验本次源库的每一行都已写入目标库，并显式添加 `--delete-source` 时，
 才会删除源库中的通达信行。需要覆盖已有重建库时也必须显式添加 `--overwrite-rebuilt`。
