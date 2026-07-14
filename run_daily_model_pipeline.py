@@ -68,6 +68,7 @@ class PipelineConfig:
     market_risk_off_drawdown_20d: float = -0.08
     market_crash_exposure: float = 0.0
     allowed_trend_states: str = DEFAULT_ALLOWED_TREND_STATES
+    include_factor_decay_monitor: bool = True
     include_strategy_stability_report: bool = True
     include_strategy_family_forward_report: bool = True
     include_benchmark_refresh: bool = True
@@ -108,6 +109,37 @@ def _read_json_object(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"Expected JSON object: {path}")
     return value
+
+
+def factor_decay_monitor_status(
+    path: Path,
+    expected_asof_date: str,
+    *,
+    enabled: bool = True,
+) -> dict[str, object]:
+    if not enabled:
+        return {"status": "skipped", "path": None}
+    if not path.exists():
+        return {"status": "missing", "path": None}
+    try:
+        payload = _read_json_object(path)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        return {"status": "invalid", "path": str(path), "message": str(exc)}
+    asof_date = str(payload.get("asof_date") or "")
+    if _date_token(asof_date) != _date_token(expected_asof_date):
+        return {
+            "status": "stale",
+            "path": str(path),
+            "asof_date": asof_date or None,
+        }
+    return {
+        "status": payload.get("overall_status", "unknown"),
+        "path": str(path),
+        "asof_date": asof_date,
+        "factor": payload.get("factor"),
+        "automatic_model_change": payload.get("automatic_model_change", False),
+        "research_only": payload.get("research_only", True),
+    }
 
 
 def _value_counts(rows: list[dict[str, str]], column: str) -> dict[str, int]:
@@ -315,6 +347,11 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "overlay_candidates": output_root / f"rank_model_candidates_trend_gated_personal_overlay_{token}.csv",
         "early_watchlist": output_root / f"early_pattern_watchlist_{token}.csv",
         "hidden_accumulation_tracking": output_root / f"hidden_accumulation_trade_watch_tracking_{token}.csv",
+        "factor_decay_monitor_csv": output_root / f"factor_decay_monitor_{token}.csv",
+        "factor_decay_monitor_json": output_root / f"factor_decay_monitor_{token}.json",
+        "factor_decay_monitor_report": output_root / f"factor_decay_monitor_{token}.md",
+        "factor_decay_observation": output_root / f"liquidity_stability_observation_{token}.csv",
+        "factor_decay_history": output_root / "factor_decay_monitor_history.csv",
         "merged_state_pattern_scan": output_root / f"merged_state_pattern_scan_{token}.csv",
         "merged_model_decision_table": output_root / f"merged_model_decision_table_{token}.csv",
         "merged_priority_watchlist": output_root / f"merged_priority_watchlist_{token}.csv",
@@ -581,6 +618,23 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
         )
     )
 
+    if config.include_factor_decay_monitor:
+        steps.append(
+            PipelineStep(
+                "factor_decay_monitor",
+                (
+                    config.python_exe,
+                    str(config.project_root / "monitor_factor_decay.py"),
+                    "--data",
+                    str(paths["panel"]),
+                    "--asof-date",
+                    config.asof_date,
+                    "--output-dir",
+                    str(paths["output_root"]),
+                ),
+            )
+        )
+
     steps.append(
         PipelineStep(
             "daily_chinese_report",
@@ -813,6 +867,11 @@ def build_daily_run_state(
         run_status,
         failure,
     )
+    factor_decay = factor_decay_monitor_status(
+        paths["factor_decay_monitor_json"],
+        config.asof_date,
+        enabled=config.include_factor_decay_monitor,
+    )
     regime_delta = regime_shadow.get("delta")
     if not isinstance(regime_delta, dict):
         regime_delta = {}
@@ -875,6 +934,7 @@ def build_daily_run_state(
             "research_database_asof_rows": research_database_sync.get("database_asof_rows"),
             "research_database_daily_rows": research_database_sync.get("database_daily_rows"),
             "research_database_observation_rows": research_database_sync.get("database_observation_rows"),
+            "factor_decay_monitor": factor_decay,
         },
         "top10": _top_rows(priority_rows, ["symbol", "stock_name", "strategy_family", "priority_bucket"]),
         "artifacts": {
@@ -885,6 +945,27 @@ def build_daily_run_state(
             "changes": str(changes_path),
             "early_watchlist": str(early_path),
             "hidden_accumulation_tracking": str(hidden_tracking_path),
+            "factor_decay_monitor_csv": (
+                str(_latest_artifact(paths["factor_decay_monitor_csv"]))
+                if paths["factor_decay_monitor_csv"].exists()
+                else None
+            ),
+            "factor_decay_monitor_json": factor_decay.get("path"),
+            "factor_decay_monitor_report": (
+                str(_latest_artifact(paths["factor_decay_monitor_report"]))
+                if paths["factor_decay_monitor_report"].exists()
+                else None
+            ),
+            "factor_decay_observation": (
+                str(_latest_artifact(paths["factor_decay_observation"]))
+                if paths["factor_decay_observation"].exists()
+                else None
+            ),
+            "factor_decay_history": (
+                str(paths["factor_decay_history"])
+                if paths["factor_decay_history"].exists()
+                else None
+            ),
             "model_decision": str(model_path),
             "strategy_family_forward_report": str(_latest_artifact(paths["strategy_family_forward_report"])),
             "strategy_family_forward_summary": str(strategy_family_summary_path),
@@ -1000,6 +1081,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbol-history", default=None)
     parser.add_argument("--shadow-account-review", default=None)
     parser.add_argument("--skip-train", action="store_true")
+    parser.add_argument("--skip-factor-decay-monitor", action="store_true")
     parser.add_argument("--skip-strategy-family-forward", action="store_true")
     parser.add_argument("--skip-strategy-stability", action="store_true")
     parser.add_argument("--skip-benchmark-refresh", action="store_true")
@@ -1043,6 +1125,7 @@ def main() -> None:
         symbol_history=symbol_history,
         shadow_account_review=shadow_account_review,
         train_model=not args.skip_train,
+        include_factor_decay_monitor=not args.skip_factor_decay_monitor,
         include_strategy_family_forward_report=not args.skip_strategy_family_forward,
         include_strategy_stability_report=not args.skip_strategy_stability,
         include_benchmark_refresh=not args.skip_benchmark_refresh,
@@ -1075,6 +1158,8 @@ def main() -> None:
     print(output_root / f"daily_personal_overlay_selected_{token}.csv")
     print(output_root / f"daily_personal_overlay_changes_{token}.csv")
     print(output_root / f"hidden_accumulation_trade_watch_tracking_{token}.csv")
+    if config.include_factor_decay_monitor:
+        print(output_root / f"factor_decay_monitor_{token}.md")
     print(output_root / f"merged_state_pattern_scan_{token}.csv")
     print(output_root / f"merged_model_decision_table_{token}.csv")
     print(output_root / f"merged_priority_watchlist_{token}.csv")
