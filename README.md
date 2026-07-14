@@ -13,6 +13,30 @@
 
 > 说明：本框架为研究用途示例，不构成投资建议；请先在纸面环境复核。
 
+## 路径配置
+
+仓库默认只使用相对目录。不同机器的数据位置通过环境变量配置，命令行显式参数仍有
+最高优先级：
+
+| 环境变量 | 用途 | 仓库内默认值 |
+| --- | --- | --- |
+| `QUANT_DATA_ROOT` | 每日行情、快照和基准 | `external_data/daily-market-data` |
+| `QUANT_FALLBACK_ROOT` | 备用抓取与状态工具 | `external_data/exchange-data-ingest` |
+| `QUANT_STOCK_DATA_ROOT` | 个股历史与市值文件 | `external_data/stock-data` |
+| `QUANT_TDX_ROOT` | 通达信历史目录 | `external_data/tdx` |
+| `QUANT_DASHBOARD_ROOT` | Dashboard 项目目录 | `external_data/stock-analysis-dashboard` |
+| `QUANT_PERSONAL_TRADES_FILE` | 个人成交记录 | `inputs/personal_trades.xls` |
+
+当前机器可在 PowerShell 用户环境中设置，例如：
+
+```powershell
+[Environment]::SetEnvironmentVariable("QUANT_DATA_ROOT", (Join-Path $HOME "quant-data"), "User")
+[Environment]::SetEnvironmentVariable("QUANT_FALLBACK_ROOT", (Join-Path $HOME "exchange-data-ingest"), "User")
+```
+
+配置用途与状态见 [`configs/README.md`](configs/README.md)。设计决策和修复记录见
+[`docs/superpowers`](docs/superpowers) 与 [`.superpowers/sdd`](.superpowers/sdd)。
+
 ## 本地研究数据库
 
 研究行情、每日候选和通达信历史数据可以汇总到本地 SQLite。默认仅用于研究查询，
@@ -22,9 +46,9 @@
 ```powershell
 python build_research_database.py `
   --db data/research.sqlite3 `
-  --daily-dir D:\codex\daily-market-data\ths_exports\normalized `
+  --daily-dir "$env:QUANT_DATA_ROOT\ths_exports\normalized" `
   --output-dir outputs\high_return_v2 `
-  --tdx-root D:\数据源
+  --tdx-root $env:QUANT_TDX_ROOT
 ```
 
 通达信历史库可以单独查询：
@@ -123,7 +147,7 @@ python migrate_tdx_history.py `
 ## 每日基准刷新
 
 默认每日入口会在股票面板更新和双轨影子回测之前刷新
-`D:\codex\daily-market-data\benchmarks\510300.csv`。刷新器使用新浪实时行情、
+`$env:QUANT_DATA_ROOT\benchmarks\510300.csv`。刷新器使用新浪实时行情、
 搜狐历史行情和 Yahoo 日线交叉核验日期、OHLC 与成交量，验证通过后才以原子替换方式写入；
 任一来源冲突或缺少目标交易日都会终止流水线，不会继续生成当日风险档位。
 
@@ -149,7 +173,7 @@ python run_daily_model_pipeline.py --asof-date 2026-07-13
 python run_strong_pullback_evolution.py `
   --config configs/evolution_strong_pullback.yaml `
   --data data_panel_history_main_chinext_20220101_20260710.csv `
-  --benchmark D:\codex\daily-market-data\benchmarks\510300.csv `
+  --benchmark "$env:QUANT_DATA_ROOT\benchmarks\510300.csv" `
   --asof-date 2026-07-10 `
   --dry-run
 ```
@@ -162,7 +186,7 @@ python run_strong_pullback_evolution.py `
 python run_strong_pullback_evolution.py `
   --config configs/evolution_strong_pullback.yaml `
   --data data_panel_history_main_chinext_20220101_20260710.csv `
-  --benchmark D:\codex\daily-market-data\benchmarks\510300.csv `
+  --benchmark "$env:QUANT_DATA_ROOT\benchmarks\510300.csv" `
   --asof-date 2026-07-10 `
   --no-dry-run `
   --promote-shadow

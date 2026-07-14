@@ -10,14 +10,15 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from daily_run_card import write_daily_run_card
+from workspace_paths import daily_data_root, fallback_data_root, resolve_workspace_path
 
 
-DEFAULT_DAILY_DATA_DIR = Path(r"D:\codex\daily-market-data")
-DEFAULT_FALLBACK_DATA_DIR = Path(r"D:\codex\2026-06-15-exchange-data-ingest")
+DEFAULT_DAILY_DATA_DIR = daily_data_root()
+DEFAULT_FALLBACK_DATA_DIR = fallback_data_root()
 DEFAULT_DAILY_NORMALIZED_DIR = DEFAULT_DAILY_DATA_DIR / "ths_exports" / "normalized"
 DEFAULT_FETCH_STATUS_UTILS = DEFAULT_FALLBACK_DATA_DIR / "scripts" / "market_data_utils.py"
 DEFAULT_BENCHMARK = DEFAULT_DAILY_DATA_DIR / "benchmarks" / "510300.csv"
@@ -43,7 +44,7 @@ class PipelineConfig:
     python_exe: str = sys.executable
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parent)
     output_root: Path = Path("outputs/high_return_v2")
-    base_panel: Path = Path("data_panel_history_main_chinext_20220101_20260626.csv")
+    base_panel: Path = Path("data/base_panel.csv")
     daily_dir: Path = DEFAULT_DAILY_NORMALIZED_DIR
     daily_data_dir: Path = DEFAULT_DAILY_DATA_DIR
     fallback_data_dir: Path = DEFAULT_FALLBACK_DATA_DIR
@@ -92,7 +93,51 @@ def _date_token(asof_date: str) -> str:
 
 
 def _resolve(root: Path, path: Path) -> Path:
-    return path if path.is_absolute() else root / path
+    return resolve_workspace_path(root, path)
+
+
+def panel_end_date(path: Path) -> str | None:
+    match = re.fullmatch(r"data_panel_history_main_chinext_\d{8}_(\d{8})\.csv", path.name)
+    if not match:
+        return None
+    return datetime.strptime(match.group(1), "%Y%m%d").strftime("%Y-%m-%d")
+
+
+def discover_base_panel(project_root: Path, asof_date: str) -> Path:
+    target_token = _date_token(asof_date)
+    candidates: list[tuple[str, Path]] = []
+    for path in project_root.glob("data_panel_history_main_chinext_*.csv"):
+        end_date = panel_end_date(path)
+        if end_date is None:
+            continue
+        token = _date_token(end_date)
+        if token < target_token:
+            candidates.append((token, path))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No base panel ending before {asof_date} was found under {project_root}. "
+            "Provide --base-panel explicitly."
+        )
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def effective_daily_start(config: PipelineConfig) -> str:
+    configured = datetime.strptime(config.daily_start, "%Y-%m-%d")
+    base_end = panel_end_date(config.base_panel)
+    if base_end is None:
+        return config.daily_start
+    next_session_floor = datetime.strptime(base_end, "%Y-%m-%d") + timedelta(days=1)
+    return max(configured, next_session_floor).strftime("%Y-%m-%d")
+
+
+def default_stability_inputs_available(project_root: Path) -> bool:
+    from summarize_core_risk_filter_stability import DEFAULT_SCHEMES
+
+    for _label, path_text in DEFAULT_SCHEMES:
+        scheme = _resolve(project_root, Path(path_text))
+        if not (scheme / "metrics.json").exists() or not (scheme / "equity_curve.csv").exists():
+            return False
+    return True
 
 
 def _latest_artifact(path: Path) -> Path:
@@ -379,11 +424,17 @@ def metrics_path_for_date(asof_date: str, output_root: Path) -> Path:
 def _paths(config: PipelineConfig) -> dict[str, Path]:
     root = config.project_root
     output_root = _resolve(root, config.output_root)
+    daily_dir = _resolve(root, config.daily_dir)
+    daily_data_dir = _resolve(root, config.daily_data_dir)
     token = _date_token(config.asof_date)
     model_dir = output_root / f"next_open_rank_model_stock_focus_lev093_marketfilter_bench{token}_20220101_{token}"
     return {
         "base_panel": _resolve(root, config.base_panel),
-        "daily_dir": config.daily_dir,
+        "daily_dir": daily_dir,
+        "daily_data_dir": daily_data_dir,
+        "fallback_data_dir": _resolve(root, config.fallback_data_dir),
+        "fetch_status_utils": _resolve(root, config.fetch_status_utils),
+        "benchmark": _resolve(root, config.benchmark),
         "output_root": output_root,
         "panel": root / f"data_panel_history_main_chinext_20220101_{token}.csv",
         "trend_dir": output_root / f"trend_state_{token}",
@@ -410,7 +461,7 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "selected": output_root / f"daily_personal_overlay_selected_{token}.csv",
         "changes": output_root / f"daily_personal_overlay_changes_{token}.csv",
         "metrics": metrics_path_for_date(config.asof_date, output_root),
-        "names_source": names_source_for_date(config.asof_date, config.daily_data_dir),
+        "names_source": names_source_for_date(config.asof_date, daily_data_dir),
         "rules": _resolve(root, config.rules),
         "strategy_stability_prefix": output_root / f"core_risk_filter_finalist_stability_{token}",
         "strategy_stability_report": output_root / f"core_risk_filter_finalist_stability_{token}.md",
@@ -452,7 +503,7 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                     config.python_exe,
                     str(config.project_root / "update_benchmark_510300.py"),
                     "--benchmark",
-                    str(config.benchmark),
+                    str(paths["benchmark"]),
                     "--asof-date",
                     config.asof_date,
                     "--status-output",
@@ -471,7 +522,7 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                 "--daily-dir",
                 str(paths["daily_dir"]),
                 "--daily-start",
-                config.daily_start,
+                effective_daily_start(config),
                 "--daily-end",
                 config.asof_date,
                 "--output",
@@ -506,7 +557,7 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                     "--data",
                     str(paths["panel"]),
                     "--benchmark",
-                    str(config.benchmark),
+                    str(paths["benchmark"]),
                     "--output-dir",
                     str(paths["regime_shadow_dir"]),
                     "--asof-date",
@@ -562,7 +613,7 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                     "--leverage",
                     str(config.leverage),
                     "--benchmark",
-                    str(config.benchmark),
+                    str(paths["benchmark"]),
                     "--market-ma-window",
                     str(config.market_ma_window),
                     "--market-below-ma-exposure",
@@ -714,11 +765,11 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                 "--names-source",
                 str(paths["names_source"]),
                 "--daily-data-dir",
-                str(config.daily_data_dir),
+                str(paths["daily_data_dir"]),
                 "--fallback-data-dir",
-                str(config.fallback_data_dir),
+                str(paths["fallback_data_dir"]),
                 "--fetch-status-utils",
-                str(config.fetch_status_utils),
+                str(paths["fetch_status_utils"]),
                 *shadow_args,
             ),
         )
@@ -982,7 +1033,7 @@ def build_daily_run_state(
         "run_type": "full_train" if config.train_model else "skip_train",
         "data_source": str(paths["names_source"]),
         "data_source_exists": paths["names_source"].exists(),
-        "fallback_fetch_status": fetch_status_summary(config.fetch_status_utils),
+        "fallback_fetch_status": fetch_status_summary(paths["fetch_status_utils"]),
         "argv": argv or [],
         "steps": [step.name for step in steps],
         "commands": [" ".join(step.command) for step in steps],
@@ -1192,12 +1243,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asof-date", default=None)
     parser.add_argument("--project-root", default=str(Path(__file__).resolve().parent))
     parser.add_argument("--python", dest="python_exe", default=sys.executable)
-    parser.add_argument("--base-panel", default="data_panel_history_main_chinext_20220101_20260626.csv")
+    parser.add_argument(
+        "--base-panel",
+        default=None,
+        help="Base panel path. Defaults to the newest panel ending before --asof-date.",
+    )
     parser.add_argument("--daily-dir", default=str(DEFAULT_DAILY_NORMALIZED_DIR))
     parser.add_argument("--daily-data-dir", default=str(DEFAULT_DAILY_DATA_DIR))
     parser.add_argument("--fallback-data-dir", default=str(DEFAULT_FALLBACK_DATA_DIR))
     parser.add_argument("--fetch-status-utils", default=str(DEFAULT_FETCH_STATUS_UTILS))
-    parser.add_argument("--daily-start", default="2026-06-22")
+    parser.add_argument("--daily-start", default="2000-01-01")
     parser.add_argument("--output-root", default="outputs/high_return_v2")
     parser.add_argument("--benchmark", default=str(DEFAULT_BENCHMARK))
     parser.add_argument("--research-db", default="data/research.sqlite3")
@@ -1208,6 +1263,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-factor-decay-monitor", action="store_true")
     parser.add_argument("--skip-strategy-family-forward", action="store_true")
     parser.add_argument("--skip-strategy-stability", action="store_true")
+    parser.add_argument("--enable-strategy-stability", action="store_true")
     parser.add_argument("--skip-benchmark-refresh", action="store_true")
     parser.add_argument("--skip-regime-shadow-compare", action="store_true")
     parser.add_argument("--skip-regime-shadow-tracking", action="store_true")
@@ -1237,21 +1293,43 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    project_root = Path(args.project_root)
-    daily_dir = Path(args.daily_dir)
+    project_root = Path(args.project_root).resolve()
+    daily_dir = _resolve(project_root, Path(args.daily_dir))
     asof_date = args.asof_date or discover_latest_daily_date(daily_dir)
-    symbol_history = Path(args.symbol_history) if args.symbol_history else latest_symbol_history(project_root)
+    base_panel = (
+        _resolve(project_root, Path(args.base_panel))
+        if args.base_panel
+        else discover_base_panel(project_root, asof_date)
+    )
+    symbol_history = (
+        _resolve(project_root, Path(args.symbol_history))
+        if args.symbol_history
+        else latest_symbol_history(project_root)
+    )
     shadow_account_review = (
-        Path(args.shadow_account_review)
+        _resolve(project_root, Path(args.shadow_account_review))
         if args.shadow_account_review
         else latest_shadow_account_review(project_root, asof_date)
     )
+    stability_available = default_stability_inputs_available(project_root)
+    include_strategy_stability = (
+        args.enable_strategy_stability
+        if not args.skip_strategy_stability
+        else False
+    )
+    if not args.enable_strategy_stability and not args.skip_strategy_stability:
+        include_strategy_stability = stability_available
+    if not include_strategy_stability and not args.skip_strategy_stability:
+        print(
+            "Strategy stability report skipped: default legacy metrics/equity inputs are incomplete. "
+            "Use --enable-strategy-stability only after restoring all inputs."
+        )
     config = PipelineConfig(
         asof_date=asof_date,
         python_exe=args.python_exe,
         project_root=project_root,
         output_root=Path(args.output_root),
-        base_panel=Path(args.base_panel),
+        base_panel=base_panel,
         daily_dir=daily_dir,
         daily_data_dir=Path(args.daily_data_dir),
         fallback_data_dir=Path(args.fallback_data_dir),
@@ -1265,7 +1343,7 @@ def main() -> None:
         train_model=not args.skip_train,
         include_factor_decay_monitor=not args.skip_factor_decay_monitor,
         include_strategy_family_forward_report=not args.skip_strategy_family_forward,
-        include_strategy_stability_report=not args.skip_strategy_stability,
+        include_strategy_stability_report=include_strategy_stability,
         include_benchmark_refresh=not args.skip_benchmark_refresh,
         include_regime_shadow_compare=not args.skip_regime_shadow_compare,
         include_regime_shadow_tracking=not args.skip_regime_shadow_tracking,
@@ -1277,7 +1355,7 @@ def main() -> None:
         trend_ignition_scorer_summary=Path(args.trend_ignition_scorer_summary),
         trend_ignition_selection_status=args.trend_ignition_selection_status,
     )
-    fetch_status = fetch_status_summary(config.fetch_status_utils)
+    fetch_status = fetch_status_summary(_resolve(project_root, config.fetch_status_utils))
     print("Daily market data fetch status:")
     print(json.dumps(fetch_status, ensure_ascii=False, indent=2, default=str))
     if not args.dry_run:

@@ -12,8 +12,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from workspace_paths import personal_trades_file
 
-SOURCE_DEFAULT = Path(r"C:\Users\86176\Desktop\table2.xls")
+
+SOURCE_DEFAULT = personal_trades_file()
 PANEL_DEFAULT = Path("data_panel_history_main_chinext_20220101_20260629.csv")
 OUTPUT_DEFAULT = Path("outputs/personal_trade_review_20260629")
 

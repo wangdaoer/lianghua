@@ -640,7 +640,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         help=(
             "Historical CSV or normalized daily-data directory. Repeat to merge "
-            "the old history with D:/codex/daily-market-data/ths_exports/normalized."
+            "the old history with the normalized daily directory under QUANT_DATA_ROOT."
         ),
     )
     parser.add_argument("--benchmark", default=None, help="CSI1000 date/close CSV")

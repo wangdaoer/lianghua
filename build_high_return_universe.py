@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import warnings
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
+from workspace_paths import stock_data_root
 
-DEFAULT_STOCK_DIR = Path(r"D:\codex\量化\data\processed\stocks")
-DEFAULT_MCAP = Path(r"D:\codex\量化\data\processed\stock_market_cap_yi.csv")
+
+DEFAULT_STOCK_DIR = stock_data_root() / "stocks"
+DEFAULT_MCAP = stock_data_root() / "stock_market_cap_yi.csv"
 DEFAULT_PREFIXES = ("000", "001", "002", "003", "300", "301", "600", "601", "603", "605")
 
 
@@ -55,7 +58,8 @@ def score_one_file(path: Path, asof: pd.Timestamp | None, min_history_days: int)
     cols = ["date", "code", "name", "open", "high", "low", "close", "volume", "amount"]
     try:
         df = _read_csv(path, usecols=lambda c: c in cols)
-    except Exception:
+    except (OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError) as exc:
+        warnings.warn(f"Skipping unreadable stock history {path}: {exc}", RuntimeWarning, stacklevel=2)
         return None
     if df.empty or "date" not in df or "close" not in df:
         return None
