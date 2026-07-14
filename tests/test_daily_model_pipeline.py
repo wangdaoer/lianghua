@@ -10,6 +10,7 @@ from unittest.mock import patch
 from run_daily_model_pipeline import (
     PipelineConfig,
     PipelineStep,
+    _trend_ignition_shadow_state,
     append_daily_run_state,
     attach_daily_run_card,
     build_daily_pipeline_steps,
@@ -130,6 +131,34 @@ class DailyModelPipelineTest(unittest.TestCase):
         names = [step.name for step in build_daily_pipeline_steps(config)]
         self.assertNotIn("research_database_sync", names)
 
+    def test_trend_ignition_shadow_is_opt_in_and_runs_after_merged_outputs(self):
+        default_config = PipelineConfig(
+            asof_date="2026-06-29",
+            python_exe="python",
+            project_root=Path("C:/model"),
+        )
+        self.assertNotIn(
+            "trend_ignition_shadow",
+            [step.name for step in build_daily_pipeline_steps(default_config)],
+        )
+
+        config = PipelineConfig(
+            asof_date="2026-06-29",
+            python_exe="python",
+            project_root=Path("C:/model"),
+            include_trend_ignition_shadow=True,
+        )
+        steps = build_daily_pipeline_steps(config)
+        names = [step.name for step in steps]
+        shadow_index = names.index("trend_ignition_shadow")
+        self.assertEqual(names[shadow_index - 1], "merged_daily_outputs")
+        command = " ".join(str(part) for part in steps[shadow_index].command)
+        self.assertIn("score_trend_ignition_shadow.py", command)
+        self.assertIn("trend_ignition_shadow_20260629", command)
+        self.assertIn("scorer_v3_shortlist_exploratory", command)
+        self.assertIn("--start 2026-06-29 --end 2026-06-29", command)
+        self.assertIn("--selection-status exploratory_posthoc", command)
+
     def test_pipeline_can_skip_factor_decay_monitor(self):
         config = PipelineConfig(
             asof_date="2026-06-29",
@@ -149,6 +178,46 @@ class DailyModelPipelineTest(unittest.TestCase):
         with patch.object(sys, "argv", ["run_daily_model_pipeline.py", "--skip-factor-decay-monitor"]):
             args = parse_args()
         self.assertTrue(args.skip_factor_decay_monitor)
+
+    def test_parse_args_accepts_trend_ignition_shadow_flag(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["run_daily_model_pipeline.py", "--enable-trend-ignition-shadow"],
+        ):
+            args = parse_args()
+        self.assertTrue(args.enable_trend_ignition_shadow)
+        self.assertEqual(args.trend_ignition_selection_status, "exploratory_posthoc")
+
+    def test_trend_ignition_shadow_state_rejects_stale_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "research_only": True,
+                        "trade_instruction": False,
+                        "inputs": {"start": "2026-06-28", "end": "2026-06-28"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                include_trend_ignition_shadow=True,
+            )
+            steps = [PipelineStep("trend_ignition_shadow", ("python", "shadow.py"))]
+
+            state, artifact = _trend_ignition_shadow_state(
+                config,
+                steps,
+                {"trend_ignition_shadow_manifest": manifest},
+                "success",
+                None,
+            )
+
+        self.assertEqual(state["status"], "stale")
+        self.assertIsNone(artifact)
 
     def test_factor_decay_status_preserves_observation_only_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
