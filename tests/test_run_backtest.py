@@ -185,6 +185,16 @@ def test_load_prices_preserves_legacy_zero_row_filtering(tmp_path):
 
 
 class RunBacktestEngineTest(unittest.TestCase):
+    def test_execution_constraint_counts_accept_new_diagnostic_keys(self):
+        engine = BacktestEngine(make_config())
+
+        engine._record_execution_constraint_counts(
+            {"blocked_orders_total": 1, "gross_budget_overrun": 1}
+        )
+
+        self.assertEqual(engine.execution_constraint_counts["blocked_orders_total"], 1)
+        self.assertEqual(engine.execution_constraint_counts["gross_budget_overrun"], 1)
+
     def test_engine_keeps_missing_amount_unavailable(self):
         engine = BacktestEngine(make_config())
         dates = pd.date_range("2026-01-01", periods=6, freq="D")

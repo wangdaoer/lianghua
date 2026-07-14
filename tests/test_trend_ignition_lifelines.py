@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -6,11 +8,22 @@ import pandas as pd
 from analyze_trend_ignition_lifelines import (
     choose_lifeline,
     find_ignition_candidates,
+    load_tdx_history_prices,
+    parse_args,
+    parse_tdx_symbols,
     summarize_trends_for_symbol,
 )
+from research_database import ResearchDatabase
 
 
 class TrendIgnitionLifelineTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
     def test_finds_volume_breakout_ignition_before_large_trend(self):
         dates = pd.date_range("2025-01-01", periods=180, freq="D")
         close = pd.Series(10.0, index=dates)
@@ -72,6 +85,74 @@ class TrendIgnitionLifelineTest(unittest.TestCase):
         self.assertEqual(len(trends), 1)
         self.assertEqual(trends[0]["symbol"], "000001")
         self.assertGreaterEqual(trends[0]["peak_return"], 0.80)
+
+    def test_load_tdx_history_prices_returns_stock_history_in_panel_shape(self):
+        main = ResearchDatabase(self.tmp_path / "research.sqlite3")
+        history = ResearchDatabase(self.tmp_path / "tdx_history.sqlite3")
+        history.import_tdx_prices(
+            pd.DataFrame(
+                [
+                    {
+                        "market": "SZ",
+                        "symbol": "000001",
+                        "date": "1991-04-03",
+                        "open": 10.0,
+                        "high": 10.5,
+                        "low": 9.8,
+                        "close": 10.2,
+                        "volume": 100,
+                        "amount": 1000,
+                        "asset_type": "stock",
+                        "source": "szlday.zip!sz000001.day",
+                    },
+                    {
+                        "market": "SH",
+                        "symbol": "000001",
+                        "date": "1991-04-03",
+                        "open": 99.0,
+                        "high": 100.0,
+                        "low": 98.0,
+                        "close": 99.5,
+                        "volume": 1,
+                        "amount": 1,
+                        "asset_type": "stock",
+                        "source": "shlday.zip!sh000001.day",
+                    },
+                ]
+            )
+        )
+
+        prices = load_tdx_history_prices(
+            main.path,
+            self.tmp_path / "tdx_history.sqlite3",
+            symbols=["000001"],
+            start="1991-01-01",
+            end="1991-12-31",
+        )
+
+        self.assertEqual(prices["symbol"].tolist(), ["000001"])
+        self.assertEqual(prices["close"].tolist(), [10.2])
+        self.assertEqual(list(prices.columns), [
+            "date", "symbol", "open", "high", "low", "close", "volume", "amount"
+        ])
+
+    def test_parse_args_allows_tdx_history_without_data_path(self):
+        args = parse_args(["--use-tdx-history", "--tdx-symbols", "000001"])
+
+        self.assertTrue(args.use_tdx_history)
+        self.assertEqual(args.tdx_symbols, "000001")
+
+    def test_parse_tdx_symbols_combines_cli_and_file(self):
+        symbols_file = self.tmp_path / "symbols.txt"
+        symbols_file.write_text("SZ000002\n000001\n", encoding="utf-8")
+
+        symbols = parse_tdx_symbols("300001,600000.SH,000001", symbols_file)
+
+        self.assertEqual(symbols, ["000001", "000002", "300001", "600000"])
+
+    def test_parse_args_requires_data_outside_tdx_mode(self):
+        with self.assertRaises(SystemExit):
+            parse_args([])
 
 
 if __name__ == "__main__":

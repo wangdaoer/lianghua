@@ -37,6 +37,20 @@ python query_tdx_history.py `
   --symbol 000001
 ```
 
+趋势起爆与生命线研究也可直接读取独立 TDX 历史库。`--tdx-symbols` 和
+`--tdx-symbols-file` 支持纯六位代码以及 `SZ000001`、`600000.SH` 格式；不启用
+TDX 模式时仍必须显式提供 `--data`，避免误用陈旧面板。
+
+```powershell
+python analyze_trend_ignition_lifelines.py `
+  --use-tdx-history `
+  --research-db data/research.sqlite3 `
+  --tdx-db data/tdx_history.sqlite3 `
+  --tdx-symbols 000001,600000.SH `
+  --start 2025-01-01 `
+  --end 2025-12-31
+```
+
 把已有主库中的通达信表合并到独立历史库时，默认保留源数据。目标库允许保留此前汇总的
 其他历史记录；只有核验本次源库的每一行都已写入目标库，并显式添加 `--delete-source` 时，
 才会删除源库中的通达信行。需要覆盖已有重建库时也必须显式添加 `--overwrite-rebuilt`。

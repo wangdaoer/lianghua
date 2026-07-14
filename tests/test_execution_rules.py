@@ -153,7 +153,7 @@ class ExecutionRulesTest(unittest.TestCase):
         self.assertEqual(counts["blocked_orders_total"], 1)
         pd.testing.assert_series_equal(adjusted, current)
 
-    def test_diagnostics_preserve_existing_blocked_order_execution_semantics(self):
+    def test_blocked_sell_rebudgets_executable_buys_to_requested_gross_budget(self):
         current = pd.Series(
             {"000001": 0.4, "000002": 0.2, "000003": 0.0, "000004": 0.0}
         )
@@ -176,12 +176,13 @@ class ExecutionRulesTest(unittest.TestCase):
 
         self.assertAlmostEqual(adjusted["000001"], 0.4)
         self.assertAlmostEqual(adjusted["000002"], 0.0)
-        self.assertAlmostEqual(adjusted["000003"], 0.3)
-        self.assertAlmostEqual(adjusted["000004"], 0.3)
+        self.assertAlmostEqual(adjusted["000003"], 0.1)
+        self.assertAlmostEqual(adjusted["000004"], 0.1)
+        self.assertLessEqual(float(adjusted.abs().sum()), float(target.abs().sum()))
         self.assertEqual(counts["blocked_limit_down_sells"], 1)
         self.assertEqual(counts["blocked_orders_total"], 1)
 
-    def test_diagnostics_do_not_apply_partial_long_only_budget_logic(self):
+    def test_blocked_sell_rebudgets_when_long_budget_exceeded_but_gross_is_not(self):
         current = pd.Series({"000001": 0.4, "000002": 0.0, "000003": 0.0})
         target = pd.Series({"000001": 0.0, "000002": 0.2, "000003": -0.8})
         prev_close = pd.Series(10.0, index=target.index)
@@ -197,9 +198,31 @@ class ExecutionRulesTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(adjusted["000001"], 0.4)
-        self.assertAlmostEqual(adjusted["000002"], 0.2)
+        self.assertAlmostEqual(adjusted["000002"], 0.0)
         self.assertAlmostEqual(adjusted["000003"], 0.0)
+        self.assertAlmostEqual(float(adjusted.clip(lower=0.0).sum()), 0.4)
+        self.assertLessEqual(float(adjusted.abs().sum()), float(target.abs().sum()))
         self.assertEqual(counts["blocked_limit_down_sells"], 2)
+
+    def test_unavoidable_blocked_position_budget_overrun_is_reported(self):
+        current = pd.Series({"000001": 0.5, "000002": 0.0})
+        target = pd.Series({"000001": 0.0, "000002": 0.1})
+        prev_close = pd.Series(10.0, index=target.index)
+        open_row = pd.Series({"000001": 9.0, "000002": 10.0})
+
+        adjusted, counts = apply_open_constraints_with_diagnostics(
+            current,
+            target,
+            open_row,
+            prev_close,
+            max_buy_open_gap=None,
+            limit_buffer=0.995,
+        )
+
+        self.assertAlmostEqual(adjusted["000001"], 0.5)
+        self.assertAlmostEqual(adjusted["000002"], 0.0)
+        self.assertEqual(counts["gross_budget_overrun"], 1)
+        self.assertEqual(counts["long_budget_overrun"], 1)
 
     def test_point_in_time_limit_rate_overrides_board_default(self):
         current = pd.Series({"000001": 0.0})

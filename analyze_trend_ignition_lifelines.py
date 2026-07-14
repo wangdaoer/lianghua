@@ -11,6 +11,63 @@ import pandas as pd
 
 from run_backtest import load_prices, pivot_prices
 from train_next_open_rank_model import clean_matrix
+from research_database import ResearchDatabase, normalize_a_share_symbol
+
+
+PANEL_PRICE_COLUMNS = ["date", "symbol", "open", "high", "low", "close", "volume", "amount"]
+
+
+def load_tdx_history_prices(
+    research_db: str | Path,
+    tdx_db: str | Path,
+    *,
+    symbols: list[str] | tuple[str, ...] | set[str] | None = None,
+    start: pd.Timestamp | str | None = None,
+    end: pd.Timestamp | str | None = None,
+    asset_type: str = "stock",
+) -> pd.DataFrame:
+    db = ResearchDatabase(research_db)
+    normalized_symbols = None
+    if symbols:
+        normalized_symbols = []
+        for symbol in symbols:
+            normalized = normalize_a_share_symbol(symbol)
+            if normalized is None:
+                raise ValueError(f"Invalid A-share symbol: {symbol!r}")
+            normalized_symbols.append(normalized)
+    prices = db.query_tdx_history_normalized(
+        tdx_db,
+        symbols=sorted(set(normalized_symbols)) if normalized_symbols else None,
+        asset_type=asset_type,
+        start=None if start is None else pd.Timestamp(start).strftime("%Y-%m-%d"),
+        end=None if end is None else pd.Timestamp(end).strftime("%Y-%m-%d"),
+    )
+    if prices.empty:
+        return pd.DataFrame(columns=PANEL_PRICE_COLUMNS)
+    prices = prices[PANEL_PRICE_COLUMNS].copy()
+    prices["date"] = pd.to_datetime(prices["date"], errors="coerce")
+    prices["symbol"] = prices["symbol"].astype(str).str.zfill(6)
+    return prices.dropna(subset=["date", "symbol"]).sort_values(["date", "symbol"]).reset_index(drop=True)
+
+
+def parse_tdx_symbols(
+    symbols_text: str | None = None,
+    symbols_file: str | Path | None = None,
+) -> list[str] | None:
+    symbols: list[str] = []
+    if symbols_text:
+        symbols.extend(item.strip() for item in symbols_text.split(",") if item.strip())
+    if symbols_file:
+        path = Path(symbols_file)
+        symbols.extend(line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    cleaned = []
+    for symbol in symbols:
+        normalized = normalize_a_share_symbol(symbol)
+        if normalized is None:
+            raise ValueError(f"Invalid A-share symbol: {symbol!r}")
+        cleaned.append(normalized)
+    cleaned = sorted(set(cleaned))
+    return cleaned or None
 
 
 def find_ignition_candidates(
@@ -223,9 +280,18 @@ def summarize_trends_for_symbol(
     return records
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze long trend ignition points and lifelines.")
-    parser.add_argument("--data", required=True)
+    parser.add_argument("--data")
+    parser.add_argument("--research-db", default="data/research.sqlite3")
+    parser.add_argument("--tdx-db", default="data/tdx_history.sqlite3")
+    parser.add_argument("--use-tdx-history", action="store_true")
+    parser.add_argument("--tdx-symbols", default=None, help="Comma separated symbols for TDX history mode.")
+    parser.add_argument(
+        "--tdx-symbols-file",
+        default=None,
+        help="UTF-8 text file with one symbol per line for TDX history mode.",
+    )
     parser.add_argument("--output-dir", default="outputs/high_return_v2/trend_ignition_lifelines_202506_202606")
     parser.add_argument("--start", default="2025-06-01")
     parser.add_argument("--end", default="2026-06-26")
@@ -239,7 +305,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lifeline-max-breach-days", type=int, default=3)
     parser.add_argument("--max-abs-daily-return", type=float, default=0.22)
     parser.add_argument("--top-n", type=int, default=100)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if not args.use_tdx_history and not args.data:
+        parser.error("--data is required unless --use-tdx-history is set")
+    return args
 
 
 def to_chinese_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -271,7 +340,18 @@ def main() -> None:
     args = parse_args()
     start = pd.Timestamp(args.start)
     end = pd.Timestamp(args.end)
-    raw = load_prices(Path(args.data), None, None)
+    if args.use_tdx_history:
+        symbols = parse_tdx_symbols(args.tdx_symbols, args.tdx_symbols_file)
+        raw = load_tdx_history_prices(
+            args.research_db,
+            args.tdx_db,
+            symbols=symbols,
+            start=start - pd.Timedelta(days=args.ignition_lookback_days + args.breakout_window * 3),
+            end=end,
+            asset_type="stock",
+        )
+    else:
+        raw = load_prices(Path(args.data), None, None)
     close = clean_matrix(pivot_prices(raw, "close"), args.max_abs_daily_return)
     high = clean_matrix(pivot_prices(raw, "high").reindex_like(close), args.max_abs_daily_return)
     amount = pivot_prices(raw, "amount").reindex_like(close)

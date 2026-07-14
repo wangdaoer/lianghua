@@ -238,6 +238,37 @@ def apply_open_constraints_with_diagnostics(
     current_aligned = current.reindex(target.index).fillna(0.0)
     adjusted = target.where(~blocked, current_aligned)
 
+    executable_long_buys = (
+        target.gt(current_aligned)
+        & target.gt(0.0)
+        & current_aligned.ge(0.0)
+        & ~blocked
+    )
+    target_gross_budget = float(target.abs().sum())
+    target_long_budget = float(target.clip(lower=0.0).sum())
+    exceeds_gross_budget = float(adjusted.abs().sum()) > target_gross_budget
+    exceeds_long_budget = float(adjusted.clip(lower=0.0).sum()) > target_long_budget
+    if executable_long_buys.any() and (exceeds_gross_budget or exceeds_long_budget):
+        base = adjusted.copy()
+        base.loc[executable_long_buys] = current_aligned.loc[executable_long_buys]
+        gross_capacity = max(target_gross_budget - float(base.abs().sum()), 0.0)
+        long_capacity = max(target_long_budget - float(base.clip(lower=0.0).sum()), 0.0)
+        requested = target.loc[executable_long_buys] - current_aligned.loc[executable_long_buys]
+        requested_total = float(requested.sum())
+        scale = (
+            min(1.0, gross_capacity / requested_total, long_capacity / requested_total)
+            if requested_total > 0.0
+            else 0.0
+        )
+        adjusted.loc[executable_long_buys] = (
+            current_aligned.loc[executable_long_buys] + requested * scale
+        )
+
     counts = {name: int(mask.sum()) for name, mask in masks.items()}
     counts["blocked_orders_total"] = int(blocked.sum())
+    tolerance = 1e-12
+    if float(adjusted.abs().sum()) > target_gross_budget + tolerance:
+        counts["gross_budget_overrun"] = 1
+    if float(adjusted.clip(lower=0.0).sum()) > target_long_budget + tolerance:
+        counts["long_budget_overrun"] = 1
     return adjusted, counts
