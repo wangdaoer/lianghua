@@ -124,9 +124,10 @@ def test_rebuild_main_without_tdx_preserves_research_tables(tmp_path):
     assert rebuilt.query("SELECT symbol, close, source FROM daily_prices").to_dict("records") == [
         {"symbol": "000001", "close": 10.1, "source": "panel"}
     ]
-    assert rebuilt.query("SELECT symbol, kind FROM observations").to_dict("records") == [
-        {"symbol": "000001", "kind": "candidate"}
-    ]
+    rebuilt_observation = rebuilt.query("SELECT symbol, kind, row_key FROM observations").iloc[0]
+    assert rebuilt_observation["symbol"] == "000001"
+    assert rebuilt_observation["kind"] == "candidate"
+    assert len(rebuilt_observation["row_key"]) == 64
     assert rebuilt.query("SELECT COUNT(*) AS rows FROM tdx_daily_prices").iloc[0]["rows"] == 0
 
 

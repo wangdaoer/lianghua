@@ -3,6 +3,7 @@ import struct
 from zipfile import ZipFile
 
 import pandas as pd
+import pytest
 
 from research_database import (
     ResearchDatabase,
@@ -61,6 +62,21 @@ def test_import_prices_accepts_numeric_symbols_and_zero_pads_them(tmp_path):
     assert db.query("SELECT symbol FROM daily_prices").iloc[0]["symbol"] == "000001"
 
 
+def test_import_prices_can_update_corrected_daily_values(tmp_path):
+    db = ResearchDatabase(tmp_path / "research.sqlite3")
+    prices = pd.DataFrame({
+        "symbol": ["000001"], "date": ["2026-07-13"], "open": [10], "high": [11],
+        "low": [9], "close": [10.5], "volume": [100], "amount": [1000],
+    })
+    assert db.import_prices(prices, "first", update_existing=True) == 1
+    corrected = prices.assign(close=10.8)
+    assert db.import_prices(corrected, "corrected", update_existing=True) == 1
+    assert db.import_prices(corrected, "corrected", update_existing=True) == 0
+    assert db.query("SELECT close, source FROM daily_prices").to_dict("records") == [
+        {"close": 10.8, "source": "corrected"}
+    ]
+
+
 def test_database_connections_release_file_handles(tmp_path):
     path = tmp_path / "research.sqlite3"
     db = ResearchDatabase(path)
@@ -78,7 +94,7 @@ def test_import_observations_preserves_source_and_payload(tmp_path):
     row = db.query("SELECT source, kind, payload FROM observations").iloc[0]
     assert row["source"] == "daily_candidates.csv"
     assert row["kind"] == "candidate"
-    assert '"score": 0.8' in row["payload"]
+    assert '"score":0.8' in row["payload"]
 
 
 def test_import_observations_normalizes_numeric_symbols(tmp_path):
@@ -86,6 +102,100 @@ def test_import_observations_normalizes_numeric_symbols(tmp_path):
     observations = pd.DataFrame({"symbol": [1.0], "date": ["2026-07-13"], "score": [0.8]})
     assert db.import_observations(observations, "candidate", "daily.csv") == 1
     assert db.query("SELECT symbol FROM observations").iloc[0]["symbol"] == "000001"
+
+
+def test_import_observations_without_symbol_is_idempotent(tmp_path):
+    db = ResearchDatabase(tmp_path / "research.sqlite3")
+    observations = pd.DataFrame({"date": ["2026-07-13"], "score": [0.8]})
+    assert db.import_observations(observations, "portfolio", "daily.csv") == 1
+    assert db.import_observations(observations, "portfolio", "daily.csv") == 0
+
+
+def test_import_observations_updates_changed_payload(tmp_path):
+    db = ResearchDatabase(tmp_path / "research.sqlite3")
+    first = pd.DataFrame({"symbol": ["000001"], "date": ["2026-07-13"], "score": [0.8]})
+    corrected = first.assign(score=0.9)
+    assert db.import_observations(first, "candidate", "daily.csv") == 1
+    assert db.import_observations(corrected, "candidate", "daily.csv") == 1
+    assert db.import_observations(corrected, "candidate", "daily.csv") == 0
+    assert '"score":0.9' in db.query("SELECT payload FROM observations").iloc[0]["payload"]
+
+
+def test_import_observations_preserves_multiple_rows_for_same_symbol_and_date(tmp_path):
+    db = ResearchDatabase(tmp_path / "research.sqlite3")
+    observations = pd.DataFrame({
+        "symbol": ["000001", "000001"],
+        "date": ["2026-07-13", "2026-07-13"],
+        "horizon": [1, 5],
+        "return": [0.01, 0.05],
+    })
+    assert db.import_observations(observations, "forward_return", "daily.csv") == 2
+    assert db.import_observations(observations, "forward_return", "daily.csv") == 0
+    row_keys = db.query("SELECT row_key FROM observations ORDER BY row_key")["row_key"].tolist()
+    assert len(row_keys) == 2
+    assert all(len(row_key) == 64 for row_key in row_keys)
+
+
+def test_observation_snapshot_handles_reordering_and_deleted_rows(tmp_path):
+    db = ResearchDatabase(tmp_path / "research.sqlite3")
+    observations = pd.DataFrame({
+        "symbol": ["000001", "000001"],
+        "date": ["2026-07-13", "2026-07-13"],
+        "horizon": [1, 5],
+    })
+    assert db.import_observations(observations, "forward", "daily.csv") == 2
+    assert db.import_observations(observations.iloc[::-1], "forward", "daily.csv") == 0
+    assert db.import_observations(observations.iloc[:1], "forward", "daily.csv") == 2
+    assert db.query("SELECT COUNT(*) AS rows FROM observations").iloc[0]["rows"] == 1
+
+
+def test_existing_observations_schema_is_migrated_without_data_loss(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                date TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(symbol, date, kind, source)
+            );
+            INSERT INTO observations (symbol,date,kind,source,payload)
+            VALUES ('000001','2026-07-13','candidate','daily.csv','{"score": 0.8}');
+            """
+        )
+
+    db = ResearchDatabase(path)
+
+    assert "row_key" in db.query("PRAGMA table_info(observations)")["name"].tolist()
+    assert db.query("SELECT symbol, row_key FROM observations").to_dict("records") == [
+        {"symbol": "000001", "row_key": "00000000"}
+    ]
+
+
+def test_failed_observation_migration_rolls_back_original_table(tmp_path):
+    path = tmp_path / "malformed.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """CREATE TABLE observations (
+            id INTEGER PRIMARY KEY, symbol TEXT, date TEXT, kind TEXT, source TEXT
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO observations VALUES (1, '000001', '2026-07-13', 'candidate', 'daily.csv')"
+        )
+
+    with pytest.raises(sqlite3.OperationalError):
+        ResearchDatabase(path)
+
+    with sqlite3.connect(path) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "observations" in tables
+        assert "observations_v2_new" not in tables
+        assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
 
 
 def _tdx_record(date, open_px, high_px, low_px, close_px, amount, volume):

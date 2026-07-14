@@ -6,7 +6,9 @@ from build_research_database import (
     discover_latest_panel,
     extract_date_tokens,
     infer_file_date,
+    prepare_observation_frame,
     select_observation_files,
+    select_supported_observation_files,
     unresolved_observation_files,
 )
 
@@ -65,3 +67,29 @@ def test_unresolved_observation_files_exposes_undated_and_invalid_names(tmp_path
     for path in (valid, undated, invalid):
         path.touch()
     assert unresolved_observation_files(tmp_path) == [invalid, undated]
+
+
+def test_select_supported_observation_files_rejects_unrelated_dated_csv(tmp_path):
+    supported = tmp_path / "merged_priority_watchlist_20260713.csv"
+    unrelated = tmp_path / "unrelated_export_20260713.csv"
+    supported.touch()
+    unrelated.touch()
+
+    assert select_supported_observation_files(tmp_path, "20260713") == [supported]
+
+
+def test_prepare_observation_frame_rejects_future_dates(tmp_path):
+    path = tmp_path / "merged_priority_watchlist_20260713.csv"
+    path.write_text("symbol,date\n000001,2026-07-14\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dates after 2026-07-13"):
+        prepare_observation_frame(path, "20260713")
+
+
+def test_prepare_observation_frame_infers_and_normalizes_filename_date(tmp_path):
+    path = tmp_path / "merged_priority_watchlist_20260713.csv"
+    path.write_text("symbol,score\n000001,0.9\n", encoding="utf-8")
+
+    frame = prepare_observation_frame(path, "2026-07-13")
+
+    assert frame["date"].tolist() == ["2026-07-13"]

@@ -57,6 +57,12 @@ python migrate_tdx_history.py `
 搜狐历史行情和 Yahoo 日线交叉核验日期、OHLC 与成交量，验证通过后才以原子替换方式写入；
 任一来源冲突或缺少目标交易日都会终止流水线，不会继续生成当日风险档位。
 
+每日流程的最后一步会把当天标准化行情和当天模型 CSV 产物增量写入
+`data/research.sqlite3`，不会重新扫描完整历史面板或 TDX 历史库。同步结果写入
+`outputs/high_return_v2/research_database_sync_<YYYYMMDD>.json`，并进入
+`daily_run_state.jsonl`。完全相同的数据重复运行不会新增记录；当天行情或模型产物修正后，
+对应记录会更新。历史回放或故障诊断时可显式添加 `--skip-research-db-sync`。
+
 ```powershell
 python run_daily_model_pipeline.py --asof-date 2026-07-13
 ```

@@ -50,6 +50,7 @@ class PipelineConfig:
     fetch_status_utils: Path = DEFAULT_FETCH_STATUS_UTILS
     daily_start: str = "2026-06-22"
     benchmark: Path = DEFAULT_BENCHMARK
+    research_db: Path = Path("data/research.sqlite3")
     rules: Path = Path("configs/personal_trade_habit_overlay.yaml")
     symbol_history: Path | None = None
     shadow_account_review: Path | None = None
@@ -72,6 +73,7 @@ class PipelineConfig:
     include_benchmark_refresh: bool = True
     include_regime_shadow_compare: bool = True
     include_regime_shadow_tracking: bool = True
+    include_research_db_sync: bool = True
     regime_shadow_config: Path = Path("configs/evolution_strong_pullback.yaml")
     regime_shadow_candidate_id: str = "regime_090_balanced"
 
@@ -148,6 +150,38 @@ def _tracking_state_gate(
     if failure_index == tracking_index:
         return "failed", False
     return None, True
+
+
+def _research_database_sync_state(
+    config: PipelineConfig,
+    steps: list[PipelineStep],
+    paths: dict[str, Path],
+    run_status: str,
+    failure: dict[str, object] | None,
+) -> tuple[dict[str, object], str | None]:
+    if not config.include_research_db_sync:
+        return {"status": "skipped"}, None
+    step_names = [step.name for step in steps]
+    sync_step = "research_database_sync"
+    if run_status == "failed" and sync_step in step_names and isinstance(failure, dict):
+        failed_step = failure.get("step")
+        if isinstance(failed_step, str) and failed_step in step_names:
+            if step_names.index(failed_step) < step_names.index(sync_step):
+                return {"status": "not_run"}, None
+            if failed_step == sync_step:
+                status_path = paths["research_database_sync_status"]
+                if status_path.exists():
+                    status = _read_json_object(status_path)
+                    if _date_token(str(status.get("asof_date", ""))) == _date_token(config.asof_date):
+                        return status, str(_latest_artifact(status_path))
+                return {"status": "failed"}, None
+    status_path = paths["research_database_sync_status"]
+    if not status_path.exists():
+        return {"status": "missing"}, None
+    status = _read_json_object(status_path)
+    if _date_token(str(status.get("asof_date", ""))) != _date_token(config.asof_date):
+        return {"status": "stale", "recorded_asof_date": status.get("asof_date")}, None
+    return status, str(_latest_artifact(status_path))
 
 
 def _jsonable(value: object) -> object:
@@ -304,6 +338,8 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "regime_shadow_tracking_summary": output_root / "regime_shadow_tracking_summary.json",
         "regime_shadow_tracking_report": output_root / "regime_shadow_tracking_report.md",
         "benchmark_refresh_status": output_root / f"benchmark_refresh_status_{token}.json",
+        "research_db": _resolve(root, config.research_db),
+        "research_database_sync_status": output_root / f"research_database_sync_{token}.json",
     }
 
 
@@ -637,6 +673,26 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                 ),
             )
         )
+    if config.include_research_db_sync:
+        steps.append(
+            PipelineStep(
+                "research_database_sync",
+                (
+                    config.python_exe,
+                    str(config.project_root / "sync_daily_research_database.py"),
+                    "--db",
+                    str(paths["research_db"]),
+                    "--daily-dir",
+                    str(paths["daily_dir"]),
+                    "--output-dir",
+                    str(paths["output_root"]),
+                    "--asof-date",
+                    config.asof_date,
+                    "--status-output",
+                    str(paths["research_database_sync_status"]),
+                ),
+            )
+        )
     return steps
 
 
@@ -750,6 +806,13 @@ def build_daily_run_state(
         benchmark_refresh = _read_json_object(paths["benchmark_refresh_status"])
     else:
         benchmark_refresh = {"status": "missing"}
+    research_database_sync, research_database_sync_artifact = _research_database_sync_state(
+        config,
+        steps,
+        paths,
+        run_status,
+        failure,
+    )
     regime_delta = regime_shadow.get("delta")
     if not isinstance(regime_delta, dict):
         regime_delta = {}
@@ -807,6 +870,11 @@ def build_daily_run_state(
             "benchmark_latest_date": benchmark_refresh.get("latest_date"),
             "benchmark_source_agreement": benchmark_refresh.get("source_agreement"),
             "benchmark_rows_added": benchmark_refresh.get("rows_added"),
+            "research_database_sync_status": research_database_sync.get("status"),
+            "research_database_latest_date": research_database_sync.get("database_latest_date"),
+            "research_database_asof_rows": research_database_sync.get("database_asof_rows"),
+            "research_database_daily_rows": research_database_sync.get("database_daily_rows"),
+            "research_database_observation_rows": research_database_sync.get("database_observation_rows"),
         },
         "top10": _top_rows(priority_rows, ["symbol", "stock_name", "strategy_family", "priority_bucket"]),
         "artifacts": {
@@ -833,6 +901,8 @@ def build_daily_run_state(
                 and paths["benchmark_refresh_status"].exists()
                 else None
             ),
+            "research_database": str(paths["research_db"]) if config.include_research_db_sync else None,
+            "research_database_sync_status": research_database_sync_artifact,
         },
     }
 
@@ -925,6 +995,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--daily-start", default="2026-06-22")
     parser.add_argument("--output-root", default="outputs/high_return_v2")
     parser.add_argument("--benchmark", default=str(DEFAULT_BENCHMARK))
+    parser.add_argument("--research-db", default="data/research.sqlite3")
     parser.add_argument("--rules", default="configs/personal_trade_habit_overlay.yaml")
     parser.add_argument("--symbol-history", default=None)
     parser.add_argument("--shadow-account-review", default=None)
@@ -934,6 +1005,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-benchmark-refresh", action="store_true")
     parser.add_argument("--skip-regime-shadow-compare", action="store_true")
     parser.add_argument("--skip-regime-shadow-tracking", action="store_true")
+    parser.add_argument("--skip-research-db-sync", action="store_true")
     parser.add_argument("--regime-shadow-config", default="configs/evolution_strong_pullback.yaml")
     parser.add_argument("--regime-shadow-candidate-id", default="regime_090_balanced")
     parser.add_argument("--state-log", default="daily_run_state.jsonl")
@@ -966,6 +1038,7 @@ def main() -> None:
         fetch_status_utils=Path(args.fetch_status_utils),
         daily_start=args.daily_start,
         benchmark=Path(args.benchmark),
+        research_db=Path(args.research_db),
         rules=Path(args.rules),
         symbol_history=symbol_history,
         shadow_account_review=shadow_account_review,
@@ -975,6 +1048,7 @@ def main() -> None:
         include_benchmark_refresh=not args.skip_benchmark_refresh,
         include_regime_shadow_compare=not args.skip_regime_shadow_compare,
         include_regime_shadow_tracking=not args.skip_regime_shadow_tracking,
+        include_research_db_sync=not args.skip_research_db_sync,
         regime_shadow_config=Path(args.regime_shadow_config),
         regime_shadow_candidate_id=args.regime_shadow_candidate_id,
     )
@@ -1016,6 +1090,8 @@ def main() -> None:
         print(output_root / "regime_shadow_tracking_report.md")
     if config.include_benchmark_refresh:
         print(output_root / f"benchmark_refresh_status_{token}.json")
+    if config.include_research_db_sync:
+        print(output_root / f"research_database_sync_{token}.json")
     if not args.dry_run and not args.skip_state_log:
         print("Daily run state:")
         print(state_log)

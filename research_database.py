@@ -7,6 +7,7 @@ but contains no broker, order, or account functionality.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -109,12 +110,58 @@ class ResearchDatabase:
                     date TEXT NOT NULL,
                     kind TEXT NOT NULL,
                     source TEXT NOT NULL,
+                    row_key TEXT NOT NULL,
                     payload TEXT NOT NULL,
-                    UNIQUE(symbol, date, kind, source)
+                    UNIQUE(date, kind, source, row_key)
                 );
                 CREATE INDEX IF NOT EXISTS idx_observations_date ON observations(date);
                 """
             )
+            self._ensure_observations_v2(conn)
+
+    def _ensure_observations_v2(self, conn: sqlite3.Connection) -> None:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(observations)").fetchall()}
+        if "row_key" in columns:
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DROP TABLE IF EXISTS observations_v2_new")
+            conn.execute(
+                """CREATE TABLE observations_v2_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                date TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                row_key TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(date, kind, source, row_key)
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO observations_v2_new
+                (id, symbol, date, kind, source, row_key, payload)
+                SELECT id, symbol, date, kind, source,
+                   printf('%08d', ROW_NUMBER() OVER (
+                       PARTITION BY date, kind, source ORDER BY id
+                   ) - 1),
+                   payload
+                FROM observations"""
+            )
+            source_rows = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+            migrated_rows = conn.execute("SELECT COUNT(*) FROM observations_v2_new").fetchone()[0]
+            if source_rows != migrated_rows:
+                raise RuntimeError(
+                    f"Observation migration row mismatch: source={source_rows}, migrated={migrated_rows}"
+                )
+            conn.execute("DROP INDEX IF EXISTS idx_observations_date")
+            conn.execute("DROP TABLE observations")
+            conn.execute("ALTER TABLE observations_v2_new RENAME TO observations")
+            conn.execute("CREATE INDEX idx_observations_date ON observations(date)")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def query(self, sql: str, params: Iterable[object] = ()) -> pd.DataFrame:
         with self.connect() as conn:
@@ -194,7 +241,7 @@ class ResearchDatabase:
         columns = ["market", "symbol", "date", "open", "high", "low", "close", "volume", "amount", "asset_type", "raw_asset_type", "source"]
         return result[columns]
 
-    def import_prices(self, frame: pd.DataFrame, source: str = "") -> int:
+    def _price_records(self, frame: pd.DataFrame, source: str) -> list[tuple]:
         missing = [column for column in PRICE_COLUMNS if column not in frame.columns]
         if missing:
             raise ValueError(f"price data missing columns: {missing}")
@@ -203,16 +250,47 @@ class ResearchDatabase:
         rows["date"] = pd.to_datetime(rows["date"], errors="coerce").dt.strftime("%Y-%m-%d")
         rows = rows.dropna(subset=["symbol", "date"]).drop_duplicates(["symbol", "date"])
         rows["source"] = source
-        records = list(rows.itertuples(index=False, name=None))
-        with self.connect() as conn:
-            before = conn.total_changes
+        return list(rows.itertuples(index=False, name=None))
+
+    def import_prices_into(
+        self,
+        conn: sqlite3.Connection,
+        frame: pd.DataFrame,
+        source: str = "",
+        update_existing: bool = False,
+    ) -> int:
+        records = self._price_records(frame, source)
+        before = conn.total_changes
+        if update_existing:
+            conn.executemany(
+                """INSERT INTO daily_prices
+                (symbol,date,open,high,low,close,volume,amount,source)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(symbol,date) DO UPDATE SET
+                    open=excluded.open, high=excluded.high, low=excluded.low,
+                    close=excluded.close, volume=excluded.volume, amount=excluded.amount,
+                    source=excluded.source
+                WHERE daily_prices.open IS NOT excluded.open
+                   OR daily_prices.high IS NOT excluded.high
+                   OR daily_prices.low IS NOT excluded.low
+                   OR daily_prices.close IS NOT excluded.close
+                   OR daily_prices.volume IS NOT excluded.volume
+                   OR daily_prices.amount IS NOT excluded.amount
+                   OR daily_prices.source IS NOT excluded.source""",
+                records,
+            )
+        else:
             conn.executemany(
                 """INSERT OR IGNORE INTO daily_prices
                 (symbol,date,open,high,low,close,volume,amount,source)
                 VALUES (?,?,?,?,?,?,?,?,?)""",
                 records,
             )
-            return conn.total_changes - before
+        return conn.total_changes - before
+
+    def import_prices(self, frame: pd.DataFrame, source: str = "", update_existing: bool = False) -> int:
+        with self.connect() as conn:
+            return self.import_prices_into(conn, frame, source, update_existing)
 
     def import_tdx_prices(self, frame: pd.DataFrame) -> int:
         records = self._tdx_price_records(frame)
@@ -324,21 +402,50 @@ class ResearchDatabase:
             records,
         )
 
-    def import_observations(self, frame: pd.DataFrame, kind: str, source: str) -> int:
+    def _observation_records(self, frame: pd.DataFrame, kind: str, source: str) -> list[tuple]:
         if "date" not in frame.columns:
             raise ValueError("observation data must contain date")
-        records = []
+        records: list[tuple] = []
+        duplicate_counts: dict[tuple[str, str], int] = {}
         for row in frame.to_dict("records"):
             date = pd.to_datetime(row.pop("date"), errors="coerce")
             if pd.isna(date):
                 continue
             symbol = normalize_a_share_symbol(row.pop("symbol", None))
-            records.append((symbol, date.strftime("%Y-%m-%d"), kind, source, json.dumps(row, ensure_ascii=False, default=str)))
+            date_text = date.strftime("%Y-%m-%d")
+            payload = json.dumps(row, ensure_ascii=False, default=str, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(f"{symbol or ''}\0{payload}".encode("utf-8")).hexdigest()
+            duplicate_key = (date_text, digest)
+            occurrence = duplicate_counts.get(duplicate_key, 0)
+            duplicate_counts[duplicate_key] = occurrence + 1
+            row_key = digest if occurrence == 0 else f"{digest}:{occurrence}"
+            records.append((symbol, date_text, kind, source, row_key, payload))
+        return records
+
+    def import_observations_into(
+        self,
+        conn: sqlite3.Connection,
+        frame: pd.DataFrame,
+        kind: str,
+        source: str,
+    ) -> int:
+        records = self._observation_records(frame, kind, source)
+        existing_rows = conn.execute(
+            "SELECT date, row_key, symbol, payload FROM observations WHERE kind = ? AND source = ?",
+            (kind, source),
+        ).fetchall()
+        existing = {(row[0], row[1]): (row[2], row[3]) for row in existing_rows}
+        desired = {(row[1], row[4]): (row[0], row[5]) for row in records}
+        if existing == desired:
+            return 0
+        conn.execute("DELETE FROM observations WHERE kind = ? AND source = ?", (kind, source))
+        conn.executemany(
+            """INSERT INTO observations (symbol,date,kind,source,row_key,payload)
+            VALUES (?,?,?,?,?,?)""",
+            records,
+        )
+        return max(len(existing), len(desired))
+
+    def import_observations(self, frame: pd.DataFrame, kind: str, source: str) -> int:
         with self.connect() as conn:
-            before = conn.total_changes
-            conn.executemany(
-                """INSERT OR IGNORE INTO observations
-                (symbol,date,kind,source,payload) VALUES (?,?,?,?,?)""",
-                records,
-            )
-            return conn.total_changes - before
+            return self.import_observations_into(conn, frame, kind, source)

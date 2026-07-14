@@ -11,6 +11,19 @@ from tdx_day_source import infer_tdx_archive_specs, iter_tdx_day_archive_member_
 
 
 DATE_TOKEN = re.compile(r"(?<!\d)(20\d{2}-\d{2}-\d{2}|20\d{6})(?!\d)")
+OBSERVATION_PREFIXES = (
+    "daily_personal_overlay_changes_",
+    "daily_personal_overlay_selected_",
+    "early_pattern_watchlist_",
+    "hidden_accumulation_trade_watch_tracking_",
+    "merged_model_decision_table_",
+    "merged_priority_watchlist_",
+    "merged_state_pattern_scan_",
+    "rank_model_candidates_trend_gated_",
+    "strategy_family_forward_",
+    "strategy_family_health_",
+    "trend_ignition_score_forward_",
+)
 
 
 def extract_date_tokens(path: Path) -> list[str]:
@@ -54,6 +67,17 @@ def select_observation_files(output_dir: Path, asof_date: str | None = None) -> 
     return [path for path, tokens in dated if selected_date in tokens]
 
 
+def select_supported_observation_files(
+    output_dir: Path,
+    asof_date: str | None = None,
+) -> list[Path]:
+    return [
+        path
+        for path in select_observation_files(output_dir, asof_date)
+        if path.name.startswith(OBSERVATION_PREFIXES)
+    ]
+
+
 def unresolved_observation_files(output_dir: Path) -> list[Path]:
     return [path for path in sorted(output_dir.glob("*.csv")) if not extract_date_tokens(path)]
 
@@ -62,7 +86,57 @@ def read_table(path: Path) -> pd.DataFrame:
     # THS exports can be tab-delimited text despite an .xls suffix.
     if path.suffix.lower() == ".xls":
         return pd.read_csv(path, sep="\t", dtype=str, encoding="gb18030")
+    if path.suffix.lower() == ".xlsx":
+        return pd.read_excel(path, dtype=str)
     return pd.read_csv(path, low_memory=False)
+
+
+def prepare_daily_price_frame(path: Path) -> pd.DataFrame | None:
+    frame = read_table(path)
+    renamed = {str(column).lower(): column for column in frame.columns}
+    mapping = {
+        renamed[key]: key
+        for key in ("symbol", "date", "open", "high", "low", "close", "volume", "amount")
+        if key in renamed
+    }
+    mapping.update({
+        "代码": "symbol", "    名称": "stock_name", "现价": "close",
+        "开盘": "open", "最高": "high", "最低": "low",
+        "总成交量": "volume", "成交量": "volume", "成交额": "amount",
+    })
+    frame = frame.rename(columns=mapping)
+    if "date" not in frame.columns:
+        inferred_date = infer_file_date(path)
+        if inferred_date:
+            frame["date"] = inferred_date
+    if not {"symbol", "date", "close"}.issubset(frame.columns):
+        return None
+    for column in ("open", "high", "low", "volume", "amount"):
+        if column not in frame.columns:
+            frame[column] = None
+    return frame
+
+
+def prepare_observation_frame(path: Path, asof_date: str) -> pd.DataFrame:
+    frame = pd.read_csv(path, low_memory=False)
+    if "date" not in frame.columns:
+        inferred_date = infer_file_date(path)
+        if inferred_date:
+            frame["date"] = inferred_date
+    if "date" not in frame.columns:
+        raise ValueError(f"Observation file has no resolvable date: {path}")
+
+    parsed_dates = pd.to_datetime(frame["date"].astype(str), errors="coerce")
+    if parsed_dates.isna().any():
+        raise ValueError(f"Observation file contains invalid dates: {path}")
+    asof_token = normalize_asof_date(asof_date)
+    asof_timestamp = pd.to_datetime(asof_token, format="%Y%m%d")
+    if (parsed_dates > asof_timestamp).any():
+        raise ValueError(f"Observation file contains dates after {asof_timestamp:%Y-%m-%d}: {path}")
+
+    frame = frame.copy()
+    frame["date"] = parsed_dates.dt.strftime("%Y-%m-%d")
+    return frame
 
 
 def main() -> None:
@@ -91,24 +165,14 @@ def main() -> None:
             print(f"prices panel: {db.import_prices(frame, str(panel))}")
 
     daily_dir = Path(args.daily_dir)
-    for path in sorted(daily_dir.glob("ths_hs_a_share_*.xls")) + sorted(daily_dir.glob("ths_hs_a_share_*.csv")):
-        frame = read_table(path)
-        renamed = {column.lower(): column for column in frame.columns}
-        mapping = {renamed[key]: key for key in ("symbol", "date", "open", "high", "low", "close", "volume", "amount") if key in renamed}
-        mapping.update({
-            "代码": "symbol", "    名称": "stock_name", "现价": "close",
-            "开盘": "open", "最高": "high", "最低": "low",
-            "总成交量": "volume", "成交量": "volume", "成交额": "amount",
-        })
-        frame = frame.rename(columns=mapping)
-        if "date" not in frame.columns:
-            inferred_date = infer_file_date(path)
-            if inferred_date:
-                frame["date"] = inferred_date
-        if {"symbol", "date", "close"}.issubset(frame.columns):
-            for column in ("open", "high", "low", "volume", "amount"):
-                if column not in frame.columns:
-                    frame[column] = None
+    daily_paths = (
+        sorted(daily_dir.glob("ths_hs_a_share_*.xls"))
+        + sorted(daily_dir.glob("ths_hs_a_share_*.xlsx"))
+        + sorted(daily_dir.glob("ths_hs_a_share_*.csv"))
+    )
+    for path in daily_paths:
+        frame = prepare_daily_price_frame(path)
+        if frame is not None:
             print(f"prices {path.name}: {db.import_prices(frame, str(path))}")
         else:
             print(f"prices {path.name}: skipped; symbol/date/close could not be resolved", flush=True)
@@ -116,16 +180,15 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     for path in unresolved_observation_files(output_dir):
         print(f"observations {path.name}: skipped; filename date could not be resolved", flush=True)
-    for path in select_observation_files(output_dir, args.asof_date):
-        frame = pd.read_csv(path, low_memory=False)
-        if "date" not in frame.columns:
-            inferred_date = infer_file_date(path)
-            if inferred_date:
-                frame["date"] = inferred_date
-        if "date" in frame.columns:
-            print(f"observations {path.name}: {db.import_observations(frame, path.stem, str(path))}")
-        else:
-            print(f"observations {path.name}: skipped; date could not be resolved", flush=True)
+    observation_paths = select_supported_observation_files(output_dir, args.asof_date)
+    selected_asof = (
+        normalize_asof_date(args.asof_date)
+        if args.asof_date
+        else max((max(extract_date_tokens(path)) for path in observation_paths), default=None)
+    )
+    for path in observation_paths:
+        frame = prepare_observation_frame(path, selected_asof)
+        print(f"observations {path.name}: {db.import_observations(frame, path.stem, str(path))}")
 
     tdx_symbol_filter = None
     if args.tdx_symbols_from_panel and panel.exists():
