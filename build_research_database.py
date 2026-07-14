@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from research_database import ResearchDatabase
+from research_database import ResearchDatabase, normalize_a_share_symbols
 from tdx_day_source import infer_tdx_archive_specs, iter_tdx_day_archive_member_frames
 
 
@@ -130,7 +130,7 @@ def main() -> None:
     tdx_symbol_filter = None
     if args.tdx_symbols_from_panel and panel.exists():
         symbol_frame = pd.read_csv(panel, usecols=["symbol"], low_memory=False)
-        tdx_symbol_filter = set(symbol_frame["symbol"].astype(str).str.extract(r"(\d{6})", expand=False).dropna())
+        tdx_symbol_filter = set(normalize_a_share_symbols(symbol_frame["symbol"]).dropna())
         print(f"tdx symbol filter: {len(tdx_symbol_filter)} symbols", flush=True)
 
     if not args.skip_tdx:
