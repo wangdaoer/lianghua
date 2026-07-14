@@ -75,6 +75,119 @@ class RunBacktestEngineTest(unittest.TestCase):
         self.assertAlmostEqual(float(target["000002"]), 0.15)
         self.assertAlmostEqual(float(target["000003"]), 0.15)
 
+    def test_cap_and_redistribute_preserves_feasible_exposure_across_multiple_caps(self):
+        engine = BacktestEngine(make_config(max_position_weight=0.14))
+        signal = pd.Series(
+            [100.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+            index=[f"{value:06d}" for value in range(1, 11)],
+        )
+
+        target = engine._cap_and_redistribute(signal, exposure=1.0)
+
+        self.assertAlmostEqual(float(target.sum()), 1.0)
+        self.assertLessEqual(float(target.max()), 0.14 + 1e-12)
+
+        ranked_target = target.loc[signal.sort_values(ascending=False).index]
+        self.assertTrue((np.diff(ranked_target.to_numpy()) <= 1e-12).all())
+
+    def test_target_weights_enforces_position_cap_after_leverage(self):
+        engine = BacktestEngine(
+            make_config(
+                top_n_long=10,
+                long_exposure=1.0,
+                max_position_weight=0.14,
+                leverage=2.0,
+            )
+        )
+        signal = pd.Series(
+            list(range(20, 10, -1)),
+            index=[f"{value:06d}" for value in range(1, 11)],
+            dtype=float,
+        )
+
+        target = engine._target_weights(signal)
+
+        self.assertLessEqual(float(target.abs().max()), 0.14 + 1e-12)
+        self.assertAlmostEqual(float(target.abs().sum()), 1.40)
+
+    def test_target_weights_accepts_capacity_shortfall_when_candidates_are_few(self):
+        engine = BacktestEngine(
+            make_config(
+                top_n_long=3,
+                long_exposure=1.0,
+                max_position_weight=0.14,
+                leverage=2.0,
+            )
+        )
+        signal = pd.Series({"000001": 3.0, "000002": 2.0, "000003": 1.0})
+
+        target = engine._target_weights(signal)
+
+        self.assertLessEqual(float(target.abs().max()), 0.14 + 1e-12)
+        self.assertAlmostEqual(float(target.abs().sum()), 0.42)
+
+    def test_target_weights_preserves_net_neutrality_when_final_cap_is_binding(self):
+        engine = BacktestEngine(
+            make_config(
+                top_n_long=2,
+                top_n_short=2,
+                long_exposure=0.80,
+                short_exposure=0.80,
+                max_position_weight=0.30,
+                leverage=2.0,
+                allow_short=True,
+                use_net_neutral=True,
+            )
+        )
+        signal = pd.Series(
+            {"000001": 10.0, "000002": 5.0, "000003": -5.0, "000004": -10.0}
+        )
+
+        target = engine._target_weights(signal)
+
+        self.assertLessEqual(float(target.abs().max()), 0.30 + 1e-12)
+        self.assertAlmostEqual(float(target.sum()), 0.0)
+        self.assertAlmostEqual(float(target[target > 0].sum()), 0.60)
+        self.assertAlmostEqual(float(target[target < 0].sum()), -0.60)
+
+    def test_final_position_cap_balances_asymmetric_net_neutral_capacity(self):
+        engine = BacktestEngine(
+            make_config(max_position_weight=0.25, allow_short=True, use_net_neutral=True)
+        )
+        weights = pd.Series(
+            {"000001": 0.60, "000002": 0.30, "000003": 0.10, "000004": -0.80}
+        )
+
+        target = engine._enforce_final_position_cap(weights)
+
+        self.assertLessEqual(float(target.abs().max()), 0.25 + 1e-12)
+        self.assertAlmostEqual(float(target[target > 0].sum()), 0.25)
+        self.assertAlmostEqual(float(target[target < 0].sum()), -0.25)
+        self.assertAlmostEqual(float(target.sum()), 0.0)
+
+    def test_final_position_cap_cleans_non_finite_and_near_zero_weights(self):
+        engine = BacktestEngine(make_config(max_position_weight=0.30))
+        weights = pd.Series(
+            {
+                "000001": 0.40,
+                "000002": -0.40,
+                "000003": np.nan,
+                "000004": np.inf,
+                "000005": 1e-16,
+            }
+        )
+
+        target = engine._enforce_final_position_cap(weights)
+
+        self.assertEqual(set(target.index), {"000001", "000002"})
+        self.assertAlmostEqual(float(target["000001"]), 0.30)
+        self.assertAlmostEqual(float(target["000002"]), -0.30)
+
+        zero_cap_target = BacktestEngine(
+            make_config(max_position_weight=0.0)
+        )._enforce_final_position_cap(pd.Series({"000001": 0.50}))
+        self.assertTrue(zero_cap_target.empty)
+
     def test_mean_reversion_signal_does_not_forward_fill_missing_prices(self):
         engine = BacktestEngine(
             make_config(

@@ -439,27 +439,75 @@ class BacktestEngine:
         if base.empty or base.sum() <= 0:
             return pd.Series(dtype=float)
 
-        target_total = min(float(exposure), self.cfg.max_position_weight * len(base))
-        weights = base / base.sum() * target_total
-        for _ in range(len(base)):
-            over_cap = weights > self.cfg.max_position_weight
-            if not over_cap.any():
+        position_cap = max(float(self.cfg.max_position_weight), 0.0)
+        target_total = min(float(exposure), position_cap * len(base))
+        if target_total <= 0:
+            return pd.Series(0.0, index=base.index, dtype=float)
+
+        weights = pd.Series(0.0, index=base.index, dtype=float)
+        active = base.copy()
+        remaining = target_total
+        tolerance = 1e-12
+        while not active.empty and remaining > tolerance:
+            active_total = float(active.sum())
+            proposed = (
+                active / active_total * remaining
+                if active_total > 0
+                else pd.Series(remaining / len(active), index=active.index)
+            )
+            newly_capped = proposed >= position_cap - tolerance
+            if not newly_capped.any():
+                weights.loc[active.index] = proposed
+                remaining = 0.0
                 break
 
-            weights.loc[over_cap] = self.cfg.max_position_weight
-            uncapped = ~over_cap
-            remaining = target_total - float(weights.loc[over_cap].sum())
-            if remaining <= 0 or not uncapped.any():
-                weights.loc[uncapped] = 0.0
-                break
+            capped_index = proposed.index[newly_capped]
+            weights.loc[capped_index] = position_cap
+            remaining = max(remaining - position_cap * len(capped_index), 0.0)
+            active = active.drop(index=capped_index)
 
-            uncapped_base = base.loc[uncapped]
-            if uncapped_base.sum() <= 0:
-                weights.loc[uncapped] = remaining / int(uncapped.sum())
-            else:
-                weights.loc[uncapped] = uncapped_base / uncapped_base.sum() * remaining
+        return weights.clip(lower=0.0, upper=position_cap)
 
-        return weights.clip(lower=0.0, upper=self.cfg.max_position_weight)
+    def _enforce_final_position_cap(self, weights: pd.Series) -> pd.Series:
+        clean = weights.replace([np.inf, -np.inf], np.nan).dropna()
+        clean = clean[clean.abs() > 1e-15]
+        if clean.empty:
+            return pd.Series(dtype=float)
+
+        long_weights = clean[clean > 0]
+        short_weights = -clean[clean < 0]
+        long_total = float(long_weights.sum())
+        short_total = float(short_weights.sum())
+
+        if self.cfg.use_net_neutral:
+            if long_weights.empty or short_weights.empty:
+                return pd.Series(dtype=float)
+            feasible_long = min(
+                long_total, self.cfg.max_position_weight * len(long_weights)
+            )
+            feasible_short = min(
+                short_total, self.cfg.max_position_weight * len(short_weights)
+            )
+            balanced_total = min(feasible_long, feasible_short)
+            long_total = balanced_total
+            short_total = balanced_total
+
+        capped = pd.Series(0.0, index=clean.index, dtype=float)
+        if not long_weights.empty:
+            capped.loc[long_weights.index] = self._cap_and_redistribute(
+                long_weights, long_total
+            )
+        if not short_weights.empty:
+            capped.loc[short_weights.index] = -self._cap_and_redistribute(
+                short_weights, short_total
+            )
+        capped = capped[capped.abs() > 1e-15]
+
+        if not capped.empty and (
+            capped.abs() > self.cfg.max_position_weight + 1e-12
+        ).any():
+            raise RuntimeError("Final target weight exceeds max_position_weight")
+        return capped
 
     def _target_weights(self, signal: pd.Series) -> pd.Series:
         if signal.empty:
@@ -494,14 +542,7 @@ class BacktestEngine:
         if gross > (self.cfg.long_exposure + self.cfg.short_exposure):
             target = target / gross * (self.cfg.long_exposure + self.cfg.short_exposure)
         target = target * self.cfg.leverage
-
-        if target.abs().sum() > 0:
-            cap = target.abs().sum()
-            over = cap / max(self.cfg.max_position_weight * max(1, len(target)), 1e-12)
-            if over > 1:
-                target = target / over
-
-        return target
+        return self._enforce_final_position_cap(target)
 
     def _scale_for_risk(self, weights: pd.Series, returns: pd.DataFrame, idx: int) -> pd.Series:
         if weights.empty:
