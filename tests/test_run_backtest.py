@@ -1,9 +1,18 @@
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
-from run_backtest import BacktestEngine, StrategyConfig
+from run_backtest import (
+    BacktestEngine,
+    StrategyConfig,
+    clean_symbol,
+    load_config,
+    load_prices,
+    prepare_prices,
+)
 
 
 def make_config(**overrides):
@@ -15,6 +24,7 @@ def make_config(**overrides):
         "universe_dynamic_top_n": 0,
         "universe_selection_mode": "none",
         "universe_selection_min_history": 120,
+        "universe_selection_lag_days": 0,
         "max_abs_daily_return": 0.35,
         "execution_model": "close_to_close",
         "block_limit_up_buys": False,
@@ -56,7 +66,257 @@ def make_config(**overrides):
     return StrategyConfig(**values)
 
 
+def test_strategy_config_defaults_dynamic_universe_lag_to_zero():
+    cfg = load_config(Path("configs/high_risk_strategy_high_return_v2_dynamic_universe.yaml"))
+
+    assert cfg.universe_selection_lag_days == 0
+
+
+def test_dynamic_universe_lag_uses_previous_trading_day_membership():
+    engine = BacktestEngine(make_config(
+        universe_dynamic_top_n=1,
+        universe_selection_mode="high_return",
+        universe_selection_min_history=2,
+        universe_selection_lag_days=1,
+    ))
+    dates = pd.DatetimeIndex(
+        ["2026-01-02", "2026-01-05", "2026-01-09", "2026-01-14"]
+    ).append(pd.bdate_range("2026-01-15", periods=61))
+    assert dates[0].day_name() == "Friday"
+    assert dates[1].day_name() == "Monday"
+    assert dates.to_series().diff().max() >= pd.Timedelta(days=5)
+    close = pd.DataFrame({
+        "000001": np.linspace(10, 30, 65),
+        "000002": np.r_[np.linspace(10, 11, 64), 40],
+    }, index=dates)
+    amount = pd.DataFrame(1_000_000.0, index=dates, columns=close.columns)
+
+    lagged = engine._precompute_universe_panel(close, amount)
+    same_day = BacktestEngine(make_config(
+        universe_dynamic_top_n=1,
+        universe_selection_mode="high_return",
+        universe_selection_min_history=2,
+        universe_selection_lag_days=0,
+    ))._precompute_universe_panel(close, amount)
+
+    pd.testing.assert_series_equal(lagged.iloc[-1], same_day.iloc[-2], check_names=False)
+
+
+def test_load_prices_preserves_six_digit_symbols_across_csv_round_trip(tmp_path):
+    path = tmp_path / "symbols.csv"
+    pd.DataFrame(
+        {
+            "date": pd.date_range("2026-01-01", periods=4, freq="D"),
+            "symbol": ["000001", "000100", 1, 100],
+            "open": [10.0] * 4,
+            "high": [10.0] * 4,
+            "low": [10.0] * 4,
+            "close": [10.0] * 4,
+            "volume": [1_000.0] * 4,
+            "amount": [10_000.0] * 4,
+        }
+    ).to_csv(path, index=False)
+
+    loaded = load_prices(path, None, None)
+
+    assert loaded["symbol"].tolist() == ["000001", "000100", "000001", "000100"]
+    assert clean_symbol(1) == "000001"
+    assert clean_symbol(100.0) == "000100"
+
+
+def test_prepare_prices_accepts_a_validated_in_memory_panel():
+    panel = pd.DataFrame(
+        {
+            "date": ["2026-01-01", "2026-01-02"],
+            "symbol": [1, 100.0],
+            "open": [10.0, 11.0],
+            "high": [10.0, 11.0],
+            "low": [10.0, 11.0],
+            "close": [10.0, 11.0],
+            "volume": [1_000.0, 1_000.0],
+            "amount": [10_000.0, 11_000.0],
+        }
+    )
+
+    prepared = prepare_prices(panel, None, None)
+
+    assert prepared["symbol"].tolist() == ["000001", "000100"]
+    assert pd.api.types.is_datetime64_any_dtype(prepared["date"])
+
+
+def test_load_prices_keeps_legacy_vendor_symbol_compatibility(tmp_path):
+    path = tmp_path / "vendor_symbols.csv"
+    pd.DataFrame(
+        {
+            "date": ["2026-01-01", "2026-01-02"],
+            "symbol": ["000001.SZ", "SH600000"],
+            "open": [10.0, 10.0],
+            "high": [10.0, 10.0],
+            "low": [10.0, 10.0],
+            "close": [10.0, 10.0],
+            "volume": [1_000.0, 1_000.0],
+            "amount": [10_000.0, 10_000.0],
+        }
+    ).to_csv(path, index=False)
+
+    loaded = load_prices(path, None, None)
+
+    assert loaded["symbol"].tolist() == ["000001", "600000"]
+
+
+def test_load_prices_preserves_legacy_zero_row_filtering(tmp_path):
+    path = tmp_path / "interior_zero.csv"
+    pd.DataFrame(
+        {
+            "date": ["2026-01-01", "2026-01-02"],
+            "symbol": ["000001", "000001"],
+            "open": [0.0, 10.0],
+            "high": [0.0, 10.0],
+            "low": [0.0, 10.0],
+            "close": [0.0, 10.0],
+            "volume": [0.0, 1_000.0],
+            "amount": [0.0, 10_000.0],
+        }
+    ).to_csv(path, index=False)
+
+    loaded = load_prices(path, None, None)
+
+    assert loaded["date"].tolist() == [pd.Timestamp("2026-01-02")]
+
+
 class RunBacktestEngineTest(unittest.TestCase):
+    def test_engine_keeps_missing_amount_unavailable(self):
+        engine = BacktestEngine(make_config())
+        dates = pd.date_range("2026-01-01", periods=6, freq="D")
+        raw = pd.DataFrame(
+            {
+                "date": dates,
+                "symbol": ["000001"] * len(dates),
+                "open": [10.0] * len(dates),
+                "high": [10.0] * len(dates),
+                "low": [10.0] * len(dates),
+                "close": [10.0] * len(dates),
+                "volume": [1_000.0] * len(dates),
+            }
+        )
+        captured = {}
+        original = engine._precompute_universe_panel
+
+        def capture_amount(close, amount):
+            captured["amount"] = amount.copy()
+            return original(close, amount)
+
+        engine._precompute_universe_panel = capture_amount
+
+        engine.run(raw)
+
+        self.assertTrue(captured["amount"].isna().all().all())
+
+    def test_close_to_close_metrics_report_zero_execution_constraint_counts(self):
+        dates = pd.date_range("2026-01-01", periods=6, freq="D")
+        raw = pd.DataFrame(
+            {
+                "date": list(dates) * 2,
+                "symbol": ["000001"] * len(dates) + ["000002"] * len(dates),
+                "open": [10.0] * 12,
+                "high": [10.0] * 12,
+                "low": [10.0] * 12,
+                "close": [10.0] * 12,
+                "volume": [1_000.0] * 12,
+                "amount": [10_000.0] * 12,
+            }
+        )
+
+        result = BacktestEngine(make_config()).run(raw)
+
+        for name in (
+            "blocked_limit_up_buys",
+            "blocked_limit_down_sells",
+            "blocked_open_gap_buys",
+            "blocked_orders_total",
+        ):
+            self.assertEqual(result["metrics"][name], 0)
+
+    def test_next_open_metrics_accumulate_execution_constraint_counts(self):
+        engine = BacktestEngine(
+            make_config(
+                execution_model="next_open",
+                block_limit_up_buys=True,
+                block_limit_down_sells=True,
+                max_buy_open_gap=0.15,
+            )
+        )
+        dates = pd.date_range("2026-01-01", periods=3, freq="D")
+        columns = pd.Index(["000001", "000002", "300001"])
+        close = pd.DataFrame(10.0, index=dates, columns=columns)
+        open_px = close.copy()
+        open_px.iloc[2] = [11.0, 9.0, 11.6]
+        amount = pd.DataFrame(1_000_000.0, index=dates, columns=columns)
+        targets = [
+            pd.Series({"000001": 0.0, "000002": 0.2, "300001": 0.0}),
+            pd.Series({"000001": 0.2, "000002": 0.0, "300001": 0.2}),
+            pd.Series(0.0, index=columns),
+        ]
+
+        def build_target(*_args):
+            return targets.pop(0), 0, "rebalance"
+
+        engine._build_target = build_target
+
+        result = engine._run_next_open(close, open_px, amount)
+
+        self.assertEqual(
+            {name: result["metrics"][name] for name in (
+                "blocked_limit_up_buys",
+                "blocked_limit_down_sells",
+                "blocked_open_gap_buys",
+                "blocked_orders_total",
+            )},
+            {
+                "blocked_limit_up_buys": 1,
+                "blocked_limit_down_sells": 1,
+                "blocked_open_gap_buys": 1,
+                "blocked_orders_total": 3,
+            },
+        )
+
+    def test_next_open_uses_point_in_time_limit_rate_when_present(self):
+        engine = BacktestEngine(
+            make_config(
+                execution_model="next_open",
+                block_limit_up_buys=True,
+                block_limit_down_sells=True,
+            )
+        )
+        dates = pd.date_range("2026-01-01", periods=3, freq="D")
+        columns = pd.Index(["000001"])
+        close = pd.DataFrame(10.0, index=dates, columns=columns)
+        open_px = close.copy()
+        open_px.iloc[2, 0] = 10.5
+        amount = pd.DataFrame(1_000_000.0, index=dates, columns=columns)
+        limit_rate = pd.DataFrame(0.05, index=dates, columns=columns)
+        targets = [
+            pd.Series(0.0, index=columns),
+            pd.Series(0.2, index=columns),
+            pd.Series(0.0, index=columns),
+        ]
+
+        def build_target(*_args):
+            return targets.pop(0), 0, "rebalance"
+
+        engine._build_target = build_target
+
+        result = engine._run_next_open(
+            close,
+            open_px,
+            amount,
+            limit_rate=limit_rate,
+        )
+
+        self.assertEqual(result["metrics"]["blocked_limit_up_buys"], 1)
+        self.assertEqual(result["metrics"]["blocked_orders_total"], 1)
+        self.assertAlmostEqual(float(result["positions"]["000001"]), 0.0)
+
     def test_target_weights_redistributes_clipped_long_exposure_to_available_names(self):
         engine = BacktestEngine(
             make_config(
