@@ -95,6 +95,26 @@ class DailyPersonalOverlayReportTest(unittest.TestCase):
         self.assertEqual(view.loc[0, "股票名称"], "平安银行")
         self.assertAlmostEqual(view.loc[0, "权重变化"], -0.008)
 
+    def test_build_selected_view_includes_shadow_account_prompt_columns_when_present(self):
+        overlay = pd.DataFrame(
+            [
+                {
+                    "symbol": "000001",
+                    "personal_selected": True,
+                    "personal_adjusted_target_weight": 0.02,
+                    "shadow_account_signal_cn": "风险提示",
+                    "shadow_account_notes": "high_quarter: 历史亏损显著",
+                }
+            ]
+        )
+
+        view = build_selected_view(overlay, name_map={"000001": "平安银行"})
+
+        self.assertIn("影子账户提示", view.columns)
+        self.assertIn("影子账户说明", view.columns)
+        self.assertEqual(view.loc[0, "影子账户提示"], "风险提示")
+        self.assertIn("high_quarter", view.loc[0, "影子账户说明"])
+
     def test_load_name_map_accepts_daily_market_data_headers(self):
         names = pd.DataFrame(
             [

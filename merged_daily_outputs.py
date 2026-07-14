@@ -9,6 +9,11 @@ from typing import Iterable
 import pandas as pd
 
 from build_daily_personal_overlay_report import load_name_map
+from shadow_account_signals import (
+    apply_shadow_account_signals,
+    load_shadow_account_review,
+    shadow_account_summary_lines,
+)
 
 
 DEFAULT_CONSTRUCTIVE_TREND_STATES = {
@@ -99,6 +104,10 @@ PRIORITY_WATCHLIST_CN_COLUMNS = {
     "return_20d": "20\u65e5\u6da8\u8dcc\u5e45",
     "return_60d": "60\u65e5\u6da8\u8dcc\u5e45",
     "close_position": "\u533a\u95f4\u4f4d\u7f6e",
+    "shadow_account_signal_score": "\u5f71\u5b50\u8d26\u6237\u5206",
+    "shadow_account_signal": "\u5f71\u5b50\u8d26\u6237\u63d0\u793a",
+    "shadow_account_signal_cn": "\u5f71\u5b50\u8d26\u6237\u63d0\u793a\u4e2d\u6587",
+    "shadow_account_notes": "\u5f71\u5b50\u8d26\u6237\u8bf4\u660e",
 }
 
 
@@ -601,9 +610,13 @@ def write_outputs(
     asof_date: str,
     state_pattern_scan: pd.DataFrame,
     model_decision_table: pd.DataFrame,
+    shadow_account_review: dict[str, object] | None = None,
 ) -> dict[str, Path]:
     token = _date_token(asof_date)
     priority_watchlist = build_priority_watchlist(state_pattern_scan, model_decision_table)
+    priority_watchlist = apply_shadow_account_signals(
+        priority_watchlist, shadow_account_review
+    )
     paths = {
         "state_pattern_scan": output_dir / f"merged_state_pattern_scan_{token}.csv",
         "state_pattern_scan_cn": output_dir / f"merged_state_pattern_scan_{token}_cn.csv",
@@ -636,6 +649,7 @@ def write_outputs(
         "",
         f"- rows: {len(priority_watchlist)}",
         f"- buckets: {priority_counts}",
+        *[f"- {line}" for line in shadow_account_summary_lines(shadow_account_review)],
         "",
         _markdown_table(priority_watchlist.rename(columns=PRIORITY_WATCHLIST_CN_COLUMNS), max_rows=15),
         "",
@@ -667,6 +681,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--asof-date", required=True)
     parser.add_argument("--names-source", default=None)
+    parser.add_argument("--shadow-account-review", default=None)
     return parser.parse_args()
 
 
@@ -683,7 +698,14 @@ def main() -> None:
         name_map = load_name_map(Path(args.names_source))
         state_pattern_scan = fill_missing_stock_names(state_pattern_scan, name_map)
         model_decision_table = fill_missing_stock_names(model_decision_table, name_map)
-    paths = write_outputs(Path(args.output_dir), args.asof_date, state_pattern_scan, model_decision_table)
+    shadow_account_review = load_shadow_account_review(args.shadow_account_review)
+    paths = write_outputs(
+        Path(args.output_dir),
+        args.asof_date,
+        state_pattern_scan,
+        model_decision_table,
+        shadow_account_review=shadow_account_review,
+    )
     for path in paths.values():
         print(path)
 

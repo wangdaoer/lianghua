@@ -112,6 +112,12 @@ def bucket_label(bucket: str) -> str:
 
 def shape_priority_row(row: dict[str, str]) -> dict[str, Any]:
     bucket = clean_text(row.get("priority_bucket"))
+    shadow_signal = clean_text(row.get("shadow_account_signal")) or "neutral"
+    shadow_label = clean_text(row.get("shadow_account_signal_cn")) or {
+        "risk": "风险提示",
+        "prefer": "偏好确认",
+        "neutral": "无额外提示",
+    }.get(shadow_signal, shadow_signal)
     shaped = {
         "code": clean_text(row.get("symbol") or row.get("code")),
         "name": clean_text(row.get("stock_name") or row.get("name")),
@@ -133,7 +139,17 @@ def shape_priority_row(row: dict[str, str]) -> dict[str, Any]:
         "return20dPct": pct_or_none(row.get("return_20d")),
         "return60dPct": pct_or_none(row.get("return_60d")),
         "closePositionPct": pct_or_none(row.get("close_position")),
+        "shadowAccount": {
+            "signal": shadow_signal,
+            "label": shadow_label,
+            "score": number_or_none(row.get("shadow_account_signal_score")),
+            "notes": clean_text(row.get("shadow_account_notes")),
+        },
     }
+    if shaped["shadowAccount"]["score"] is None:
+        shaped["shadowAccount"].pop("score")
+    if not shaped["shadowAccount"]["notes"]:
+        shaped["shadowAccount"].pop("notes")
     return {key: value for key, value in shaped.items() if value not in (None, "")}
 
 
@@ -160,6 +176,12 @@ def build_feed(asof_date: str, output_root: Path, state_log: Path) -> dict[str, 
     state_record = latest_state_record(state_log, asof_date)
     priority_rows = [shape_priority_row(row) for row in priority_rows_raw]
     bucket_counts = dict(Counter(row.get("bucket", "未分层") for row in priority_rows))
+    shadow_account_counts = dict(
+        Counter(
+            row.get("shadowAccount", {}).get("signal", "neutral")
+            for row in priority_rows
+        )
+    )
     verification = {
         "tests": state_record.get("verification", {}).get("tests", "unknown"),
         "priorityRows": len(priority_rows),
@@ -179,6 +201,7 @@ def build_feed(asof_date: str, output_root: Path, state_log: Path) -> dict[str, 
         "runType": state_record.get("run_type", "unknown"),
         "verification": verification,
         "bucketCounts": bucket_counts,
+        "shadowAccountCounts": shadow_account_counts,
         "buckets": [
             {"bucket": bucket, "label": bucket_label(bucket), "count": count}
             for bucket, count in bucket_counts.items()
