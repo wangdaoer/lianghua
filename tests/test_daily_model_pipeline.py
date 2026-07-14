@@ -11,11 +11,13 @@ from run_daily_model_pipeline import (
     PipelineConfig,
     PipelineStep,
     append_daily_run_state,
+    attach_daily_run_card,
     build_daily_pipeline_steps,
     build_daily_run_state,
     ensure_fetch_status_ok,
     execute_pipeline,
     latest_daily_date,
+    latest_shadow_account_review,
     metrics_path_for_date,
     names_source_for_date,
     parse_args,
@@ -106,6 +108,52 @@ class DailyModelPipelineTest(unittest.TestCase):
         stability_args = " ".join(str(part) for part in stability_step.command)
         self.assertIn("summarize_core_risk_filter_stability.py", stability_args)
         self.assertIn("core_risk_filter_finalist_stability_20260629", stability_args)
+
+    def test_pipeline_passes_latest_shadow_account_review_when_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            review_dir = (
+                root
+                / "outputs"
+                / "personal_trade_review_20260629"
+                / "shadow_account"
+            )
+            review_dir.mkdir(parents=True)
+            review = review_dir / "shadow_account_review.json"
+            review.write_text("{}", encoding="utf-8")
+            future_dir = (
+                root
+                / "outputs"
+                / "personal_trade_review_20260701"
+                / "shadow_account"
+            )
+            future_dir.mkdir(parents=True)
+            future = future_dir / "shadow_account_review.json"
+            future.write_text("{}", encoding="utf-8")
+            older_dir = (
+                root
+                / "outputs"
+                / "personal_trade_review_20260620"
+                / "shadow_account"
+            )
+            older_dir.mkdir(parents=True)
+            older = older_dir / "shadow_account_review.json"
+            older.write_text("{}", encoding="utf-8")
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                python_exe="python",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+            )
+
+            steps = {step.name: step for step in build_daily_pipeline_steps(config)}
+            report_args = " ".join(steps["daily_chinese_report"].command)
+            merged_args = " ".join(steps["merged_daily_outputs"].command)
+            detected = latest_shadow_account_review(root, "2026-06-29")
+
+        self.assertEqual(detected, review)
+        self.assertIn(f"--shadow-account-review {review}", report_args)
+        self.assertIn(f"--shadow-account-review {review}", merged_args)
 
     def test_pipeline_can_skip_regime_shadow_compare(self):
         config = PipelineConfig(
@@ -562,6 +610,65 @@ class DailyModelPipelineTest(unittest.TestCase):
             rows = [json.loads(line) for line in state_log.read_text(encoding="utf-8").splitlines()]
 
             self.assertEqual([row["asof_date"] for row in rows], ["2026-06-29", "2026-06-30"])
+
+    def test_attach_daily_run_card_writes_card_and_updates_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            output.mkdir(parents=True)
+            self._seed_minimal_daily_state_inputs(output, "20260629")
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                python_exe="python",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                daily_data_dir=root,
+                fetch_status_utils=root / "missing_utils.py",
+            )
+            record = build_daily_run_state(
+                config, [PipelineStep("example", ("python", "example.py"))]
+            )
+
+            paths = attach_daily_run_card(
+                config, record, generated_at="2026-06-29T16:00:00"
+            )
+
+            self.assertTrue(paths["json"].exists())
+            self.assertTrue(paths["markdown"].exists())
+            self.assertEqual(
+                record["artifacts"]["daily_run_card_json"], str(paths["json"])
+            )
+            self.assertEqual(
+                record["artifacts"]["daily_run_card_markdown"],
+                str(paths["markdown"]),
+            )
+
+    def test_successful_pipeline_records_state_when_run_card_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_log = root / "daily_run_state.jsonl"
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                python_exe="python",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                daily_data_dir=root,
+                fetch_status_utils=root / "missing_utils.py",
+                include_benchmark_refresh=False,
+                include_regime_shadow_compare=False,
+                include_regime_shadow_tracking=False,
+            )
+
+            with patch(
+                "run_daily_model_pipeline.attach_daily_run_card",
+                side_effect=OSError("run card unavailable"),
+            ):
+                execute_pipeline(config, [], state_log=state_log)
+
+            record = json.loads(state_log.read_text(encoding="utf-8").splitlines()[0])
+
+        self.assertEqual(record["run_status"], "success")
+        self.assertEqual(record["daily_run_card_error"], "run card unavailable")
 
     @staticmethod
     def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:

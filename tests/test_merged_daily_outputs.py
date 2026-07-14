@@ -10,6 +10,7 @@ from merged_daily_outputs import (
     build_priority_watchlist,
     build_state_pattern_scan,
     fill_missing_stock_names,
+    write_outputs,
 )
 
 
@@ -421,6 +422,78 @@ class MergedDailyOutputsTest(unittest.TestCase):
 
         self.assertEqual(filled.loc[0, "stock_name"], "Alpha")
         self.assertEqual(filled.loc[1, "stock_name"], "Existing")
+
+    def test_write_outputs_adds_shadow_account_prompt_columns(self):
+        state_pattern_scan = pd.DataFrame(
+            [
+                {
+                    "symbol": "000001",
+                    "stock_name": "Alpha",
+                    "state_pattern_bucket": "pattern_confirmed_by_trend",
+                    "pattern_score": 1.2,
+                    "close_position": 0.34,
+                    "return_20d": 0.06,
+                },
+                {
+                    "symbol": "000002",
+                    "stock_name": "Beta",
+                    "state_pattern_bucket": "pattern_confirmed_by_trend",
+                    "pattern_score": 1.1,
+                    "close_position": 0.90,
+                    "return_20d": 0.10,
+                },
+            ]
+        )
+        model_decision_table = pd.DataFrame(
+            [
+                {
+                    "symbol": "000001",
+                    "stock_name": "Alpha",
+                    "personal_selected": True,
+                    "personal_target_weight": 0.02,
+                    "decision_layer": "kept_by_overlay",
+                },
+                {
+                    "symbol": "000002",
+                    "stock_name": "Beta",
+                    "personal_selected": True,
+                    "personal_target_weight": 0.02,
+                    "decision_layer": "kept_by_overlay",
+                },
+            ]
+        )
+        shadow_review = {
+            "research_only": True,
+            "allows_broker_orders": False,
+            "rules": [
+                {"action": "prefer", "source": "entry_position", "value": "mid_low"},
+                {
+                    "action": "avoid_or_reduce",
+                    "source": "entry_position",
+                    "value": "high_quarter",
+                },
+            ],
+        }
+        with TemporaryDirectory() as tmp:
+            paths = write_outputs(
+                Path(tmp),
+                "2026-06-29",
+                state_pattern_scan,
+                model_decision_table,
+                shadow_account_review=shadow_review,
+            )
+            priority = pd.read_csv(paths["priority_watchlist"], dtype={"symbol": str})
+            priority_cn = pd.read_csv(
+                paths["priority_watchlist_cn"], dtype={"股票代码": str}
+            )
+
+        self.assertIn("shadow_account_signal", priority.columns)
+        self.assertIn("shadow_account_notes", priority.columns)
+        by_symbol = priority.set_index("symbol")
+        self.assertEqual(by_symbol.loc["000001", "shadow_account_signal"], "prefer")
+        self.assertEqual(by_symbol.loc["000002", "shadow_account_signal"], "risk")
+        self.assertIn("影子账户提示", priority_cn.columns)
+        self.assertIn("影子账户说明", priority_cn.columns)
 
     def test_write_table_uses_pending_file_when_target_is_unwritable(self):
         table = pd.DataFrame([{"symbol": "000001", "score": 1.0}])

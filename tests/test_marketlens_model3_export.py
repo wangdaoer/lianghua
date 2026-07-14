@@ -25,6 +25,10 @@ class MarketLensModel3ExportTest(unittest.TestCase):
                         "personal_target_weight": "0.02325",
                         "personal_action_cn": "可保留",
                         "personal_reasons_cn": "低位介入习惯",
+                        "shadow_account_signal": "risk",
+                        "shadow_account_signal_cn": "风险提示",
+                        "shadow_account_signal_score": "-1",
+                        "shadow_account_notes": "entry_momentum:>+20%",
                         "trend_state": "生命线健康",
                         "return_5d": "-0.1",
                         "return_20d": "0.25",
@@ -68,6 +72,14 @@ class MarketLensModel3ExportTest(unittest.TestCase):
             self.assertEqual(feed["top10"][0]["code"], "000001")
             self.assertEqual(feed["top10"][0]["targetWeightPct"], 2.325)
             self.assertEqual(feed["top10"][0]["return5dPct"], -10.0)
+            self.assertEqual(feed["top10"][0]["shadowAccount"]["signal"], "risk")
+            self.assertEqual(feed["top10"][0]["shadowAccount"]["label"], "风险提示")
+            self.assertEqual(feed["top10"][0]["shadowAccount"]["score"], -1.0)
+            self.assertEqual(
+                feed["top10"][0]["shadowAccount"]["notes"],
+                "entry_momentum:>+20%",
+            )
+            self.assertEqual(feed["shadowAccountCounts"], {"risk": 1, "neutral": 1})
             self.assertNotIn("D:\\", rendered)
 
     def test_export_feed_writes_model_output_and_dashboard_copy(self):

@@ -11,6 +11,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from shadow_account_signals import (
+    apply_shadow_account_signals,
+    load_shadow_account_review,
+    shadow_account_summary_lines,
+)
+
 
 ACTION_CN = {"allow": "可保留", "reduce": "降仓", "watch_only": "只观察"}
 CODE_COLUMNS = [
@@ -282,6 +288,13 @@ def build_selected_view(overlay: pd.DataFrame, name_map: dict[str, str] | None =
             "个人调整后分数": _numeric(selected, "personal_adjusted_score", np.nan).to_numpy(),
         }
     )
+    if "shadow_account_signal_cn" in selected or "shadow_account_notes" in selected:
+        view["影子账户提示"] = _text(
+            selected, "shadow_account_signal_cn", "无额外提示"
+        ).to_numpy()
+        view["影子账户说明"] = _text(
+            selected, "shadow_account_notes", ""
+        ).to_numpy()
     return view.reset_index(drop=True)
 
 
@@ -517,6 +530,7 @@ def write_report(
     asof_date: str | None = None,
     name_map: dict[str, str] | None = None,
     watchlist_view: pd.DataFrame | None = None,
+    shadow_account_review: dict[str, Any] | None = None,
 ) -> Path:
     summary = summarize_overlay_changes(base, overlay)
     date_label = asof_date or "latest"
@@ -542,6 +556,9 @@ def write_report(
         "",
         "## 风险提示",
         *[f"- {line}" for line in build_risk_warnings(summary, metrics or {})],
+        "",
+        "## 影子账户提示",
+        *[f"- {line}" for line in shadow_account_summary_lines(shadow_account_review)],
         "",
         "## 提前观察形态",
         "这部分只用于提前观察分析，不直接触发买入或加仓。",
@@ -667,6 +684,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asof-date", default=None)
     parser.add_argument("--names-source", default=None)
     parser.add_argument("--early-watchlist", default=None)
+    parser.add_argument("--shadow-account-review", default=None)
     parser.add_argument("--daily-data-dir", default="D:/codex/daily-market-data")
     parser.add_argument("--fallback-data-dir", default="D:/codex/2026-06-15-exchange-data-ingest")
     parser.add_argument(
@@ -689,6 +707,8 @@ def main() -> None:
 
     base = pd.read_csv(base_path, dtype={"symbol": str})
     overlay = pd.read_csv(overlay_path, dtype={"symbol": str})
+    shadow_account_review = load_shadow_account_review(args.shadow_account_review)
+    overlay = apply_shadow_account_signals(overlay, shadow_account_review)
     print(_check_latest_fetch_status(Path(args.fetch_status_utils)))
     names_source = (
         Path(args.names_source)
@@ -713,7 +733,19 @@ def main() -> None:
     report_path = output_dir / f"daily_personal_overlay_report_{date_token}.md"
     selected_view.to_csv(selected_path, index=False, encoding="utf-8-sig")
     change_view.to_csv(changes_path, index=False, encoding="utf-8-sig")
-    write_report(report_path, base, overlay, selected_view, change_view, metrics, rules, asof, name_map, watchlist_view)
+    write_report(
+        report_path,
+        base,
+        overlay,
+        selected_view,
+        change_view,
+        metrics,
+        rules,
+        asof,
+        name_map,
+        watchlist_view,
+        shadow_account_review,
+    )
 
     summary = summarize_overlay_changes(base, overlay)
     print(f"Report: {report_path}")

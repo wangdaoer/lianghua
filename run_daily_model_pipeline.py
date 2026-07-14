@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from daily_run_card import write_daily_run_card
+
 
 DEFAULT_DAILY_DATA_DIR = Path(r"D:\codex\daily-market-data")
 DEFAULT_FALLBACK_DATA_DIR = Path(r"D:\codex\2026-06-15-exchange-data-ingest")
@@ -50,6 +52,7 @@ class PipelineConfig:
     benchmark: Path = DEFAULT_BENCHMARK
     rules: Path = Path("configs/personal_trade_habit_overlay.yaml")
     symbol_history: Path | None = None
+    shadow_account_review: Path | None = None
     train_model: bool = True
     top_n: int = 40
     candidate_pool_n: int = 120
@@ -218,6 +221,27 @@ def latest_symbol_history(project_root: Path) -> Path | None:
     return files[0] if files else None
 
 
+def latest_shadow_account_review(
+    project_root: Path,
+    asof_date: str | None = None,
+) -> Path | None:
+    asof_token = _date_token(asof_date) if asof_date else None
+    eligible: list[tuple[str, float, Path]] = []
+    for path in (project_root / "outputs").glob(
+        "personal_trade_review_*/shadow_account/shadow_account_review.json"
+    ):
+        match = re.fullmatch(
+            r"personal_trade_review_(\d{8})", path.parent.parent.name
+        )
+        if not match:
+            continue
+        review_token = match.group(1)
+        if asof_token and review_token > asof_token:
+            continue
+        eligible.append((review_token, path.stat().st_mtime, path))
+    return max(eligible, key=lambda item: (item[0], item[1]))[2] if eligible else None
+
+
 def names_source_for_date(asof_date: str, daily_data_dir: Path) -> Path:
     normalized = daily_data_dir / "ths_exports" / "normalized"
     for suffix in (".csv", ".xls", ".xlsx"):
@@ -263,6 +287,8 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "strategy_family_forward_summary": output_root / f"strategy_family_forward_summary_{token}.csv",
         "strategy_family_health": output_root / f"strategy_family_health_{token}.csv",
         "strategy_family_forward_report": output_root / f"strategy_family_forward_report_{token}.md",
+        "daily_run_card_json": output_root / f"daily_run_card_{token}.json",
+        "daily_run_card_markdown": output_root / f"daily_run_card_{token}.md",
         "daily_report": output_root / f"daily_personal_overlay_report_{token}.md",
         "selected": output_root / f"daily_personal_overlay_selected_{token}.csv",
         "changes": output_root / f"daily_personal_overlay_changes_{token}.csv",
@@ -470,6 +496,12 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
     if config.symbol_history is not None:
         overlay_command.extend(["--symbol-history", str(config.symbol_history)])
     steps.append(PipelineStep("personal_overlay", tuple(overlay_command)))
+    shadow_review = config.shadow_account_review or latest_shadow_account_review(
+        config.project_root, config.asof_date
+    )
+    shadow_args: tuple[str, ...] = ()
+    if shadow_review is not None and shadow_review.exists():
+        shadow_args = ("--shadow-account-review", str(shadow_review))
 
     steps.append(
         PipelineStep(
@@ -541,6 +573,7 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                 str(config.fallback_data_dir),
                 "--fetch-status-utils",
                 str(config.fetch_status_utils),
+                *shadow_args,
             ),
         )
     )
@@ -564,6 +597,7 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                 config.asof_date,
                 "--names-source",
                 str(paths["names_source"]),
+                *shadow_args,
             ),
         )
     )
@@ -809,6 +843,35 @@ def append_daily_run_state(state_log: Path, record: dict[str, object]) -> None:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def attach_daily_run_card(
+    config: PipelineConfig,
+    record: dict[str, object],
+    generated_at: str | None = None,
+) -> dict[str, Path]:
+    paths = _paths(config)
+    card_paths = write_daily_run_card(
+        paths["output_root"], record, generated_at=generated_at
+    )
+    artifacts = record.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+        record["artifacts"] = artifacts
+    artifacts["daily_run_card_json"] = str(card_paths["json"])
+    artifacts["daily_run_card_markdown"] = str(card_paths["markdown"])
+    return card_paths
+
+
+def attach_daily_run_card_safely(
+    config: PipelineConfig,
+    record: dict[str, object],
+) -> dict[str, Path] | None:
+    try:
+        return attach_daily_run_card(config, record)
+    except (OSError, TypeError, ValueError) as exc:
+        record["daily_run_card_error"] = str(exc)
+        return None
+
+
 def execute_pipeline(
     config: PipelineConfig,
     steps: list[PipelineStep],
@@ -835,6 +898,7 @@ def execute_pipeline(
                     "message": str(exc),
                 },
             )
+            attach_daily_run_card_safely(config, record)
             append_daily_run_state(state_log, record)
         raise
     if not dry_run and not skip_state_log:
@@ -844,6 +908,7 @@ def execute_pipeline(
             argv=argv,
             test_status=test_status,
         )
+        attach_daily_run_card_safely(config, record)
         append_daily_run_state(state_log, record)
 
 
@@ -862,6 +927,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark", default=str(DEFAULT_BENCHMARK))
     parser.add_argument("--rules", default="configs/personal_trade_habit_overlay.yaml")
     parser.add_argument("--symbol-history", default=None)
+    parser.add_argument("--shadow-account-review", default=None)
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-strategy-family-forward", action="store_true")
     parser.add_argument("--skip-strategy-stability", action="store_true")
@@ -883,6 +949,11 @@ def main() -> None:
     daily_dir = Path(args.daily_dir)
     asof_date = args.asof_date or discover_latest_daily_date(daily_dir)
     symbol_history = Path(args.symbol_history) if args.symbol_history else latest_symbol_history(project_root)
+    shadow_account_review = (
+        Path(args.shadow_account_review)
+        if args.shadow_account_review
+        else latest_shadow_account_review(project_root, asof_date)
+    )
     config = PipelineConfig(
         asof_date=asof_date,
         python_exe=args.python_exe,
@@ -897,6 +968,7 @@ def main() -> None:
         benchmark=Path(args.benchmark),
         rules=Path(args.rules),
         symbol_history=symbol_history,
+        shadow_account_review=shadow_account_review,
         train_model=not args.skip_train,
         include_strategy_family_forward_report=not args.skip_strategy_family_forward,
         include_strategy_stability_report=not args.skip_strategy_stability,
@@ -947,6 +1019,8 @@ def main() -> None:
     if not args.dry_run and not args.skip_state_log:
         print("Daily run state:")
         print(state_log)
+        print(output_root / f"daily_run_card_{token}.json")
+        print(output_root / f"daily_run_card_{token}.md")
 
 
 if __name__ == "__main__":
