@@ -94,10 +94,21 @@ def find_ignition_candidates(
     ma60 = close.rolling(60, min_periods=60).mean()
     amount_ratio = amount / (amount_median + 1e-12)
 
+    return_20d = close / close.shift(20) - 1.0
+    return_60d = close / close.shift(60) - 1.0
+    volatility_20d = close.pct_change(fill_method=None).rolling(20, min_periods=20).std()
+    ma20_over_ma60 = ma20 / (ma60 + 1e-12) - 1.0
+    close_over_ma20 = close / (ma20 + 1e-12) - 1.0
+    rolling_high_120 = high.rolling(120, min_periods=60).max()
+    drawdown_120d = close / (rolling_high_120 + 1e-12) - 1.0
+    amount_mean_5 = amount.replace(0, np.nan).rolling(5, min_periods=3).mean()
+    amount_trend_5_20 = amount_mean_5 / (amount_median + 1e-12)
+
     breakout = close.gt(prev_high * (1.0 + breakout_buffer))
     volume_ok = amount_ratio.ge(amount_multiplier)
     trend_ok = close.gt(ma60) & ma20.ge(ma60 * 0.98)
     valid = breakout & volume_ok & trend_ok
+    breakout_count_20d = breakout.astype(float).rolling(20, min_periods=5).sum()
 
     out = pd.DataFrame(
         {
@@ -108,6 +119,14 @@ def find_ignition_candidates(
             "amount_ratio": amount_ratio,
             "ma20": ma20,
             "ma60": ma60,
+            "return_20d": return_20d,
+            "return_60d": return_60d,
+            "volatility_20d": volatility_20d,
+            "ma20_over_ma60": ma20_over_ma60,
+            "close_over_ma20": close_over_ma20,
+            "drawdown_120d": drawdown_120d,
+            "amount_trend_5_20": amount_trend_5_20,
+            "breakout_count_20d": breakout_count_20d,
         }
     )
     return out.loc[valid].dropna(subset=["close", "prev_high"])
@@ -209,6 +228,10 @@ def summarize_trends_for_symbol(
     lifeline_breach_buffer: float = 0.03,
     lifeline_max_breach_days: int = 3,
     lifeline_windows: tuple[int, ...] = (20, 30, 60, 120),
+    include_below_threshold: bool = False,
+    include_prestart_ignitions: bool = True,
+    outcome_horizon_days: int = 365,
+    ignition_cooldown_bars: int = 20,
 ) -> list[dict[str, object]]:
     close = pd.to_numeric(close, errors="coerce").sort_index()
     high = pd.to_numeric(high, errors="coerce").reindex(close.index)
@@ -216,7 +239,11 @@ def summarize_trends_for_symbol(
     if close.loc[:end].dropna().empty:
         return []
 
-    ignition_start = start - pd.Timedelta(days=ignition_lookback_days)
+    ignition_start = (
+        start - pd.Timedelta(days=ignition_lookback_days)
+        if include_prestart_ignitions
+        else start
+    )
     ignitions = find_ignition_candidates(
         close,
         high,
@@ -228,12 +255,16 @@ def summarize_trends_for_symbol(
     )
     ignitions = ignitions.loc[(ignitions.index >= ignition_start) & (ignitions.index <= end)]
 
+    valid_dates = close.loc[:end].dropna().index
+    date_positions = pd.Series(np.arange(len(valid_dates)), index=valid_dates)
     records: list[dict[str, object]] = []
-    occupied_until: pd.Timestamp | None = None
+    cooldown_until_position = -1
     for ignition_date, ignition in ignitions.iterrows():
-        if occupied_until is not None and ignition_date <= occupied_until:
+        ignition_position = int(date_positions.loc[ignition_date])
+        if ignition_position <= cooldown_until_position:
             continue
-        future_window = close.loc[max(ignition_date, start):end].dropna()
+        outcome_end = min(end, ignition_date + pd.Timedelta(days=outcome_horizon_days))
+        future_window = close.loc[max(ignition_date, start):outcome_end].dropna()
         if future_window.empty:
             continue
         peak_date = future_window.idxmax()
@@ -242,12 +273,12 @@ def summarize_trends_for_symbol(
         if ignition_close <= 0:
             continue
         peak_return = peak_close / ignition_close - 1.0
-        if peak_return < min_trend_return:
+        if peak_return < min_trend_return and not include_below_threshold:
             continue
 
         period_start_close = close.loc[close.index >= start].dropna()
         period_start_price = float(period_start_close.iloc[0]) if not period_start_close.empty else np.nan
-        close_to_end = close.loc[:end].dropna()
+        close_to_end = close.loc[:outcome_end].dropna()
         end_close = float(close_to_end.iloc[-1]) if not close_to_end.empty else np.nan
         trend_path = close.loc[ignition_date:peak_date]
         lifeline = choose_lifeline(
@@ -257,7 +288,7 @@ def summarize_trends_for_symbol(
             windows=lifeline_windows,
             breach_buffer=lifeline_breach_buffer,
             max_breach_days=lifeline_max_breach_days,
-            end_date=end,
+            end_date=outcome_end,
         )
         records.append(
             {
@@ -267,16 +298,26 @@ def summarize_trends_for_symbol(
                 "peak_date": peak_date.strftime("%Y-%m-%d"),
                 "peak_close": peak_close,
                 "peak_return": peak_return,
+                "analysis_end_date": end.strftime("%Y-%m-%d"),
+                "outcome_end_date": outcome_end.strftime("%Y-%m-%d"),
                 "period_return_to_peak": peak_close / period_start_price - 1.0 if period_start_price > 0 else np.nan,
                 "return_to_end_from_ignition": end_close / ignition_close - 1.0 if end_close > 0 else np.nan,
                 "days_to_peak": int((peak_date - ignition_date).days),
                 "max_drawdown_to_peak": _max_drawdown(trend_path),
                 "breakout_pct": float(ignition["breakout_pct"]),
                 "amount_ratio": float(ignition["amount_ratio"]),
+                "return_20d": float(ignition["return_20d"]),
+                "return_60d": float(ignition["return_60d"]),
+                "volatility_20d": float(ignition["volatility_20d"]),
+                "ma20_over_ma60": float(ignition["ma20_over_ma60"]),
+                "close_over_ma20": float(ignition["close_over_ma20"]),
+                "drawdown_120d": float(ignition["drawdown_120d"]),
+                "amount_trend_5_20": float(ignition["amount_trend_5_20"]),
+                "breakout_count_20d": float(ignition["breakout_count_20d"]),
                 **lifeline,
             }
         )
-        occupied_until = peak_date
+        cooldown_until_position = ignition_position + max(0, ignition_cooldown_bars)
     return records
 
 
@@ -305,6 +346,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lifeline-max-breach-days", type=int, default=3)
     parser.add_argument("--max-abs-daily-return", type=float, default=0.22)
     parser.add_argument("--top-n", type=int, default=100)
+    parser.add_argument("--period", default=None, help="Chronological period label stored in training samples.")
+    parser.add_argument("--outcome-horizon-days", type=int, default=365)
+    parser.add_argument("--ignition-cooldown-bars", type=int, default=20)
+    parser.add_argument("--include-prestart-ignitions", action="store_true")
     args = parser.parse_args(argv)
     if not args.use_tdx_history and not args.data:
         parser.error("--data is required unless --use-tdx-history is set")
@@ -326,6 +371,14 @@ def to_chinese_columns(df: pd.DataFrame) -> pd.DataFrame:
             "max_drawdown_to_peak": "起爆到峰值最大回撤",
             "breakout_pct": "突破幅度",
             "amount_ratio": "成交额放大倍数",
+            "return_20d": "近20日收益",
+            "return_60d": "近60日收益",
+            "volatility_20d": "近20日波动率",
+            "ma20_over_ma60": "MA20相对MA60偏离",
+            "close_over_ma20": "收盘价相对MA20偏离",
+            "drawdown_120d": "距120日高点回撤",
+            "amount_trend_5_20": "近5日成交额趋势比",
+            "breakout_count_20d": "近20日突破次数",
             "lifeline_ma": "生命线均线",
             "breach_days_to_peak": "峰值前跌破生命线天数",
             "min_distance_to_lifeline": "相对生命线最小距离",
@@ -374,12 +427,25 @@ def main() -> None:
                 breakout_buffer=args.breakout_buffer,
                 lifeline_breach_buffer=args.lifeline_breach_buffer,
                 lifeline_max_breach_days=args.lifeline_max_breach_days,
+                include_below_threshold=True,
+                include_prestart_ignitions=args.include_prestart_ignitions,
+                outcome_horizon_days=args.outcome_horizon_days,
+                ignition_cooldown_bars=args.ignition_cooldown_bars,
             )
         )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    trends = pd.DataFrame(records)
+    samples = pd.DataFrame(records)
+    if not samples.empty:
+        samples["period"] = args.period or f"{start:%Y%m%d}_{end:%Y%m%d}"
+        samples = samples.sort_values(["ignition_date", "symbol"]).reset_index(drop=True)
+    samples.to_csv(output_dir / "trend_ignition_samples.csv", index=False, encoding="utf-8-sig")
+    trends = (
+        samples[pd.to_numeric(samples["peak_return"], errors="coerce").ge(args.min_trend_return)].copy()
+        if not samples.empty
+        else samples.copy()
+    )
     if not trends.empty:
         trends = trends.sort_values(["peak_return", "amount_ratio"], ascending=[False, False])
     trends.to_csv(output_dir / "trend_ignition_lifelines.csv", index=False, encoding="utf-8-sig")
@@ -392,6 +458,8 @@ def main() -> None:
         "start": args.start,
         "end": args.end,
         "min_trend_return": args.min_trend_return,
+        "outcome_horizon_days": args.outcome_horizon_days,
+        "sample_count": int(len(samples)),
         "trend_count": int(len(trends)),
         "symbol_count": int(trends["symbol"].nunique()) if not trends.empty else 0,
         "median_peak_return": float(trends["peak_return"].median()) if not trends.empty else None,

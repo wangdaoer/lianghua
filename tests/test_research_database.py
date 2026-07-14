@@ -8,6 +8,7 @@ import pytest
 from research_database import (
     ResearchDatabase,
     classify_tdx_asset_type,
+    is_a_share_stock_symbol,
     normalize_a_share_symbol,
     normalize_a_share_symbols,
 )
@@ -321,6 +322,46 @@ def test_classify_tdx_asset_type_corrects_common_index_codes():
     assert classify_tdx_asset_type("SZ", "399006", "stock") == "index"
     assert classify_tdx_asset_type("SH", "600000", "stock") == "stock"
     assert classify_tdx_asset_type("SZ", "000001", "stock") == "stock"
+
+
+def test_is_a_share_stock_symbol_respects_market_prefixes():
+    assert is_a_share_stock_symbol("SH", "600000")
+    assert is_a_share_stock_symbol("SZ", "000001")
+    assert not is_a_share_stock_symbol("SH", "000004")
+    assert not is_a_share_stock_symbol("SZ", "600000")
+
+
+def test_normalized_stock_query_filters_misclassified_cross_market_codes(tmp_path):
+    main = ResearchDatabase(tmp_path / "research.sqlite3")
+    history = ResearchDatabase(tmp_path / "tdx_history.sqlite3")
+    rows = []
+    for market, close in [("SH", 99.0), ("SZ", 10.0)]:
+        rows.append(
+            {
+                "market": market,
+                "symbol": "000004",
+                "date": "2025-01-02",
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 1,
+                "amount": 1,
+                "asset_type": "stock",
+                "source": f"{market.lower()}lday.zip!{market.lower()}000004.day",
+            }
+        )
+    history.import_tdx_prices(pd.DataFrame(rows))
+
+    result = main.query_tdx_history_normalized(
+        tmp_path / "tdx_history.sqlite3",
+        symbols=["000004"],
+        asset_type="stock",
+    )
+
+    assert result[["market", "symbol", "close"]].to_dict("records") == [
+        {"market": "SZ", "symbol": "000004", "close": 10.0}
+    ]
 
 
 def test_query_tdx_history_normalized_exposes_clean_asset_type(tmp_path):

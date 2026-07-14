@@ -22,6 +22,10 @@ TDX_PRICE_COLUMNS = ["market", "symbol", "date", "open", "high", "low", "close",
 SH_INDEX_SYMBOLS = {"000001", "000002", "000003", "000016", "000300", "000905", "000906", "000852", "000688"}
 SZ_INDEX_PREFIXES = ("399",)
 A_SHARE_SYMBOL_PATTERN = re.compile(r"^(?:SH|SZ)?(\d{1,6})(?:\.(?:SH|SZ))?$", re.IGNORECASE)
+A_SHARE_STOCK_PREFIXES = {
+    "SH": ("600", "601", "603", "605", "688", "689"),
+    "SZ": ("000", "001", "002", "003", "300", "301"),
+}
 
 
 def normalize_a_share_symbols(values: pd.Series) -> pd.Series:
@@ -36,6 +40,13 @@ def normalize_a_share_symbol(value: object) -> str | None:
     text = re.sub(r"\.0$", "", str(value).strip())
     match = A_SHARE_SYMBOL_PATTERN.fullmatch(text)
     return match.group(1).zfill(6) if match else None
+
+
+def is_a_share_stock_symbol(market: object, symbol: object) -> bool:
+    market_code = str(market).upper()
+    symbol_code = normalize_a_share_symbol(symbol)
+    prefixes = A_SHARE_STOCK_PREFIXES.get(market_code, ())
+    return symbol_code is not None and symbol_code.startswith(prefixes)
 
 
 def classify_tdx_asset_type(market: str, symbol: str, raw_asset_type: str) -> str:
@@ -231,6 +242,12 @@ class ResearchDatabase:
         ]
         if asset_type is not None:
             result = result[result["asset_type"] == asset_type].reset_index(drop=True)
+            if asset_type == "stock" and not result.empty:
+                valid_stock = [
+                    is_a_share_stock_symbol(row.market, row.symbol)
+                    for row in result.itertuples(index=False)
+                ]
+                result = result.loc[valid_stock].reset_index(drop=True)
         result["_asset_type_rank"] = (result["raw_asset_type"] != result["asset_type"]).astype(int)
         result = (
             result.sort_values(["market", "symbol", "date", "asset_type", "_asset_type_rank", "source"])
