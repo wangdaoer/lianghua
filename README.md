@@ -51,6 +51,32 @@ python analyze_trend_ignition_lifelines.py `
   --end 2025-12-31
 ```
 
+### 趋势起爆评分研究
+
+训练样本只使用起爆日收盘时已经可知的价格、均线、波动和成交额特征。标签向后观察
+365 个自然日；未走满观察窗的事件会保留在原始样本中，但不会进入训练集。相邻起爆
+事件使用固定 20 个交易日冷却，不允许再用未来峰值日期决定是否保留样本。
+
+按时间段分别生成样本后，用多个 `--sample-csv` 合并训练集，再执行严格的过去训练、
+未来验证。训练入口要求完整特征合同，缺列会直接报错；缺失值使用独立分箱，不会混入
+最低数值分箱。
+
+```powershell
+python build_trend_ignition_training_set.py `
+  --sample-csv outputs\trend_ignition_training\period_2018_2020_v3\trend_ignition_samples.csv `
+  --sample-csv outputs\trend_ignition_training\period_2021_2023_v3\trend_ignition_samples.csv `
+  --sample-csv outputs\trend_ignition_training\period_2024_2026_v3\trend_ignition_samples.csv `
+  --output-dir outputs\trend_ignition_training\training_set_v3
+
+python train_trend_ignition_scorer.py `
+  --training-set outputs\trend_ignition_training\training_set_v3\trend_ignition_training_set.csv `
+  --output-dir outputs\trend_ignition_training\scorer_v3
+```
+
+`scorer_summary.json` 中的 `passes_research_gate` 仅代表跨期研究门槛，不代表已获准接入
+每日选股或实盘。逐特征结果保存在 `walk_forward_feature_diagnostics*.csv`；使用
+`--feature-columns` 运行的事后短名单仍应标记为探索性，等待新的未见数据验证。
+
 把已有主库中的通达信表合并到独立历史库时，默认保留源数据。目标库允许保留此前汇总的
 其他历史记录；只有核验本次源库的每一行都已写入目标库，并显式添加 `--delete-source` 时，
 才会删除源库中的通达信行。需要覆盖已有重建库时也必须显式添加 `--overwrite-rebuilt`。
