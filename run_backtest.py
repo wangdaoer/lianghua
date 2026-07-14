@@ -11,7 +11,13 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from execution_rules import apply_open_constraints
+from execution_rules import (
+    LIMIT_DOWN_PRICE_COLUMNS,
+    LIMIT_RATE_COLUMNS,
+    LIMIT_UP_PRICE_COLUMNS,
+    apply_open_constraints_with_diagnostics,
+    drop_terminal_zero_placeholders,
+)
 
 try:
     import yaml
@@ -66,6 +72,7 @@ class StrategyConfig:
     commission_bps: float
     impact_bps: float
     output_dir: str
+    universe_selection_lag_days: int = 0
 
     @classmethod
     def from_dict(cls, cfg: Dict[str, Any]) -> "StrategyConfig":
@@ -77,6 +84,9 @@ class StrategyConfig:
             universe_dynamic_top_n=int(cfg.get("universe", {}).get("dynamic_top_n", 0)),
             universe_selection_mode=cfg.get("universe", {}).get("selection_mode", "none"),
             universe_selection_min_history=int(cfg.get("universe", {}).get("selection_min_history", 120)),
+            universe_selection_lag_days=max(
+                0, int(cfg.get("universe", {}).get("selection_lag_days", 0))
+            ),
             max_abs_daily_return=float(cfg.get("data", {}).get("max_abs_daily_return", 0.35)),
             execution_model=cfg.get("execution", {}).get("model", "close_to_close"),
             block_limit_up_buys=bool(cfg.get("execution", {}).get("block_limit_up_buys", False)),
@@ -132,12 +142,22 @@ def clean_symbol(value: object) -> str:
     return digits.zfill(6)[-6:] if digits else text
 
 
-def load_prices(data_path: Path, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
-    df = pd.read_csv(data_path, parse_dates=["date"])
+def prepare_prices(
+    panel: pd.DataFrame,
+    start: Optional[str],
+    end: Optional[str],
+    *,
+    strict_validation: bool = True,
+) -> pd.DataFrame:
+    df = panel.copy()
     required = {"date", "symbol", "close"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns: {sorted(missing)}")
+
+    if strict_validation:
+        df = drop_terminal_zero_placeholders(df)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
     if "open" not in df.columns:
         df["open"] = df["close"]
@@ -172,6 +192,15 @@ def load_prices(data_path: Path, start: Optional[str], end: Optional[str]) -> pd
         raise ValueError("No rows after date filtering.")
 
     return df.sort_values(["date", "symbol"]).reset_index(drop=True)
+
+
+def load_prices(data_path: Path, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
+    return prepare_prices(
+        pd.read_csv(data_path),
+        start,
+        end,
+        strict_validation=False,
+    )
 
 
 def pivot_prices(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
@@ -212,6 +241,12 @@ class BacktestEngine:
         self.trade_log = []
         self.position_gross_history = []
         self.turnover_history = []
+        self.execution_constraint_counts = {
+            "blocked_limit_up_buys": 0,
+            "blocked_limit_down_sells": 0,
+            "blocked_open_gap_buys": 0,
+            "blocked_orders_total": 0,
+        }
         self.signal_cache: Optional[pd.DataFrame] = None
         self.universe_cache: Optional[pd.DataFrame] = None
 
@@ -340,7 +375,11 @@ class BacktestEngine:
         )
         score = score.where(enough_history)
         rank = score.rank(axis=1, ascending=False, method="first")
-        return rank.le(top_n)
+        membership = rank.le(top_n)
+        lag_days = self.cfg.universe_selection_lag_days
+        if lag_days:
+            membership = membership.shift(lag_days, fill_value=False).astype(bool)
+        return membership
 
     def _clean_price_matrix(self, close: pd.DataFrame) -> pd.DataFrame:
         threshold = self.cfg.max_abs_daily_return
@@ -356,8 +395,11 @@ class BacktestEngine:
         target: pd.Series,
         open_row: pd.Series,
         prev_close_row: pd.Series,
-    ) -> pd.Series:
-        return apply_open_constraints(
+        limit_rate_row: pd.Series | None = None,
+        limit_up_price_row: pd.Series | None = None,
+        limit_down_price_row: pd.Series | None = None,
+    ) -> tuple[pd.Series, dict[str, int]]:
+        return apply_open_constraints_with_diagnostics(
             current=current,
             target=target,
             open_row=open_row,
@@ -366,6 +408,9 @@ class BacktestEngine:
             limit_buffer=self.cfg.limit_buffer,
             block_limit_up_buys=self.cfg.block_limit_up_buys,
             block_limit_down_sells=self.cfg.block_limit_down_sells,
+            limit_rate_row=limit_rate_row,
+            limit_up_price_row=limit_up_price_row,
+            limit_down_price_row=limit_down_price_row,
         )
 
     def _signal_trend_momentum_ratio(self, close_slice: pd.DataFrame) -> pd.Series:
@@ -563,7 +608,11 @@ class BacktestEngine:
     def run(self, raw_df: pd.DataFrame) -> Dict[str, Any]:
         close = pivot_prices(raw_df, "close")
         close = self._clean_price_matrix(close)
-        amount = pivot_prices(raw_df, "amount") if "amount" in raw_df.columns else close * 0.0
+        amount = (
+            pivot_prices(raw_df, "amount")
+            if "amount" in raw_df.columns
+            else pd.DataFrame(np.nan, index=close.index, columns=close.columns)
+        )
         returns = close.pct_change(fill_method=None).fillna(0.0)
         if close.shape[1] == 0 or len(close) < max(self.cfg.long_window, 2):
             raise ValueError("Not enough data for backtest.")
@@ -573,7 +622,19 @@ class BacktestEngine:
         if self.cfg.execution_model.lower().strip() == "next_open":
             open_px = pivot_prices(raw_df, "open").reindex_like(close)
             open_px = self._clean_price_matrix(open_px)
-            return self._run_next_open(close, open_px, amount)
+            optional_panels = {}
+            for name, candidates in (
+                ("limit_rate", LIMIT_RATE_COLUMNS),
+                ("limit_up_price", LIMIT_UP_PRICE_COLUMNS),
+                ("limit_down_price", LIMIT_DOWN_PRICE_COLUMNS),
+            ):
+                column = next((item for item in candidates if item in raw_df.columns), None)
+                optional_panels[name] = (
+                    pivot_prices(raw_df, column).reindex_like(close)
+                    if column is not None
+                    else None
+                )
+            return self._run_next_open(close, open_px, amount, **optional_panels)
 
         positions = pd.Series(dtype=float)
         high_water_mark = self.equity
@@ -655,6 +716,7 @@ class BacktestEngine:
             "final_positions_count": int((positions != 0).sum()),
             "avg_gross_exposure": float(pd.Series(self.position_gross_history).mean()),
             "avg_turnover": float(pd.Series(self.turnover_history).mean()),
+            **self.execution_constraint_counts,
         }
         return {
             "equity": nav,
@@ -689,6 +751,9 @@ class BacktestEngine:
         close: pd.DataFrame,
         open_px: pd.DataFrame,
         amount: pd.DataFrame,
+        limit_rate: pd.DataFrame | None = None,
+        limit_up_price: pd.DataFrame | None = None,
+        limit_down_price: pd.DataFrame | None = None,
     ) -> Dict[str, Any]:
         open_returns = open_px.pct_change(fill_method=None).fillna(0.0)
         close_returns = close.pct_change(fill_method=None).fillna(0.0)
@@ -705,12 +770,27 @@ class BacktestEngine:
 
             target_to_execute = queued_target.reindex(close.columns).fillna(0.0)
             if i > 0:
-                target_to_execute = self._apply_execution_constraints(
+                target_to_execute, counts = self._apply_execution_constraints(
                     positions.reindex(close.columns).fillna(0.0),
                     target_to_execute,
                     open_px.loc[date],
                     close.iloc[i - 1],
+                    limit_rate_row=(
+                        limit_rate.loc[date] if limit_rate is not None else None
+                    ),
+                    limit_up_price_row=(
+                        limit_up_price.loc[date]
+                        if limit_up_price is not None
+                        else None
+                    ),
+                    limit_down_price_row=(
+                        limit_down_price.loc[date]
+                        if limit_down_price is not None
+                        else None
+                    ),
                 )
+                for name, count in counts.items():
+                    self.execution_constraint_counts[name] += count
 
             turnover = float((target_to_execute - positions.reindex(close.columns).fillna(0.0)).abs().sum())
             self.turnover_history.append(turnover)
@@ -757,6 +837,7 @@ class BacktestEngine:
             "final_positions_count": int((positions != 0).sum()),
             "avg_gross_exposure": float(pd.Series(self.position_gross_history).mean()),
             "avg_turnover": float(pd.Series(self.turnover_history).mean()),
+            **self.execution_constraint_counts,
         }
         return {
             "equity": nav,
