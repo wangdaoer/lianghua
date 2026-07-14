@@ -4,7 +4,12 @@ from zipfile import ZipFile
 
 import pandas as pd
 
-from research_database import ResearchDatabase, classify_tdx_asset_type
+from research_database import (
+    ResearchDatabase,
+    classify_tdx_asset_type,
+    normalize_a_share_symbol,
+    normalize_a_share_symbols,
+)
 from tdx_day_source import TdxArchiveSpec, parse_tdx_day_bytes, read_tdx_day_archive
 
 
@@ -31,6 +36,31 @@ def test_import_prices_is_idempotent_and_queryable(tmp_path):
     ]
 
 
+def test_normalize_a_share_symbols_preserves_leading_zero_codes():
+    values = pd.Series([1, 1.0, "000001", "000001.SZ", "SZ000001", "300001", None, "not-a-code", "1.5"])
+    assert normalize_a_share_symbols(values).tolist()[:6] == [
+        "000001", "000001", "000001", "000001", "000001", "300001"
+    ]
+    assert normalize_a_share_symbols(values).isna().tolist()[6:] == [True, True, True]
+
+
+def test_normalize_a_share_symbol_matches_batch_contract():
+    assert normalize_a_share_symbol(1.0) == "000001"
+    assert normalize_a_share_symbol("SZ000001") == "000001"
+    assert normalize_a_share_symbol("000001.SZ") == "000001"
+    assert normalize_a_share_symbol("1.5") is None
+
+
+def test_import_prices_accepts_numeric_symbols_and_zero_pads_them(tmp_path):
+    db = ResearchDatabase(tmp_path / "research.sqlite3")
+    prices = pd.DataFrame({
+        "symbol": [1], "date": ["2026-07-13"], "open": [10], "high": [11],
+        "low": [9], "close": [10.5], "volume": [100], "amount": [1000],
+    })
+    assert db.import_prices(prices) == 1
+    assert db.query("SELECT symbol FROM daily_prices").iloc[0]["symbol"] == "000001"
+
+
 def test_database_connections_release_file_handles(tmp_path):
     path = tmp_path / "research.sqlite3"
     db = ResearchDatabase(path)
@@ -49,6 +79,13 @@ def test_import_observations_preserves_source_and_payload(tmp_path):
     assert row["source"] == "daily_candidates.csv"
     assert row["kind"] == "candidate"
     assert '"score": 0.8' in row["payload"]
+
+
+def test_import_observations_normalizes_numeric_symbols(tmp_path):
+    db = ResearchDatabase(tmp_path / "research.sqlite3")
+    observations = pd.DataFrame({"symbol": [1.0], "date": ["2026-07-13"], "score": [0.8]})
+    assert db.import_observations(observations, "candidate", "daily.csv") == 1
+    assert db.query("SELECT symbol FROM observations").iloc[0]["symbol"] == "000001"
 
 
 def _tdx_record(date, open_px, high_px, low_px, close_px, amount, volume):
@@ -83,6 +120,13 @@ def test_parse_tdx_day_bytes_uses_native_cent_scale():
     data = struct.pack("<iiiiifII", 20260612, 1124, 1130, 1100, 1124, 1.0, 1, 0)
     frame = parse_tdx_day_bytes(data, symbol="000001", market="SZ", asset_type="stock", source="sample")
     assert frame.iloc[0]["close"] == 11.24
+
+
+def test_parse_tdx_day_bytes_skips_invalid_calendar_dates():
+    invalid = struct.pack("<iiiiifII", 20260230, 100, 100, 100, 100, 1.0, 1, 0)
+    valid = struct.pack("<iiiiifII", 20260228, 100, 100, 100, 100, 1.0, 1, 0)
+    frame = parse_tdx_day_bytes(invalid + valid, symbol="000001", market="SZ", asset_type="stock", source="sample")
+    assert frame["date"].tolist() == ["2026-02-28"]
 
 
 def test_import_tdx_prices_keeps_market_separate_and_idempotent(tmp_path):

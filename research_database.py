@@ -7,6 +7,7 @@ but contains no broker, order, or account functionality.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,6 +20,21 @@ PRICE_COLUMNS = ["symbol", "date", "open", "high", "low", "close", "volume", "am
 TDX_PRICE_COLUMNS = ["market", "symbol", "date", "open", "high", "low", "close", "volume", "amount", "asset_type", "source"]
 SH_INDEX_SYMBOLS = {"000001", "000002", "000003", "000016", "000300", "000905", "000906", "000852", "000688"}
 SZ_INDEX_PREFIXES = ("399",)
+A_SHARE_SYMBOL_PATTERN = re.compile(r"^(?:SH|SZ)?(\d{1,6})(?:\.(?:SH|SZ))?$", re.IGNORECASE)
+
+
+def normalize_a_share_symbols(values: pd.Series) -> pd.Series:
+    text = values.astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    digits = text.str.extract(A_SHARE_SYMBOL_PATTERN, expand=False)
+    return digits.str.zfill(6)
+
+
+def normalize_a_share_symbol(value: object) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    text = re.sub(r"\.0$", "", str(value).strip())
+    match = A_SHARE_SYMBOL_PATTERN.fullmatch(text)
+    return match.group(1).zfill(6) if match else None
 
 
 def classify_tdx_asset_type(market: str, symbol: str, raw_asset_type: str) -> str:
@@ -183,7 +199,7 @@ class ResearchDatabase:
         if missing:
             raise ValueError(f"price data missing columns: {missing}")
         rows = frame[PRICE_COLUMNS].copy()
-        rows["symbol"] = rows["symbol"].astype(str).str.extract(r"(\d{6})", expand=False)
+        rows["symbol"] = normalize_a_share_symbols(rows["symbol"])
         rows["date"] = pd.to_datetime(rows["date"], errors="coerce").dt.strftime("%Y-%m-%d")
         rows = rows.dropna(subset=["symbol", "date"]).drop_duplicates(["symbol", "date"])
         rows["source"] = source
@@ -271,7 +287,7 @@ class ResearchDatabase:
             raise ValueError(f"TDX price data missing columns: {missing}")
         rows = frame[TDX_PRICE_COLUMNS].copy()
         rows["market"] = rows["market"].astype(str).str.upper()
-        rows["symbol"] = rows["symbol"].astype(str).str.extract(r"(\d{6})", expand=False)
+        rows["symbol"] = normalize_a_share_symbols(rows["symbol"])
         rows["asset_type"] = rows["asset_type"].astype(str)
         rows["date"] = pd.to_datetime(rows["date"], errors="coerce").dt.strftime("%Y-%m-%d")
         rows = rows.dropna(subset=["market", "symbol", "date", "asset_type"]).drop_duplicates(
@@ -316,8 +332,7 @@ class ResearchDatabase:
             date = pd.to_datetime(row.pop("date"), errors="coerce")
             if pd.isna(date):
                 continue
-            symbol = row.pop("symbol", None)
-            symbol = None if pd.isna(symbol) else str(symbol).zfill(6)
+            symbol = normalize_a_share_symbol(row.pop("symbol", None))
             records.append((symbol, date.strftime("%Y-%m-%d"), kind, source, json.dumps(row, ensure_ascii=False, default=str)))
         with self.connect() as conn:
             before = conn.total_changes

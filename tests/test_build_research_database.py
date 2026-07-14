@@ -2,12 +2,26 @@ from pathlib import Path
 
 import pytest
 
-from build_research_database import discover_latest_panel, extract_date_tokens, select_observation_files
+from build_research_database import (
+    discover_latest_panel,
+    extract_date_tokens,
+    infer_file_date,
+    select_observation_files,
+    unresolved_observation_files,
+)
 
 
 def test_extract_date_tokens_rejects_invalid_calendar_dates():
     assert extract_date_tokens(Path("candidate_20260710.csv")) == ["20260710"]
+    assert extract_date_tokens(Path("ths_hs_a_share_2026-07-10.xls")) == ["20260710"]
     assert extract_date_tokens(Path("candidate_20261340.csv")) == []
+    assert extract_date_tokens(Path("candidate_2026-13-40.csv")) == []
+
+
+def test_infer_file_date_supports_compact_and_dashed_names():
+    assert infer_file_date(Path("candidate_20260710.csv")) == "2026-07-10"
+    assert infer_file_date(Path("ths_hs_a_share_2026-07-10.xls")) == "2026-07-10"
+    assert infer_file_date(Path("candidate_without_date.csv")) is None
 
 
 def test_discover_latest_panel_uses_latest_end_date(tmp_path):
@@ -26,9 +40,28 @@ def test_select_observation_files_uses_latest_date_or_explicit_date(tmp_path):
         path.touch()
     assert select_observation_files(tmp_path) == [latest_a, latest_b]
     assert select_observation_files(tmp_path, "20260709") == [older]
+    assert select_observation_files(tmp_path, "2026-07-09") == [older]
 
 
 def test_select_observation_files_rejects_invalid_asof_date(tmp_path):
     (tmp_path / "candidates_20260710.csv").touch()
     with pytest.raises(ValueError):
         select_observation_files(tmp_path, "20261340")
+    with pytest.raises(ValueError):
+        select_observation_files(tmp_path, "2026--07-10")
+    with pytest.raises(ValueError):
+        select_observation_files(tmp_path, "2026-0710")
+
+
+def test_select_observation_files_validates_asof_date_even_without_candidates(tmp_path):
+    with pytest.raises(ValueError):
+        select_observation_files(tmp_path, "not-a-date")
+
+
+def test_unresolved_observation_files_exposes_undated_and_invalid_names(tmp_path):
+    valid = tmp_path / "candidates_20260710.csv"
+    undated = tmp_path / "candidates_latest.csv"
+    invalid = tmp_path / "candidates_2026-13-40.csv"
+    for path in (valid, undated, invalid):
+        path.touch()
+    assert unresolved_observation_files(tmp_path) == [invalid, undated]
