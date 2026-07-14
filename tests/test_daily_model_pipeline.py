@@ -68,7 +68,7 @@ class DailyModelPipelineTest(unittest.TestCase):
         self.assertIn("--target-days 20", tracking_args)
 
         self.assertEqual(
-            names[-7:],
+            names[-8:],
             [
                 "personal_overlay",
                 "early_pattern_watchlist",
@@ -77,37 +77,57 @@ class DailyModelPipelineTest(unittest.TestCase):
                 "merged_daily_outputs",
                 "strategy_family_forward_report",
                 "strategy_stability_report",
+                "research_database_sync",
             ],
         )
-        watch_step = steps[-6]
+        watch_step = steps[-7]
         watch_args = " ".join(str(part) for part in watch_step.command)
         self.assertIn("early_pattern_watchlist.py", watch_args)
-        tracking_step = steps[-5]
+        tracking_step = steps[-6]
         tracking_args = " ".join(str(part) for part in tracking_step.command)
         self.assertIn("track_hidden_accumulation_watch.py", tracking_args)
         self.assertIn("hidden_accumulation_trade_watch_tracking_20260629.csv", tracking_args)
-        report_step = steps[-4]
+        report_step = steps[-5]
         report_args = " ".join(str(part) for part in report_step.command)
         self.assertIn("build_daily_personal_overlay_report.py", report_args)
         self.assertIn("rank_model_candidates_trend_gated_personal_overlay_20260629.csv", report_args)
         self.assertIn("early_pattern_watchlist_20260629.csv", report_args)
         self.assertIn("--names-source", report_args)
-        merged_step = steps[-3]
+        merged_step = steps[-4]
         merged_args = " ".join(str(part) for part in merged_step.command)
         self.assertIn("merged_daily_outputs.py", merged_args)
         self.assertIn("trend_state_20260629", merged_args)
         self.assertIn("rank_model_candidates_trend_gated_bench20260629_20260629.csv", merged_args)
         self.assertIn("rank_model_candidates_trend_gated_personal_overlay_20260629.csv", merged_args)
         self.assertIn("early_pattern_watchlist_20260629.csv", merged_args)
-        family_step = steps[-2]
+        family_step = steps[-3]
         family_args = " ".join(str(part) for part in family_step.command)
         self.assertIn("evaluate_strategy_family_forward_returns.py", family_args)
         self.assertIn("--horizons 1,3,5,10", family_args)
         self.assertIn("--token 20260629", family_args)
-        stability_step = steps[-1]
+        stability_step = steps[-2]
         stability_args = " ".join(str(part) for part in stability_step.command)
         self.assertIn("summarize_core_risk_filter_stability.py", stability_args)
         self.assertIn("core_risk_filter_finalist_stability_20260629", stability_args)
+        database_step = steps[-1]
+        database_args = " ".join(database_step.command)
+        self.assertIn("sync_daily_research_database.py", database_args)
+        self.assertIn("research_database_sync_20260629.json", database_args)
+
+    def test_pipeline_can_skip_research_database_sync(self):
+        config = PipelineConfig(
+            asof_date="2026-06-29",
+            python_exe="python",
+            project_root=Path("C:/model"),
+            include_research_db_sync=False,
+        )
+        names = [step.name for step in build_daily_pipeline_steps(config)]
+        self.assertNotIn("research_database_sync", names)
+
+    def test_parse_args_accepts_skip_research_database_sync_flag(self):
+        with patch.object(sys, "argv", ["run_daily_model_pipeline.py", "--skip-research-db-sync"]):
+            args = parse_args()
+        self.assertTrue(args.skip_research_db_sync)
 
     def test_pipeline_passes_latest_shadow_account_review_when_available(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -140,7 +160,7 @@ class DailyModelPipelineTest(unittest.TestCase):
             older = older_dir / "shadow_account_review.json"
             older.write_text("{}", encoding="utf-8")
             config = PipelineConfig(
-                asof_date="2026-06-29",
+                asof_date="20260629",
                 python_exe="python",
                 project_root=root,
                 output_root=Path("outputs/high_return_v2"),
@@ -610,6 +630,57 @@ class DailyModelPipelineTest(unittest.TestCase):
             rows = [json.loads(line) for line in state_log.read_text(encoding="utf-8").splitlines()]
 
             self.assertEqual([row["asof_date"] for row in rows], ["2026-06-29", "2026-06-30"])
+
+    def test_daily_run_state_records_research_database_sync_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            output.mkdir(parents=True)
+            status_path = output / "research_database_sync_20260629.json"
+            status_path.write_text(
+                json.dumps({
+                    "status": "success",
+                    "asof_date": "2026-06-29",
+                    "database_latest_date": "2026-06-29",
+                    "database_asof_rows": 5000,
+                    "database_daily_rows": 100000,
+                    "database_observation_rows": 200,
+                }),
+                encoding="utf-8",
+            )
+            config = PipelineConfig(
+                asof_date="2026-06-29",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                include_benchmark_refresh=False,
+                include_regime_shadow_compare=False,
+                include_regime_shadow_tracking=False,
+            )
+            steps = build_daily_pipeline_steps(config)
+
+            record = build_daily_run_state(config, steps)
+
+        self.assertEqual(record["verification"]["research_database_sync_status"], "success")
+        self.assertEqual(record["verification"]["research_database_asof_rows"], 5000)
+        self.assertTrue(str(record["artifacts"]["research_database_sync_status"]).endswith(".json"))
+
+    def test_daily_run_state_marks_database_sync_not_run_after_earlier_failure(self):
+        config = PipelineConfig(
+            asof_date="2026-06-29",
+            project_root=Path("C:/model"),
+            include_benchmark_refresh=False,
+            include_regime_shadow_compare=False,
+            include_regime_shadow_tracking=False,
+        )
+        steps = build_daily_pipeline_steps(config)
+        record = build_daily_run_state(
+            config,
+            steps,
+            run_status="failed",
+            failure={"step": "update_panel", "returncode": 1},
+        )
+        self.assertEqual(record["verification"]["research_database_sync_status"], "not_run")
+        self.assertIsNone(record["artifacts"]["research_database_sync_status"])
 
     def test_attach_daily_run_card_writes_card_and_updates_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:

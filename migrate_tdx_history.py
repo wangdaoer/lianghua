@@ -123,12 +123,18 @@ def rebuild_main_without_tdx(
         )
         conn.execute(
             """
-            INSERT OR IGNORE INTO rebuilt.observations
-            (id, symbol, date, kind, source, payload)
-            SELECT id, symbol, date, kind, source, payload
+            INSERT OR REPLACE INTO rebuilt.observations
+            (id, symbol, date, kind, source, row_key, payload)
+            SELECT id, symbol, date, kind, source, row_key, payload
             FROM main.observations
             """
         )
+        rebuilt_observation_rows = conn.execute("SELECT COUNT(*) FROM rebuilt.observations").fetchone()[0]
+        if rebuilt_observation_rows != observation_rows:
+            raise RuntimeError(
+                "Rebuilt observation row count mismatch: "
+                f"source={observation_rows}, rebuilt={rebuilt_observation_rows}"
+            )
         conn.commit()
         conn.execute("DETACH DATABASE rebuilt")
 
