@@ -63,10 +63,10 @@ def _load_rules(path: Path | None) -> dict[str, Any]:
         raise FileNotFoundError(path)
     try:
         import yaml
-
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:
+    except ImportError:
         loaded = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     rules.update(loaded)
     return rules
 

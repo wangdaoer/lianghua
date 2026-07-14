@@ -8,6 +8,7 @@ import pandas as pd
 
 from research_database import ResearchDatabase, normalize_a_share_symbols
 from tdx_day_source import infer_tdx_archive_specs, iter_tdx_day_archive_member_frames
+from workspace_paths import daily_data_root, tdx_data_root
 
 
 DATE_TOKEN = re.compile(r"(?<!\d)(20\d{2}-\d{2}-\d{2}|20\d{6})(?!\d)")
@@ -144,10 +145,12 @@ def main() -> None:
     parser.add_argument("--db", default="data/research.sqlite3")
     parser.add_argument("--panel", help="Panel CSV. Defaults to the latest dated panel in the current directory.")
     parser.add_argument("--skip-panel", action="store_true")
-    parser.add_argument("--daily-dir", default="D:/codex/daily-market-data/ths_exports/normalized")
+    parser.add_argument(
+        "--daily-dir", default=str(daily_data_root() / "ths_exports" / "normalized")
+    )
     parser.add_argument("--output-dir", default="outputs/high_return_v2")
     parser.add_argument("--asof-date", help="Observation date in YYYYMMDD or YYYY-MM-DD. Defaults to the latest dated output.")
-    parser.add_argument("--tdx-root", default="D:/数据源")
+    parser.add_argument("--tdx-root", default=str(tdx_data_root()))
     parser.add_argument("--skip-tdx", action="store_true")
     parser.add_argument("--tdx-symbols-from-panel", action="store_true")
     args = parser.parse_args()

@@ -16,9 +16,12 @@ from shadow_account_signals import (
     load_shadow_account_review,
     shadow_account_summary_lines,
 )
+from workspace_paths import daily_data_root, fallback_data_root
 
 
 ACTION_CN = {"allow": "可保留", "reduce": "降仓", "watch_only": "只观察"}
+DEFAULT_DAILY_DATA_DIR = daily_data_root()
+DEFAULT_FALLBACK_DATA_DIR = fallback_data_root()
 CODE_COLUMNS = [
     "symbol",
     "security_code",
@@ -685,11 +688,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--names-source", default=None)
     parser.add_argument("--early-watchlist", default=None)
     parser.add_argument("--shadow-account-review", default=None)
-    parser.add_argument("--daily-data-dir", default="D:/codex/daily-market-data")
-    parser.add_argument("--fallback-data-dir", default="D:/codex/2026-06-15-exchange-data-ingest")
+    parser.add_argument("--daily-data-dir", default=str(DEFAULT_DAILY_DATA_DIR))
+    parser.add_argument("--fallback-data-dir", default=str(DEFAULT_FALLBACK_DATA_DIR))
     parser.add_argument(
         "--fetch-status-utils",
-        default="D:/codex/2026-06-15-exchange-data-ingest/scripts/market_data_utils.py",
+        default=str(DEFAULT_FALLBACK_DATA_DIR / "scripts" / "market_data_utils.py"),
     )
     return parser.parse_args()
 

@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import argparse
 import re
+import warnings
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
+from workspace_paths import daily_data_root, fallback_data_root
 
+
+DAILY_DATA_ROOT = daily_data_root()
 PRIMARY_SNAPSHOTS = (
-    Path(r"D:\codex\daily-market-data\ths_exports\normalized"),
-    Path(r"D:\codex\daily-market-data\snapshots"),
+    DAILY_DATA_ROOT / "ths_exports" / "normalized",
+    DAILY_DATA_ROOT / "snapshots",
 )
-SECONDARY_SNAPSHOTS = (Path(r"D:\codex\2026-06-15-exchange-data-ingest\data\normalized"),)
+SECONDARY_SNAPSHOTS = (fallback_data_root() / "data" / "normalized",)
 
 THS_FILE_RE = re.compile(r"ths_hs_a_share_(\d{4}-\d{2}-\d{2})\.csv$", re.IGNORECASE)
 SNAPSHOT_RE = re.compile(r"snapshot_all_(\d{8})\.csv$", re.IGNORECASE)
@@ -145,8 +149,8 @@ def build_panel(
     for f in files:
         try:
             frames.append(_read_panel_csv(f))
-        except Exception:
-            # tolerate dirty rows for one-day files, continue with strict reporting
+        except (OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError) as exc:
+            warnings.warn(f"Skipping unreadable snapshot {f}: {exc}", RuntimeWarning, stacklevel=2)
             continue
 
     if not frames:

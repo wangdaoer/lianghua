@@ -16,6 +16,7 @@ from build_research_database import (
     select_supported_observation_files,
 )
 from research_database import ResearchDatabase, normalize_a_share_symbols
+from workspace_paths import daily_data_root
 
 
 def _daily_candidates(daily_dir: Path, asof_date: str) -> list[Path]:
@@ -136,7 +137,9 @@ def sync_daily_research_database(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Incrementally sync today's prices and model observations to SQLite.")
     parser.add_argument("--db", default="data/research.sqlite3")
-    parser.add_argument("--daily-dir", default="D:/codex/daily-market-data/ths_exports/normalized")
+    parser.add_argument(
+        "--daily-dir", default=str(daily_data_root() / "ths_exports" / "normalized")
+    )
     parser.add_argument("--output-dir", default="outputs/high_return_v2")
     parser.add_argument("--asof-date", required=True)
     parser.add_argument("--status-output", required=True)

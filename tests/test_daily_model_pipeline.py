@@ -15,6 +15,9 @@ from run_daily_model_pipeline import (
     attach_daily_run_card,
     build_daily_pipeline_steps,
     build_daily_run_state,
+    default_stability_inputs_available,
+    discover_base_panel,
+    effective_daily_start,
     ensure_fetch_status_ok,
     execute_pipeline,
     factor_decay_monitor_status,
@@ -27,6 +30,31 @@ from run_daily_model_pipeline import (
 
 
 class DailyModelPipelineTest(unittest.TestCase):
+    def test_discover_base_panel_uses_latest_panel_before_asof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            older = root / "data_panel_history_main_chinext_20220101_20260712.csv"
+            latest_base = root / "data_panel_history_main_chinext_20220101_20260713.csv"
+            same_day = root / "data_panel_history_main_chinext_20220101_20260714.csv"
+            for path in (older, latest_base, same_day):
+                path.write_text("date,symbol\n", encoding="utf-8")
+
+            selected = discover_base_panel(root, "2026-07-14")
+
+        self.assertEqual(selected, latest_base)
+
+    def test_effective_daily_start_advances_past_base_panel(self):
+        config = PipelineConfig(
+            asof_date="2026-07-14",
+            base_panel=Path("data_panel_history_main_chinext_20220101_20260713.csv"),
+            daily_start="2026-06-22",
+        )
+        self.assertEqual(effective_daily_start(config), "2026-07-14")
+
+    def test_default_stability_inputs_are_optional_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(default_stability_inputs_available(Path(tmp)))
+
     def test_latest_daily_date_prefers_newest_normalized_daily_file(self):
         daily_dir = Path("D:/codex/daily-market-data/ths_exports/normalized")
         files = [
@@ -58,7 +86,10 @@ class DailyModelPipelineTest(unittest.TestCase):
         shadow_args = " ".join(str(part) for part in shadow_step.command)
         self.assertIn("run_daily_regime_shadow_compare.py", shadow_args)
         self.assertIn("regime_shadow_compare_20260629", shadow_args)
-        self.assertIn("daily-market-data\\benchmarks\\510300.csv", shadow_args)
+        self.assertIn(
+            "daily-market-data/benchmarks/510300.csv",
+            shadow_args.replace("\\", "/"),
+        )
         self.assertIn("regime_shadow_tracking", names)
         tracking_step = steps[names.index("regime_shadow_tracking")]
         tracking_args = " ".join(str(part) for part in tracking_step.command)
@@ -178,6 +209,16 @@ class DailyModelPipelineTest(unittest.TestCase):
         with patch.object(sys, "argv", ["run_daily_model_pipeline.py", "--skip-factor-decay-monitor"]):
             args = parse_args()
         self.assertTrue(args.skip_factor_decay_monitor)
+
+    def test_parse_args_supports_auto_base_panel_and_explicit_stability(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["run_daily_model_pipeline.py", "--enable-strategy-stability"],
+        ):
+            args = parse_args()
+        self.assertIsNone(args.base_panel)
+        self.assertTrue(args.enable_strategy_stability)
 
     def test_parse_args_accepts_trend_ignition_shadow_flag(self):
         with patch.object(

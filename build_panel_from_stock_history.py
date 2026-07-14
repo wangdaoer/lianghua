@@ -8,8 +8,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from workspace_paths import stock_data_root
 
-DEFAULT_STOCK_DIR = Path(r"D:\codex\量化\data\processed\stocks")
+
+DEFAULT_STOCK_DIR = stock_data_root() / "stocks"
 DEFAULT_PREFIXES = ("000", "001", "002", "003", "300", "301", "600", "601", "603", "605")
 
 

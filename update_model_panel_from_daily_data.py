@@ -10,9 +10,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from workspace_paths import daily_data_root
 
-DEFAULT_BASE_PANEL = Path("data_panel_history_main_chinext_20220101_20260626.csv")
-DEFAULT_DAILY_DIR = Path(r"D:\codex\daily-market-data\ths_exports\normalized")
+
+DEFAULT_BASE_PANEL = Path("data/base_panel.csv")
+DEFAULT_DAILY_DIR = daily_data_root() / "ths_exports" / "normalized"
 DEFAULT_OUTPUT = Path("data_panel_history_main_chinext_20220101_latest.csv")
 DEFAULT_PREFIXES = ("000", "001", "002", "003", "300", "301", "600", "601", "603", "605")
 ZERO_PLACEHOLDER_COLUMNS = ("open", "high", "low", "close", "volume", "amount")
@@ -249,7 +251,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Update the model panel with daily normalized exports.")
     parser.add_argument("--base-panel", default=str(DEFAULT_BASE_PANEL))
     parser.add_argument("--daily-dir", default=str(DEFAULT_DAILY_DIR))
-    parser.add_argument("--daily-start", default="2026-06-22")
+    parser.add_argument("--daily-start", default="2000-01-01")
     parser.add_argument("--daily-end", default=None)
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--prefixes", default=",".join(DEFAULT_PREFIXES))

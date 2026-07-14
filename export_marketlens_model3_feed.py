@@ -10,9 +10,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from workspace_paths import dashboard_root
+
 
 DEFAULT_OUTPUT_ROOT = Path("outputs/high_return_v2")
-DEFAULT_DASHBOARD_OUTPUT = Path("D:/codex/outputs/stock-analysis-dashboard/data/quant-model3-latest.json")
+DEFAULT_DASHBOARD_OUTPUT = dashboard_root() / "data" / "quant-model3-latest.json"
 LOCAL_PATH_RE = re.compile(r"[A-Za-z]:\\[^\"'\n\r]+")
 
 

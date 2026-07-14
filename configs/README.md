@@ -1,0 +1,50 @@
+# Configuration index
+
+All configurations are research or simulation artifacts. None authorizes live trading.
+
+Status meanings:
+
+- `active-research`: used by the current daily research workflow.
+- `shadow`: evaluated without changing the formal ranking or placing orders.
+- `experimental`: retained for active manual research.
+- `rejected`: failed a preregistered or holdout gate.
+- `legacy-reproduction`: retained only to reproduce historical results or audits.
+- `utility`: schema or mapping input, not a strategy.
+- `example`: example sweep or starter configuration.
+
+| Configuration | Status | Entry point / evidence |
+| --- | --- | --- |
+| `personal_trade_habit_overlay.yaml` | active-research | `run_daily_model_pipeline.py`; personal overlay only |
+| `evolution_strong_pullback.yaml` | shadow | `run_strong_pullback_evolution.py`; `docs/superpowers/specs/2026-07-10-strong-pullback-self-evolution-design.md` |
+| `evolution_multifactor_observation.yaml` | shadow | `run_multifactor_observation_evolution.py`; observation-only gates |
+| `trend_ignition_shortlist_preregistered.yaml` | rejected | `docs/research-results/trend_ignition_shortlist_20260714_v1.md` |
+| `external_strategy_absorption.yaml` | experimental | `docs/external_strategy_absorption_20260709.md` |
+| `field_map_stock_targets.yaml` | utility | field mapping for target exports |
+| `high_risk_strategy.yaml` | example | baseline `run_backtest.py` example |
+| `high_risk_strategy_high_return.yaml` | legacy-reproduction | historical high-return research |
+| `high_risk_strategy_high_return_toy.yaml` | example | reduced toy research |
+| `high_risk_strategy_high_return_v2.yaml` | legacy-reproduction | historical v2 research |
+| `high_risk_strategy_high_return_v2_selected.yaml` | legacy-reproduction | selected historical universe audit |
+| `high_risk_strategy_high_return_v2_dynamic_universe.yaml` | legacy-reproduction | legacy bias audit baseline |
+| `high_risk_strategy_high_return_v2_dynamic_universe_balanced.yaml` | legacy-reproduction | historical balanced variant |
+| `high_risk_strategy_high_return_v2_dynamic_universe_balanced_dd30.yaml` | legacy-reproduction | historical drawdown variant |
+| `high_risk_strategy_high_return_v2_dynamic_universe_balanced_dd30_v2.yaml` | legacy-reproduction | historical drawdown variant v2 |
+| `high_risk_strategy_high_return_v2_dynamic_universe_balanced_dd30_v3.yaml` | legacy-reproduction | historical drawdown variant v3 |
+| `high_risk_strategy_high_return_v2_dynamic_universe_balanced_dd30_v3_next_open.yaml` | legacy-reproduction | historical next-open variant |
+| `high_risk_strategy_high_return_v2_dynamic_universe_balanced_dd30_v3_next_open_gap3.yaml` | legacy-reproduction | historical next-open gap variant |
+| `high_risk_strategy_high_return_v2_dynamic_universe_conservative.yaml` | legacy-reproduction | historical conservative variant |
+| `high_risk_strategy_high_return_v2_toy.yaml` | example | v2 toy research |
+| `high_risk_strategy_high_return_v2_toy_small.yaml` | example | reduced v2 toy research |
+| `high_risk_strategy_high_return_v2_toy_small_best.yaml` | legacy-reproduction | retained toy winner, not approved |
+| `high_risk_strategy_next_open_reversal_dynamic.yaml` | experimental | manual next-open reversal research |
+| `high_risk_strategy_next_open_reversal_dynamic_low_turnover.yaml` | experimental | low-turnover reversal research |
+| `high_risk_strategy_next_open_trend_dynamic.yaml` | experimental | manual next-open trend research |
+| `sweep_grid_example.yaml` | example | generic sweep example |
+| `sweep_grid_high_return.yaml` | legacy-reproduction | historical high-return sweep |
+| `sweep_grid_high_return_expanded.yaml` | legacy-reproduction | expanded historical sweep |
+| `sweep_grid_high_return_fast.yaml` | legacy-reproduction | fast historical sweep |
+| `sweep_grid_high_return_toy_fast.yaml` | example | toy fast sweep |
+
+The current daily rank model is configured by explicit `PipelineConfig` and CLI fields in
+`run_daily_model_pipeline.py`; it does not silently select one of the
+`high_risk_strategy_high_return_v2*` files.
