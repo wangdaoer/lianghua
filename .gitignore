@@ -51,3 +51,4 @@ tmp_*.yml
 Thumbs.db
 .vscode/
 .idea/
+.vercel/
