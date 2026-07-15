@@ -2,4 +2,5 @@
 # Vercel only needs the dependency-free deployment health endpoint.
 /*
 !api
+!index.html
 !vercel.json
