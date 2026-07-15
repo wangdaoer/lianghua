@@ -411,7 +411,7 @@
         align-items: center;
         justify-content: space-between;
         gap: 16px;
-        margin-bottom: 54px;
+        margin-bottom: 30px;
         color: var(--muted);
         font-family: var(--mono);
         font-size: 10px;
@@ -464,6 +464,182 @@
         color: var(--muted);
         font-size: 13px;
         line-height: 1.75;
+      }
+
+      .research-panel {
+        min-width: 0;
+      }
+
+      .research-panel[aria-busy="true"] {
+        min-height: 280px;
+      }
+
+      .research-heading {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 24px;
+      }
+
+      .research-heading-label,
+      .research-section-label,
+      .metric-label {
+        display: block;
+        margin-bottom: 5px;
+        color: var(--faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .research-date {
+        display: block;
+        font-family: var(--serif);
+        font-size: 34px;
+        font-weight: 500;
+        letter-spacing: -0.035em;
+        line-height: 1.1;
+      }
+
+      .research-age {
+        color: var(--muted);
+        font-size: 11px;
+        text-align: right;
+      }
+
+      .research-summary {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        margin-bottom: 24px;
+        border: 1px solid var(--line-soft);
+        border-radius: 9px;
+        background: rgba(251, 250, 247, 0.72);
+      }
+
+      .research-metric {
+        min-width: 0;
+        padding: 15px 16px;
+        border-right: 1px solid var(--line-soft);
+      }
+
+      .research-metric:last-child {
+        border-right: 0;
+      }
+
+      .metric-value {
+        display: block;
+        overflow: hidden;
+        font-family: var(--mono);
+        font-size: 16px;
+        font-weight: 650;
+        letter-spacing: -0.035em;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .bucket-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 7px;
+        margin: 0 0 26px;
+        padding: 0;
+        list-style: none;
+      }
+
+      .bucket-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        padding: 6px 9px;
+        border: 1px solid var(--line-soft);
+        border-radius: 999px;
+        color: var(--muted);
+        font-size: 10px;
+      }
+
+      .bucket-item strong {
+        color: var(--ink);
+        font-family: var(--mono);
+        font-size: 10px;
+      }
+
+      .watchlist {
+        overflow: hidden;
+        margin-top: 9px;
+        border-top: 1px solid var(--line);
+      }
+
+      .watchlist-header,
+      .watchlist-row {
+        display: grid;
+        grid-template-columns: minmax(150px, 1.15fr) minmax(110px, 0.85fr) minmax(92px, 0.6fr);
+        gap: 16px;
+        align-items: center;
+      }
+
+      .watchlist-header {
+        min-height: 38px;
+        color: var(--faint);
+        font-family: var(--mono);
+        font-size: 8px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .watchlist-row {
+        min-height: 58px;
+        border-top: 1px solid var(--line-soft);
+        font-size: 11px;
+      }
+
+      .watchlist-empty {
+        padding: 28px 0;
+        border-top: 1px solid var(--line-soft);
+        color: var(--muted);
+        font-size: 11px;
+        text-align: center;
+      }
+
+      .stock-name {
+        display: block;
+        overflow: hidden;
+        font-size: 12px;
+        font-weight: 650;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .stock-meta,
+      .watchlist-family {
+        display: block;
+        overflow: hidden;
+        color: var(--muted);
+        font-family: var(--mono);
+        font-size: 9px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .watchlist-priority {
+        justify-self: start;
+      }
+
+      .research-warning {
+        margin-top: 18px;
+        padding: 11px 13px;
+        border: 1px solid #ead9b3;
+        border-radius: 7px;
+        background: var(--yellow-bg);
+        color: var(--yellow);
+        font-size: 10px;
+      }
+
+      .research-warning.red {
+        border-color: #ebcfcc;
+        background: var(--red-bg);
+        color: var(--red);
       }
 
       .check-card {
@@ -808,6 +984,38 @@
           padding: 23px;
         }
 
+        .research-heading {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .research-age {
+          text-align: left;
+        }
+
+        .research-summary {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .research-metric:nth-child(2) {
+          border-right: 0;
+        }
+
+        .research-metric:nth-child(-n + 2) {
+          border-bottom: 1px solid var(--line-soft);
+        }
+
+        .watchlist-header,
+        .watchlist-row {
+          grid-template-columns: minmax(0, 1fr) minmax(90px, auto);
+          gap: 10px;
+        }
+
+        .watchlist-family {
+          display: none;
+        }
+
         .section {
           padding: 76px 0;
         }
@@ -920,7 +1128,7 @@
               </div>
               <div class="board-row">
                 <span>研究数据</span>
-                <span class="badge yellow">尚未接入</span>
+                <span class="badge yellow" id="research-badge">正在读取</span>
               </div>
               <div class="board-row">
                 <span>研究属性</span>
@@ -942,7 +1150,7 @@
             <div>
               <h2>先确认数据，再讨论结果。</h2>
               <p>
-                部署健康检查来自线上接口；研究产物仍保存在本地数据目录，因此此处保持空状态，直到有经过审核的稳定数据源。
+                部署健康检查来自线上接口；研究概览读取私有存储中的审核后摘要，并明确显示数据日期、覆盖范围和运行状态。
               </p>
             </div>
           </div>
@@ -951,19 +1159,21 @@
             <article class="card run-card reveal">
               <div class="card-kicker">
                 <span>最近研究运行</span>
-                <span class="badge yellow">等待数据源</span>
+                <span class="badge yellow" id="research-run-badge">读取中</span>
               </div>
-              <div class="empty-state">
+              <div class="research-panel" id="research-panel" aria-live="polite" aria-busy="true">
+                <div class="empty-state">
                 <div class="empty-state-inner">
                   <div class="empty-icon" aria-hidden="true">
                     <svg viewBox="0 0 24 24">
                       <path d="M4 18V9m5 9V5m5 13v-7m5 7V3" />
                     </svg>
                   </div>
-                  <h3>尚无可发布的研究快照</h3>
+                  <h3>正在读取研究快照</h3>
                   <p>
-                    接入每日流水线生成的审核后摘要，才能显示候选数量、风险档位、回测指标与最新数据日期。
+                    正在核验最新数据日期、观察池和研究边界，请稍候。
                   </p>
+                </div>
                 </div>
               </div>
             </article>
@@ -981,16 +1191,16 @@
                 <div class="check-item">
                   <div class="check-item-top">
                     <span>研究数据库</span>
-                    <span class="badge yellow">本地</span>
+                    <span class="badge yellow" id="database-badge">读取中</span>
                   </div>
-                  <p>未发布 SQLite 研究库</p>
+                  <p id="database-meta">正在核验摘要覆盖范围</p>
                 </div>
                 <div class="check-item">
                   <div class="check-item-top">
                     <span>行情覆盖</span>
-                    <span class="badge yellow">未知</span>
+                    <span class="badge yellow" id="market-badge">读取中</span>
                   </div>
-                  <p>等待最新完整交易日</p>
+                  <p id="market-meta">正在核验最新完整交易日</p>
                 </div>
                 <div class="check-item">
                   <div class="check-item-top">
@@ -1133,14 +1343,14 @@
         <div class="shell">
           <div class="card connection-card reveal">
             <div>
-              <h3>下一步：接入审核后的每日摘要</h3>
+              <h3>已接入审核后的每日摘要</h3>
               <p>
-                建议由每日流水线输出一个不含个人成交与私有路径的 JSON 摘要，再由只读 API 提供给页面。届时可安全加入候选数量、市场状态、回测指标和最新完整交易日。
+                页面通过只读接口获取私有存储中的脱敏快照，只展示研究日期、覆盖统计和观察名单；个人成交、私有路径与交易指令不会进入网页。
               </p>
             </div>
             <div class="connection-meta">
-              <span class="badge yellow">Not connected</span>
-              <code>source: pending</code>
+              <span class="badge yellow" id="connection-badge">Checking</span>
+              <code id="connection-source">source: /api/research/latest</code>
             </div>
           </div>
         </div>
@@ -1193,6 +1403,205 @@
         })
         .then((payload) => setApiState(payload.status === "ok", payload))
         .catch(() => setApiState(false, {}));
+
+      const numberFormatter = new Intl.NumberFormat("zh-CN");
+      const bucketLabels = {
+        model_focus: "模型关注",
+        action_focus: "优先复核",
+        risk_watch: "风险观察",
+        pattern_watch: "形态观察",
+        review_later: "后续复核",
+      };
+      const warningLabels = {
+        data_stale: "数据已超过新鲜度阈值",
+        run_failed: "最近一次研究运行未成功",
+        "artifact_missing:stability_report": "稳定性报告尚未生成",
+      };
+
+      const createElement = (tagName, className, text) => {
+        const element = document.createElement(tagName);
+        if (className) element.className = className;
+        if (text !== undefined && text !== null) element.textContent = String(text);
+        return element;
+      };
+
+      const setBadge = (element, text, tone) => {
+        element.textContent = text;
+        element.className = `badge ${tone}`;
+      };
+
+      const formatNumber = (value) => {
+        const numeric = Number(value);
+        return Number.isFinite(numeric) ? numberFormatter.format(numeric) : "—";
+      };
+
+      const formatDate = (value) => {
+        const parts = String(value || "").split("-");
+        return parts.length === 3 ? parts.join(".") : "日期未知";
+      };
+
+      const formatAge = (freshness) => {
+        const age = Number(freshness && freshness.age_days);
+        if (!Number.isFinite(age)) return "新鲜度未知";
+        if (age === 0) return "今日完整数据";
+        return `距今 ${numberFormatter.format(age)} 天`;
+      };
+
+      const renderResearchEmpty = (status) => {
+        const states = {
+          missing: ["尚未发布", "没有找到可展示的研究快照。完成每日发布后，页面会自动更新。"],
+          unavailable: ["暂未配置", "研究存储尚未配置，部署健康状态不受影响。"],
+          error: ["读取失败", "研究快照未通过核验，请稍后刷新或检查发布结果。"],
+        };
+        const [title, message] = states[status] || states.error;
+        const panel = document.getElementById("research-panel");
+        const wrapper = createElement("div", "empty-state");
+        const inner = createElement("div", "empty-state-inner");
+        const icon = createElement("div", "empty-icon", "—");
+        icon.setAttribute("aria-hidden", "true");
+        inner.append(icon, createElement("h3", "", title), createElement("p", "", message));
+        wrapper.append(inner);
+        panel.replaceChildren(wrapper);
+        panel.setAttribute("aria-busy", "false");
+
+        const tone = status === "error" ? "red" : "yellow";
+        setBadge(document.getElementById("research-badge"), title, tone);
+        setBadge(document.getElementById("research-run-badge"), title, tone);
+        setBadge(document.getElementById("database-badge"), "未知", "yellow");
+        setBadge(document.getElementById("market-badge"), "未知", "yellow");
+        setBadge(document.getElementById("connection-badge"), "Unavailable", tone);
+        document.getElementById("database-meta").textContent = "没有可核验的覆盖数据";
+        document.getElementById("market-meta").textContent = "没有可核验的行情日期";
+      };
+
+      const metric = (label, value) => {
+        const item = createElement("div", "research-metric");
+        item.append(createElement("span", "metric-label", label), createElement("strong", "metric-value", value));
+        return item;
+      };
+
+      const renderResearch = (status, snapshot) => {
+        if (!snapshot || snapshot.research_only !== true || snapshot.trade_instruction !== false) {
+          renderResearchEmpty("error");
+          return;
+        }
+
+        const summary = snapshot.summary || {};
+        const coverage = snapshot.coverage || {};
+        const freshness = snapshot.freshness || {};
+        const watchlist = snapshot.watchlist || {};
+        const quality = snapshot.quality || {};
+        const panel = document.getElementById("research-panel");
+        const fragment = document.createDocumentFragment();
+
+        const heading = createElement("div", "research-heading");
+        const dateBlock = createElement("div", "");
+        dateBlock.append(
+          createElement("span", "research-heading-label", "最新完整研究日"),
+          createElement("strong", "research-date", formatDate(snapshot.asof_date))
+        );
+        heading.append(dateBlock, createElement("span", "research-age", formatAge(freshness)));
+        fragment.append(heading);
+
+        const summaryGrid = createElement("div", "research-summary");
+        summaryGrid.append(
+          metric("观察池", formatNumber(summary.priority_rows)),
+          metric("本期入选", formatNumber(summary.selected_rows)),
+          metric("变更记录", formatNumber(summary.change_rows)),
+          metric("日线记录", formatNumber(coverage.database_daily_rows))
+        );
+        fragment.append(summaryGrid);
+
+        const bucketCounts = watchlist.bucket_counts && typeof watchlist.bucket_counts === "object"
+          ? Object.entries(watchlist.bucket_counts)
+          : [];
+        if (bucketCounts.length) {
+          fragment.append(createElement("span", "research-section-label", "观察层级"));
+          const buckets = createElement("ul", "bucket-list");
+          bucketCounts.forEach(([key, count]) => {
+            const item = createElement("li", "bucket-item", bucketLabels[key] || key.replaceAll("_", " "));
+            item.append(createElement("strong", "", formatNumber(count)));
+            buckets.append(item);
+          });
+          fragment.append(buckets);
+        }
+
+        fragment.append(createElement("span", "research-section-label", "重点观察 Top 10"));
+        const list = createElement("div", "watchlist");
+        const listHeader = createElement("div", "watchlist-header");
+        listHeader.append(createElement("span", "", "标的 / 排名"), createElement("span", "watchlist-family", "策略族"), createElement("span", "", "关注层级"));
+        list.append(listHeader);
+
+        const top10 = Array.isArray(watchlist.top10) ? watchlist.top10.slice(0, 10) : [];
+        if (!top10.length) {
+          list.append(createElement("div", "watchlist-empty", "本期没有可展示的观察项"));
+        } else {
+          top10.forEach((row, index) => {
+            const item = createElement("div", "watchlist-row");
+            const stock = createElement("div", "");
+            stock.append(
+              createElement("span", "stock-name", row.stock_name || row.symbol || "未命名标的"),
+              createElement("span", "stock-meta", `#${String(index + 1).padStart(2, "0")} · ${row.symbol || "—"} · ${formatNumber(row.priority_score)}`)
+            );
+            const family = row.strategy_family_cn || row.strategy_family || "未分类";
+            const priority = createElement("span", "badge blue watchlist-priority", bucketLabels[row.priority_bucket] || "研究观察");
+            item.append(stock, createElement("span", "watchlist-family", family), priority);
+            list.append(item);
+          });
+        }
+        fragment.append(list);
+
+        const warnings = Array.isArray(quality.warnings) ? quality.warnings : [];
+        if (warnings.length || status === "failed") {
+          const warningText = warnings
+            .slice(0, 3)
+            .map((code) => warningLabels[code] || "存在待复核的研究提示")
+            .join("；");
+          fragment.append(createElement("div", `research-warning${status === "failed" ? " red" : ""}`, warningText || "最近一次研究运行未成功"));
+        }
+
+        panel.replaceChildren(fragment);
+        panel.setAttribute("aria-busy", "false");
+
+        const isFailed = status === "failed";
+        const isStale = status === "stale";
+        const tone = isFailed ? "red" : isStale ? "yellow" : "green";
+        const shortStatus = isFailed ? "运行失败" : isStale ? "数据过期" : "已接入";
+        setBadge(document.getElementById("research-badge"), shortStatus, tone);
+        setBadge(document.getElementById("research-run-badge"), isFailed ? "失败" : isStale ? "需更新" : "最新", tone);
+        setBadge(document.getElementById("connection-badge"), isStale ? "Connected · stale" : isFailed ? "Connected · failed" : "Connected", tone);
+
+        const databaseReady = Boolean(coverage.database_latest_date);
+        setBadge(document.getElementById("database-badge"), databaseReady ? "已同步" : "待核验", databaseReady ? "green" : "yellow");
+        document.getElementById("database-meta").textContent = databaseReady
+          ? `${formatDate(coverage.database_latest_date)} · ${formatNumber(coverage.database_daily_rows)} 条日线`
+          : "摘要未提供数据库覆盖日期";
+
+        const marketReady = Boolean(coverage.benchmark_latest_date);
+        setBadge(document.getElementById("market-badge"), marketReady ? "已覆盖" : "待核验", marketReady ? "green" : "yellow");
+        const agreement = coverage.benchmark_source_agreement === true ? "来源一致" : "来源待复核";
+        document.getElementById("market-meta").textContent = marketReady
+          ? `${formatDate(coverage.benchmark_latest_date)} · ${agreement}`
+          : "摘要未提供行情覆盖日期";
+      };
+
+      fetch("/api/research/latest", { cache: "no-store" })
+        .then(async (response) => {
+          const payload = await response.json();
+          return { ok: response.ok, payload };
+        })
+        .then(({ ok, payload }) => {
+          if (payload.research_only !== true || payload.trade_instruction !== false) {
+            renderResearchEmpty("error");
+            return;
+          }
+          if (ok && ["ok", "stale", "failed"].includes(payload.status)) {
+            renderResearch(payload.status, payload.data);
+          } else {
+            renderResearchEmpty(payload.status);
+          }
+        })
+        .catch(() => renderResearchEmpty("error"));
 
       const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
       const reveals = document.querySelectorAll(".reveal");
