@@ -6,6 +6,7 @@ import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from http.server import HTTPServer
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +66,181 @@ class VercelEntrypointTests(unittest.TestCase):
 
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["status"], "ok")
+
+    def _research_snapshot(self, asof_date: str | None = None) -> dict:
+        asof_date = (
+            asof_date
+            or MODULE.datetime.now(MODULE.timezone.utc).date().isoformat()
+        )
+        return {
+            "schema_version": 2,
+            "project": "lianghua",
+            "research_only": True,
+            "trade_instruction": False,
+            "asof_date": asof_date,
+            "generated_at": "2026-07-14T22:00:13",
+            "published_at": "2026-07-15T05:00:00Z",
+            "run_status": "success",
+            "freshness": {
+                "status": "fresh",
+                "age_days": 1,
+                "stale_after_days": 3,
+            },
+            "summary": {"priority_rows": 50},
+            "coverage": {"database_latest_date": "2026-07-14"},
+            "quality": {"warnings": []},
+            "watchlist": {
+                "bucket_counts": {},
+                "strategy_family_counts": {},
+                "top10": [],
+            },
+            "source_integrity": {
+                "run_card_sha256": "a" * 64,
+                "watchlist_sha256": "b" * 64,
+            },
+        }
+
+    def test_research_api_returns_verified_snapshot(self) -> None:
+        snapshot = self._research_snapshot()
+        with patch.object(MODULE, "_fetch_research_snapshot", return_value=snapshot):
+            with urlopen(f"{self.base_url}/api/research/latest", timeout=2) as response:
+                payload = json.load(response)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["data"]["summary"]["priority_rows"], 50)
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+
+    def test_research_api_reports_missing_snapshot(self) -> None:
+        with patch.object(
+            MODULE,
+            "_fetch_research_snapshot",
+            side_effect=MODULE.ResearchSnapshotMissing,
+        ):
+            with self.assertRaises(HTTPError) as context:
+                urlopen(f"{self.base_url}/api/research/latest", timeout=2)
+
+        self.assertEqual(context.exception.code, 404)
+        payload = json.load(context.exception)
+        self.assertEqual(payload["status"], "missing")
+
+    def test_research_api_recomputes_stale_state(self) -> None:
+        snapshot = self._research_snapshot(asof_date="2020-01-01")
+        with patch.object(MODULE, "_fetch_research_snapshot", return_value=snapshot):
+            with urlopen(f"{self.base_url}/api/research/latest", timeout=2) as response:
+                payload = json.load(response)
+
+        self.assertEqual(payload["status"], "stale")
+        self.assertEqual(payload["data"]["freshness"]["status"], "stale")
+
+    def test_research_api_reports_failed_run(self) -> None:
+        snapshot = self._research_snapshot()
+        snapshot["run_status"] = "failed"
+        status, payload = MODULE._research_response(lambda: snapshot)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["data"]["freshness"]["status"], "failed")
+
+    def test_research_api_reports_unavailable_storage(self) -> None:
+        status, payload = MODULE._research_response(
+            lambda: (_ for _ in ()).throw(MODULE.ResearchSnapshotUnavailable())
+        )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["status"], "unavailable")
+
+    def test_research_api_hides_invalid_snapshot_error(self) -> None:
+        snapshot = self._research_snapshot()
+        snapshot["personal_target_weight"] = 0.75
+        with patch.object(MODULE, "_fetch_research_snapshot", return_value=snapshot):
+            with self.assertRaises(HTTPError) as context:
+                urlopen(f"{self.base_url}/api/research/latest", timeout=2)
+
+        self.assertEqual(context.exception.code, 502)
+        payload = json.load(context.exception)
+        self.assertEqual(payload["status"], "error")
+        self.assertNotIn("personal_target_weight", json.dumps(payload))
+
+    def test_research_api_rejects_sensitive_text_in_allowed_field(self) -> None:
+        sensitive_values = (
+            r"C:\private\research.sqlite3 | buy_now target_weight=0.75",
+            "position_size=0.75",
+            "purchase_now",
+            "建议加仓",
+            "个人持仓 100股",
+            "py private_job.py",
+            "node private_job.js",
+            "vercel_blob_rw_dummy",
+            "sk-proj-dummy",
+            "ghp_dummy",
+            "D:private.db",
+            "/root/config.yaml",
+            "/srv/research/config.yaml",
+            "s3://private-bucket/research.json",
+            "postgresql://user:pass@host/db",
+            "Rscript private_job.R",
+            "git clone private-repo",
+            "target.weight=0.75",
+            "建议止损",
+            "立即平仓",
+            "sk_live_dummy",
+        )
+        for sensitive_value in sensitive_values:
+            with self.subTest(sensitive_value=sensitive_value):
+                snapshot = self._research_snapshot()
+                snapshot["watchlist"]["top10"] = [
+                    {
+                        "symbol": "000001",
+                        "stock_name": sensitive_value,
+                        "strategy_family": "trend_momentum",
+                        "strategy_family_cn": "趋势动量",
+                        "priority_bucket": "model_focus",
+                        "priority_score": 1.0,
+                    }
+                ]
+                status, payload = MODULE._research_response(lambda: snapshot)
+
+                self.assertEqual(status, 502)
+                self.assertEqual(payload["status"], "error")
+                self.assertNotIn(sensitive_value, json.dumps(payload))
+
+    def test_research_api_rejects_sensitive_text_hidden_in_unknown_key(self) -> None:
+        snapshot = self._research_snapshot()
+        snapshot[r"C:\private\research.sqlite3"] = "hidden"
+        status, payload = MODULE._research_response(lambda: snapshot)
+
+        self.assertEqual(status, 502)
+        self.assertEqual(payload["status"], "error")
+        self.assertNotIn("research.sqlite3", json.dumps(payload))
+
+    def test_research_api_rejects_unapproved_schema_field(self) -> None:
+        snapshot = self._research_snapshot()
+        snapshot["harmless_extra"] = "not approved"
+        status, payload = MODULE._research_response(lambda: snapshot)
+
+        self.assertEqual(status, 502)
+        self.assertEqual(payload["status"], "error")
+
+    def test_rewrite_marker_routes_to_research_payload(self) -> None:
+        snapshot = self._research_snapshot()
+        with patch.object(MODULE, "_fetch_research_snapshot", return_value=snapshot):
+            with urlopen(
+                f"{self.base_url}/api?route=research-latest", timeout=2
+            ) as response:
+                payload = json.load(response)
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertIn("data", payload)
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+
+    def test_private_blob_read_bypasses_cached_overwrite(self) -> None:
+        url = MODULE._consistent_blob_url(
+            "https://store.private.blob.vercel-storage.com/research/latest.json?x=1"
+        )
+
+        self.assertIn("x=1", url)
+        self.assertIn("cache=0", url)
 
     def test_unknown_path_returns_not_found(self) -> None:
         with self.assertRaises(HTTPError) as context:
