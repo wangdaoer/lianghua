@@ -27,10 +27,14 @@ class VercelFrontendTests(unittest.TestCase):
 
     def test_vercel_bundle_includes_homepage(self) -> None:
         ignore_rules = (ROOT / ".vercelignore").read_text(encoding="utf-8")
+        config = json.loads((ROOT / "vercel.json").read_text(encoding="utf-8"))
 
         self.assertIn("!api", ignore_rules.splitlines())
         self.assertIn("!index.html", ignore_rules.splitlines())
         self.assertIn("!vercel.json", ignore_rules.splitlines())
+        self.assertEqual(
+            config["functions"]["api/index.py"]["includeFiles"], "index.html"
+        )
 
 
 if __name__ == "__main__":

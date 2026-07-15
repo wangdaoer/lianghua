@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import threading
 import unittest
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from http.server import HTTPServer
 
@@ -22,7 +23,7 @@ class VercelEntrypointTests(unittest.TestCase):
         cls.server = HTTPServer(("127.0.0.1", 0), MODULE.handler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
-        cls.url = f"http://127.0.0.1:{cls.server.server_port}/"
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}"
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -30,8 +31,25 @@ class VercelEntrypointTests(unittest.TestCase):
         cls.server.server_close()
         cls.thread.join(timeout=2)
 
-    def test_get_returns_health_payload(self) -> None:
-        with urlopen(self.url, timeout=2) as response:
+    def test_root_returns_research_workbench(self) -> None:
+        with urlopen(f"{self.base_url}/", timeout=2) as response:
+            html = response.read().decode("utf-8")
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers.get_content_type(), "text/html")
+        self.assertIn("<title>lianghua · 量化研究工作台</title>", html)
+        self.assertIn('id="overview"', html)
+
+    def test_index_path_returns_research_workbench(self) -> None:
+        with urlopen(f"{self.base_url}/index.html", timeout=2) as response:
+            html = response.read().decode("utf-8")
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers.get_content_type(), "text/html")
+        self.assertIn("<main", html)
+
+    def test_api_returns_health_payload(self) -> None:
+        with urlopen(f"{self.base_url}/api", timeout=2) as response:
             payload = json.load(response)
 
         self.assertEqual(response.status, 200)
@@ -41,8 +59,21 @@ class VercelEntrypointTests(unittest.TestCase):
         self.assertTrue(payload["research_only"])
         self.assertFalse(payload["trade_instruction"])
 
+    def test_health_returns_health_payload(self) -> None:
+        with urlopen(f"{self.base_url}/health", timeout=2) as response:
+            payload = json.load(response)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["status"], "ok")
+
+    def test_unknown_path_returns_not_found(self) -> None:
+        with self.assertRaises(HTTPError) as context:
+            urlopen(f"{self.base_url}/missing", timeout=2)
+
+        self.assertEqual(context.exception.code, 404)
+
     def test_head_has_no_response_body(self) -> None:
-        request = Request(self.url, method="HEAD")
+        request = Request(f"{self.base_url}/api", method="HEAD")
         with urlopen(request, timeout=2) as response:
             body = response.read()
 
