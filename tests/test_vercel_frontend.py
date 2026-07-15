@@ -21,6 +21,7 @@ class VercelFrontendTests(unittest.TestCase):
         config = json.loads((ROOT / "vercel.json").read_text(encoding="utf-8"))
 
         rewrites = config["rewrites"]
+        self.assertIn({"source": "/", "destination": "/index.html"}, rewrites)
         self.assertNotIn({"source": "/", "destination": "/api"}, rewrites)
         self.assertIn({"source": "/health", "destination": "/api"}, rewrites)
 
