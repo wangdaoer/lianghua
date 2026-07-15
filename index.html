@@ -1431,6 +1431,7 @@
       };
 
       const formatNumber = (value) => {
+        if (value === null || value === undefined || (typeof value === "string" && !value.trim())) return "—";
         const numeric = Number(value);
         return Number.isFinite(numeric) ? numberFormatter.format(numeric) : "—";
       };

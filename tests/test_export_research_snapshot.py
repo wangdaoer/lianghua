@@ -72,6 +72,8 @@ class ResearchSnapshotTests(unittest.TestCase):
                 "artifact_missing:stability_report",
                 "tests:534 passed; 563 subtests passed",
                 r"unsafe:C:\private\file.txt",
+                "buy_now target_weight=0.75",
+                "python private_job.py --execute",
             ],
         }
         run_card_path = self.root / f"daily_run_card_{token}.json"
@@ -129,7 +131,7 @@ class ResearchSnapshotTests(unittest.TestCase):
             published_at=datetime(2026, 7, 15, 3, 0, tzinfo=timezone.utc),
         )
 
-        self.assertEqual(snapshot["schema_version"], 1)
+        self.assertEqual(snapshot["schema_version"], 2)
         self.assertEqual(snapshot["asof_date"], "2026-07-14")
         self.assertEqual(snapshot["freshness"]["status"], "fresh")
         self.assertEqual(snapshot["freshness"]["age_days"], 1)
@@ -152,8 +154,62 @@ class ResearchSnapshotTests(unittest.TestCase):
             "private-note",
             "target_leverage",
             "factor.json",
+            "target_weight=0.75",
+            "private_job.py",
         ):
             self.assertNotIn(forbidden, serialized)
+
+    def test_drops_sensitive_text_from_unpublished_watchlist_field(self) -> None:
+        run_card, watchlist = self._write_sources()
+        contents = watchlist.read_text(encoding="utf-8")
+        sensitive_value = r"C:\private\research.sqlite3 | buy_now target_weight=0.75"
+        watchlist.write_text(
+            contents.replace("strategy_family_insufficient", sensitive_value),
+            encoding="utf-8",
+        )
+
+        snapshot = build_research_snapshot(run_card, watchlist)
+
+        self.assertNotIn(sensitive_value, json.dumps(snapshot, ensure_ascii=False))
+        self.assertNotIn("risk_flags", snapshot["watchlist"]["top10"][0])
+
+    def test_rejects_sensitive_text_in_published_stock_name(self) -> None:
+        sensitive_values = (
+            r"C:\private\research.sqlite3 | buy_now target_weight=0.75",
+            "position_size=0.75",
+            "purchase_now",
+            "建议加仓",
+            "个人持仓 100股",
+            "py private_job.py",
+            "node private_job.js",
+            "vercel_blob_rw_dummy",
+            "sk-proj-dummy",
+            "ghp_dummy",
+            "D:private.db",
+            "/root/config.yaml",
+            "/srv/research/config.yaml",
+            "s3://private-bucket/research.json",
+            "postgresql://user:pass@host/db",
+            "Rscript private_job.R",
+            "git clone private-repo",
+            "target.weight=0.75",
+            "建议止损",
+            "立即平仓",
+            "sk_live_dummy",
+        )
+        for sensitive_value in sensitive_values:
+            with self.subTest(sensitive_value=sensitive_value):
+                run_card, watchlist = self._write_sources()
+                contents = watchlist.read_text(encoding="utf-8")
+                watchlist.write_text(
+                    contents.replace("name-603010", sensitive_value),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError, "not (?:safe|approved) for publication"
+                ):
+                    build_research_snapshot(run_card, watchlist)
 
     def test_marks_old_snapshot_stale(self) -> None:
         run_card, watchlist = self._write_sources()
@@ -182,8 +238,8 @@ class ResearchSnapshotTests(unittest.TestCase):
 
         discovered = discover_latest_sources(self.root)
 
-        self.assertEqual(discovered, (new_card, new_watchlist))
-        self.assertNotEqual(discovered, (old_card, old_watchlist))
+        self.assertEqual(discovered, (new_card.resolve(), new_watchlist.resolve()))
+        self.assertNotEqual(discovered, (old_card.resolve(), old_watchlist.resolve()))
 
     def test_writes_round_trip_json(self) -> None:
         run_card, watchlist = self._write_sources()

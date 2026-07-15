@@ -31,6 +31,7 @@ class VercelFrontendTests(unittest.TestCase):
         self.assertIn('["ok", "stale", "failed"]', html)
         for state in ("missing", "unavailable", "error"):
             self.assertIn(f'{state}: [', html)
+        self.assertIn("value === null || value === undefined", html)
         self.assertIn("页面不产生券商订单", html)
         self.assertNotIn("personal_target_weight", html)
         self.assertNotIn("personal_action", html)
@@ -42,6 +43,13 @@ class VercelFrontendTests(unittest.TestCase):
         self.assertIn({"source": "/", "destination": "/index.html"}, rewrites)
         self.assertNotIn({"source": "/", "destination": "/api"}, rewrites)
         self.assertIn({"source": "/health", "destination": "/api"}, rewrites)
+        self.assertIn(
+            {
+                "source": "/api/research/latest",
+                "destination": "/api?route=research-latest",
+            },
+            rewrites,
+        )
 
     def test_vercel_bundle_includes_homepage(self) -> None:
         ignore_rules = (ROOT / ".vercelignore").read_text(encoding="utf-8")

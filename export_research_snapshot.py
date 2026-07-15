@@ -13,22 +13,46 @@ import re
 from typing import Any
 
 
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
 DEFAULT_STALE_AFTER_DAYS = 3
 RUN_CARD_PATTERN = re.compile(r"daily_run_card_(\d{8})\.json$")
-
-SAFE_TOP10_TEXT_FIELDS = (
-    "symbol",
-    "stock_name",
-    "strategy_family",
-    "strategy_family_cn",
-    "priority_bucket",
-    "trend_state",
-    "pattern_type",
-    "risk_flags",
-    "family_health_status",
+SYMBOL_PATTERN = re.compile(r"^[0-9]{6}$")
+STOCK_NAME_PATTERN = re.compile(r"^[\u3400-\u9fffA-Za-z0-9*·（）()＋+&.\-]{1,30}$")
+STRATEGY_FAMILY_LABELS = {
+    "trend_momentum": "趋势动量",
+    "strong_pullback": "强势回调二波",
+    "hidden_accumulation": "隐性吸筹",
+}
+ALLOWED_STRATEGY_FAMILIES = set(STRATEGY_FAMILY_LABELS)
+ALLOWED_PRIORITY_BUCKETS = {
+    "model_focus",
+    "action_focus",
+    "risk_watch",
+    "pattern_watch",
+    "review_later",
+}
+ALLOWED_WARNING_CODES = {
+    "artifact_missing:stability_report",
+    "data_stale",
+    "run_failed",
+}
+SENSITIVE_PUBLIC_TEXT_PATTERN = re.compile(
+    r"(?:"
+    r"(?:^|[\s\"'=])[a-z]:"
+    r"|[a-z][a-z0-9+.-]*://"
+    r"|(?:^|[^a-z0-9])[^\s/\\]+\.(?:py|js|ps1|sh|bat|cmd|sqlite3?|db|csv)(?:[^a-z0-9]|$)"
+    r"|target[\s_.-]*(?:weight|leverage)"
+    r"|personal[\s_-]*(?:action|position|trade)"
+    r"|(?:^|[^a-z0-9])(?:buy|sell|execute|broker|purchase|allocation|position)(?:[^a-z0-9]|$)"
+    r"|(?:place[\s_-]*order|order[\s_-]*(?:now|id|quantity|side))"
+    r"|(?:^|[^a-z0-9])(?:py|python3?|node|deno|rscript|git|powershell|pwsh|cmd(?:\.exe)?|bash|zsh|curl|wget|sqlite3)(?=\s|$)"
+    r"|--[a-z0-9_-]+"
+    r"|(?:api[\s_-]*key|access[\s_-]*token|client[\s_-]*secret|password|bearer)"
+    r"|(?:^|[^a-z0-9])(?:sk[-_](?:proj[-_]|live[-_])?|gh[pousr]_|vercel_blob_rw_|xox[baprs]-|AKIA[0-9A-Z]{8,})"
+    r"|(?:买入|卖出|下单|仓位|持仓|加仓|减仓|清仓|建仓|止损|平仓|目标权重|交易指令|执行交易)"
+    r")",
+    re.IGNORECASE,
 )
-SAFE_TOP10_NUMBER_FIELDS = ("priority_score", "pattern_score")
 
 
 def file_sha256(path: Path) -> str:
@@ -81,7 +105,7 @@ def build_research_snapshot(
     if age_days < 0:
         raise ValueError("published_at cannot be earlier than asof_date")
 
-    run_status = str(run_card.get("run_status") or "unknown")
+    run_status = "success" if run_card.get("run_status") == "success" else "failed"
     freshness_status = "fresh" if age_days <= stale_after_days else "stale"
     if run_status != "success":
         freshness_status = "failed"
@@ -130,9 +154,6 @@ def build_research_snapshot(
             ),
         },
         "coverage": {
-            "database_sync_status": _optional_text(
-                verification.get("research_database_sync_status")
-            ),
             "database_latest_date": _optional_text(
                 verification.get("research_database_latest_date")
             ),
@@ -145,9 +166,6 @@ def build_research_snapshot(
             "database_observation_rows": _optional_int(
                 verification.get("research_database_observation_rows")
             ),
-            "benchmark_status": _optional_text(
-                verification.get("benchmark_refresh_status")
-            ),
             "benchmark_latest_date": _optional_text(
                 verification.get("benchmark_latest_date")
             ),
@@ -156,21 +174,19 @@ def build_research_snapshot(
             ),
         },
         "quality": {
-            "tests": _optional_text(verification.get("tests")),
             "missing_stock_names": _optional_int(
                 verification.get("missing_stock_names")
-            ),
-            "strategy_family_health_counts": _safe_count_map(
-                verification.get("strategy_family_health_counts")
             ),
             "warnings": warnings,
         },
         "watchlist": {
             "bucket_counts": _safe_count_map(
-                verification.get("priority_bucket_counts")
+                verification.get("priority_bucket_counts"),
+                allowed_keys=ALLOWED_PRIORITY_BUCKETS,
             ),
             "strategy_family_counts": _safe_count_map(
-                verification.get("priority_strategy_family_counts")
+                verification.get("priority_strategy_family_counts"),
+                allowed_keys=ALLOWED_STRATEGY_FAMILIES,
             ),
             "top10": top10,
         },
@@ -212,13 +228,28 @@ def _read_watchlist(path: Path) -> list[dict[str, str]]:
 
 
 def _safe_watchlist_row(row: dict[str, str]) -> dict[str, Any]:
-    safe: dict[str, Any] = {
-        field: str(row.get(field) or "").strip() for field in SAFE_TOP10_TEXT_FIELDS
+    symbol = str(row.get("symbol") or "").strip()
+    stock_name = str(row.get("stock_name") or "").strip()
+    strategy_family = str(row.get("strategy_family") or "").strip()
+    priority_bucket = str(row.get("priority_bucket") or "").strip()
+    if not SYMBOL_PATTERN.fullmatch(symbol):
+        raise ValueError("Watchlist symbol is not approved for publication")
+    if not STOCK_NAME_PATTERN.fullmatch(stock_name):
+        raise ValueError("Watchlist stock_name is not approved for publication")
+    if _contains_sensitive_public_text(stock_name):
+        raise ValueError("Watchlist stock_name is not safe for publication")
+    if strategy_family not in ALLOWED_STRATEGY_FAMILIES:
+        raise ValueError("Watchlist strategy_family is not approved for publication")
+    if priority_bucket not in ALLOWED_PRIORITY_BUCKETS:
+        raise ValueError("Watchlist priority_bucket is not approved for publication")
+    return {
+        "symbol": symbol,
+        "stock_name": stock_name,
+        "strategy_family": strategy_family,
+        "strategy_family_cn": STRATEGY_FAMILY_LABELS[strategy_family],
+        "priority_bucket": priority_bucket,
+        "priority_score": _optional_float(row.get("priority_score")),
     }
-    safe.update(
-        {field: _optional_float(row.get(field)) for field in SAFE_TOP10_NUMBER_FIELDS}
-    )
-    return safe
 
 
 def _validate_top10(raw_top10: Any, exported_top10: list[dict[str, Any]]) -> None:
@@ -276,10 +307,10 @@ def _format_datetime(value: datetime) -> str:
 def _safe_timestamp(value: Any) -> str | None:
     if value in (None, ""):
         return None
-    text = str(value).strip()
-    if len(text) > 40 or "/" in text or "\\" in text:
+    try:
+        return _format_datetime(_parse_datetime(str(value)))
+    except ValueError:
         return None
-    return text
 
 
 def _safe_warning_codes(value: Any) -> list[str]:
@@ -290,20 +321,22 @@ def _safe_warning_codes(value: Any) -> list[str]:
         if not isinstance(item, str):
             continue
         text = item.strip()
-        if not text or len(text) > 200 or "\n" in text or "/" in text or "\\" in text:
+        if text not in ALLOWED_WARNING_CODES:
             continue
         warnings.append(text)
     return warnings
 
 
-def _safe_count_map(value: Any) -> dict[str, int]:
+def _safe_count_map(value: Any, *, allowed_keys: set[str]) -> dict[str, int]:
     if not isinstance(value, dict):
         return {}
     result: dict[str, int] = {}
     for key, count in value.items():
         name = str(key).strip()
         number = _optional_int(count)
-        if name and len(name) <= 80 and number is not None:
+        if name not in allowed_keys:
+            raise ValueError("Snapshot count label is not approved for publication")
+        if number is not None:
             result[name] = number
     return result
 
@@ -312,9 +345,18 @@ def _optional_text(value: Any) -> str | None:
     if value in (None, ""):
         return None
     text = str(value).strip()
-    if len(text) > 200 or "\n" in text or "/" in text or "\\" in text:
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
         return None
-    return text
+
+
+def _contains_sensitive_public_text(text: str) -> bool:
+    if any(character in text for character in ("\\", "\n", "\r")):
+        return True
+    if any(ord(character) < 32 for character in text):
+        return True
+    return SENSITIVE_PUBLIC_TEXT_PATTERN.search(text) is not None
 
 
 def _optional_int(value: Any) -> int | None:
