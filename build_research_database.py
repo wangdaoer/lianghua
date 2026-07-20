@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from panel_io import read_panel
 from research_database import ResearchDatabase, normalize_a_share_symbols
 from tdx_day_source import infer_tdx_archive_specs, iter_tdx_day_archive_member_frames
 from ths_daily_data import normalize_daily_market_file
@@ -59,7 +60,11 @@ def normalize_asof_date(value: str) -> str:
 
 
 def discover_latest_panel(root: Path = Path(".")) -> Path | None:
-    candidates = list(root.glob("data_panel_history_main_chinext_*.csv"))
+    candidates = [
+        path
+        for suffix in ("csv", "parquet", "pq")
+        for path in root.glob(f"data_panel_history_main_chinext_*.{suffix}")
+    ]
     dated = [(max(tokens), path) for path in candidates if (tokens := extract_date_tokens(path))]
     return max(dated, default=(None, None), key=lambda item: item[0])[1]
 
@@ -150,7 +155,7 @@ def main() -> None:
         if not args.skip_panel:
             print("prices panel: no dated panel found; skipped", flush=True)
     if panel.exists() and not args.skip_panel:
-        frame = pd.read_csv(panel, low_memory=False)
+        frame = read_panel(panel, low_memory=False)
         price_cols = {"symbol", "date", "open", "high", "low", "close", "volume", "amount"}
         if price_cols.issubset(frame.columns):
             print(f"prices panel: {db.import_prices(frame, str(panel))}")

@@ -69,6 +69,15 @@ def test_unresolved_observation_files_exposes_undated_and_invalid_names(tmp_path
     assert unresolved_observation_files(tmp_path) == [invalid, undated]
 
 
+def test_discover_latest_panel_accepts_parquet(tmp_path):
+    older = tmp_path / "data_panel_history_main_chinext_20220101_20260712.csv"
+    latest = tmp_path / "data_panel_history_main_chinext_20220101_20260713.parquet"
+    older.touch()
+    latest.touch()
+
+    assert discover_latest_panel(tmp_path) == latest
+
+
 def test_select_supported_observation_files_rejects_unrelated_dated_csv(tmp_path):
     supported = tmp_path / "merged_priority_watchlist_20260713.csv"
     flow_shadow = tmp_path / "main_net_volume_shadow_20260713.csv"
