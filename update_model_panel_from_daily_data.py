@@ -7,10 +7,10 @@ import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from panel_io import read_panel, write_panel_atomic
+from ths_daily_data import normalize_daily_market_file, parse_number, parse_percent_ratio
 from workspace_paths import daily_data_root
 
 
@@ -72,35 +72,6 @@ def allowed_code(code: str, prefixes: tuple[str, ...]) -> bool:
     return bool(code) and any(code.startswith(prefix) for prefix in prefixes)
 
 
-def parse_number(value: object) -> float:
-    if pd.isna(value):
-        return np.nan
-    text = str(value).strip()
-    if not text or text in {"--", "-", "nan", "None"}:
-        return np.nan
-    multiplier = 1.0
-    if text.endswith("%"):
-        text = text[:-1]
-    if text.endswith("亿"):
-        multiplier = 100_000_000.0
-        text = text[:-1]
-    elif text.endswith("万"):
-        multiplier = 10_000.0
-        text = text[:-1]
-    text = text.replace(",", "").replace("↑", "").replace("↓", "")
-    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
-    if not match:
-        return np.nan
-    return float(match.group(0)) * multiplier
-
-
-def parse_percent_ratio(value: object) -> float:
-    """Convert a THS percentage-point field such as ``0.77`` to ``0.0077``."""
-
-    parsed = parse_number(value)
-    return parsed / 100.0 if np.isfinite(parsed) else np.nan
-
-
 def _numeric(series: pd.Series) -> pd.Series:
     return series.map(parse_number).astype(float)
 
@@ -136,51 +107,7 @@ def _finalize(frame: pd.DataFrame, prefixes: tuple[str, ...]) -> pd.DataFrame:
 
 
 def read_daily_csv(path: Path, trade_date: str, prefixes: tuple[str, ...]) -> tuple[pd.DataFrame, DailySummary]:
-    raw = pd.read_csv(path)
-    money_flow_column = next(
-        (
-            column
-            for column in ("main_net_inflow", "net_money_flow", "net_mf_amount", "money_flow")
-            if column in raw
-        ),
-        None,
-    )
-    money_flow = (
-        pd.to_numeric(raw[money_flow_column], errors="coerce")
-        if money_flow_column is not None
-        else pd.Series(np.nan, index=raw.index, dtype=float)
-    )
-    ratio_column = next(
-        (
-            column
-            for column in ("main_net_volume_ratio", "main_net_volume_ratio_pct", "主力净量")
-            if column in raw
-        ),
-        None,
-    )
-    if ratio_column == "main_net_volume_ratio":
-        money_flow_ratio = pd.to_numeric(raw[ratio_column], errors="coerce")
-    elif ratio_column is not None:
-        money_flow_ratio = raw[ratio_column].map(parse_percent_ratio).astype(float)
-    else:
-        money_flow_ratio = pd.Series(np.nan, index=raw.index, dtype=float)
-    frame = pd.DataFrame(
-        {
-            "date": pd.to_datetime(raw.get("trade_date", trade_date), errors="coerce"),
-            "symbol": raw.get("security_code", raw.get("raw_security_code")),
-            "open": pd.to_numeric(raw.get("open", raw.get("open_price")), errors="coerce"),
-            "high": pd.to_numeric(raw.get("high", raw.get("high_price")), errors="coerce"),
-            "low": pd.to_numeric(raw.get("low", raw.get("low_price")), errors="coerce"),
-            "close": pd.to_numeric(raw.get("close", raw.get("close_price")), errors="coerce"),
-            "volume": pd.to_numeric(raw.get("volume"), errors="coerce"),
-            "amount": pd.to_numeric(raw.get("amount", raw.get("turnover")), errors="coerce"),
-            "turnover_rate": pd.to_numeric(raw.get("turnover_rate"), errors="coerce"),
-            "market_cap": pd.to_numeric(raw.get("market_cap"), errors="coerce"),
-            "main_net_inflow": money_flow,
-            "main_net_volume_ratio": money_flow_ratio,
-        }
-    )
-    frame["date"] = frame["date"].fillna(pd.Timestamp(trade_date))
+    frame, sources = normalize_daily_market_file(path, trade_date)
     tradable = frame["close"].gt(0)
     raw_amount = frame["amount"]
     raw_positive_ratio = float(raw_amount[tradable].gt(0).mean()) if tradable.any() else 0.0
@@ -204,37 +131,14 @@ def read_daily_csv(path: Path, trade_date: str, prefixes: tuple[str, ...]) -> tu
         symbols=int(out["symbol"].nunique()),
         amount_source=amount_source,
         raw_positive_ratio=raw_positive_ratio,
-        money_flow_source=(money_flow_column or "unavailable"),
-        money_flow_ratio_source=(ratio_column or "unavailable"),
+        money_flow_source=sources.money_flow,
+        money_flow_ratio_source=sources.money_flow_ratio,
     )
     return out, summary
 
 
 def read_daily_xls(path: Path, trade_date: str, prefixes: tuple[str, ...]) -> tuple[pd.DataFrame, DailySummary]:
-    raw = pd.read_csv(path, sep="\t", encoding="gb18030")
-    raw.columns = [str(c).strip() for c in raw.columns]
-    code_col = "代码"
-    close_col = "现价"
-    frame = pd.DataFrame(
-        {
-            "date": pd.Timestamp(trade_date),
-            "symbol": raw.get(code_col),
-            "open": _numeric(raw.get("开盘", raw.get(close_col))),
-            "high": _numeric(raw.get("最高", raw.get(close_col))),
-            "low": _numeric(raw.get("最低", raw.get(close_col))),
-            "close": _numeric(raw.get(close_col)),
-            "volume": _numeric(raw.get("总手", pd.Series(np.nan, index=raw.index))),
-            "amount": _numeric(raw.get("总金额", pd.Series(np.nan, index=raw.index))),
-            "turnover_rate": _numeric(raw.get("换手", pd.Series(np.nan, index=raw.index))),
-            "market_cap": _numeric(raw.get("总市值", pd.Series(np.nan, index=raw.index))),
-            "main_net_inflow": _numeric(
-                raw.get("大单净额", pd.Series(np.nan, index=raw.index))
-            ),
-            "main_net_volume_ratio": raw.get(
-                "主力净量", pd.Series(np.nan, index=raw.index)
-            ).map(parse_percent_ratio).astype(float),
-        }
-    )
+    frame, sources = normalize_daily_market_file(path, trade_date)
     tradable = frame["close"].gt(0)
     raw_positive_ratio = float(frame["amount"][tradable].gt(0).mean()) if tradable.any() else 0.0
     amount_source = "raw_amount"
@@ -252,10 +156,12 @@ def read_daily_xls(path: Path, trade_date: str, prefixes: tuple[str, ...]) -> tu
         amount_source=amount_source,
         raw_positive_ratio=raw_positive_ratio,
         money_flow_source=(
-            "大单净额" if frame["main_net_inflow"].notna().any() else "unavailable"
+            sources.money_flow if frame["main_net_inflow"].notna().any() else "unavailable"
         ),
         money_flow_ratio_source=(
-            "主力净量" if frame["main_net_volume_ratio"].notna().any() else "unavailable"
+            sources.money_flow_ratio
+            if frame["main_net_volume_ratio"].notna().any()
+            else "unavailable"
         ),
     )
     return out, summary

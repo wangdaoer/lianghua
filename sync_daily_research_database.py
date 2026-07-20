@@ -115,6 +115,7 @@ def _daily_freshness_evidence(
     frame: pd.DataFrame,
     parsed_dates: pd.Series,
 ) -> dict[str, object]:
+    source_provenance = frame.attrs.get("daily_market_sources", {})
     symbols = normalize_a_share_symbols(frame["symbol"])
     valid_symbol = symbols.notna()
     normalized_dates = parsed_dates.dt.strftime("%Y-%m-%d")
@@ -169,8 +170,10 @@ def _daily_freshness_evidence(
             if factor_masks["amount"].any()
             else "unavailable"
         ),
-        "main_net_inflow": main_net_inflow_source,
-        "main_net_volume_ratio": main_net_volume_ratio_source,
+        "main_net_inflow": source_provenance.get("money_flow", main_net_inflow_source),
+        "main_net_volume_ratio": source_provenance.get(
+            "money_flow_ratio", main_net_volume_ratio_source
+        ),
         "market_cap": market_cap_source,
         "turnover_rate": turnover_source,
     }

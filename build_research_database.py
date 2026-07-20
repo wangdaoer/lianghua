@@ -6,8 +6,10 @@ from pathlib import Path
 
 import pandas as pd
 
+from panel_io import read_panel
 from research_database import ResearchDatabase, normalize_a_share_symbols
 from tdx_day_source import infer_tdx_archive_specs, iter_tdx_day_archive_member_frames
+from ths_daily_data import normalize_daily_market_file
 from workspace_paths import daily_data_root, tdx_data_root
 
 
@@ -58,7 +60,11 @@ def normalize_asof_date(value: str) -> str:
 
 
 def discover_latest_panel(root: Path = Path(".")) -> Path | None:
-    candidates = list(root.glob("data_panel_history_main_chinext_*.csv"))
+    candidates = [
+        path
+        for suffix in ("csv", "parquet", "pq")
+        for path in root.glob(f"data_panel_history_main_chinext_*.{suffix}")
+    ]
     dated = [(max(tokens), path) for path in candidates if (tokens := extract_date_tokens(path))]
     return max(dated, default=(None, None), key=lambda item: item[0])[1]
 
@@ -98,28 +104,10 @@ def read_table(path: Path) -> pd.DataFrame:
 
 
 def prepare_daily_price_frame(path: Path) -> pd.DataFrame | None:
-    frame = read_table(path)
-    renamed = {str(column).lower(): column for column in frame.columns}
-    mapping = {
-        renamed[key]: key
-        for key in ("symbol", "date", "open", "high", "low", "close", "volume", "amount")
-        if key in renamed
-    }
-    mapping.update({
-        "代码": "symbol", "    名称": "stock_name", "现价": "close",
-        "开盘": "open", "最高": "high", "最低": "low",
-        "总成交量": "volume", "成交量": "volume", "成交额": "amount",
-    })
-    frame = frame.rename(columns=mapping)
-    if "date" not in frame.columns:
-        inferred_date = infer_file_date(path)
-        if inferred_date:
-            frame["date"] = inferred_date
-    if not {"symbol", "date", "close"}.issubset(frame.columns):
+    inferred_date = infer_file_date(path)
+    frame, sources = normalize_daily_market_file(path, inferred_date or "1970-01-01")
+    if inferred_date is None and sources.date == "filename":
         return None
-    for column in ("open", "high", "low", "volume", "amount"):
-        if column not in frame.columns:
-            frame[column] = None
     return frame
 
 
@@ -167,7 +155,7 @@ def main() -> None:
         if not args.skip_panel:
             print("prices panel: no dated panel found; skipped", flush=True)
     if panel.exists() and not args.skip_panel:
-        frame = pd.read_csv(panel, low_memory=False)
+        frame = read_panel(panel, low_memory=False)
         price_cols = {"symbol", "date", "open", "high", "low", "close", "volume", "amount"}
         if price_cols.issubset(frame.columns):
             print(f"prices panel: {db.import_prices(frame, str(panel))}")
