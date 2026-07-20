@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from panel_io import read_panel
+
 from multifactor_observation_evolution import (
     EvolutionConfig,
     ParameterEvaluation,
@@ -576,15 +578,17 @@ def run_evolution(
 
 def _source_files(path: Path) -> list[Path]:
     if path.is_file():
-        if path.suffix.lower() != ".csv":
-            raise ValueError(f"market-data file must be CSV: {path}")
+        if path.suffix.lower() not in {".csv", ".parquet", ".pq"}:
+            raise ValueError(f"market-data file must be CSV or Parquet: {path}")
         return [path]
     if not path.is_dir():
         raise FileNotFoundError(path)
-    files = sorted(path.glob("ths_hs_a_share_*.csv"))
+    files = sorted(path.glob("ths_hs_a_share_*.csv")) + sorted(
+        path.glob("ths_hs_a_share_*.parquet")
+    )
     if not files:
         raise FileNotFoundError(
-            f"no ths_hs_a_share_YYYY-MM-DD.csv files found in {path}"
+            f"no ths_hs_a_share_YYYY-MM-DD CSV or Parquet files found in {path}"
         )
     return files
 
@@ -594,7 +598,7 @@ def load_market_data(paths: Sequence[Path]) -> pd.DataFrame:
     for source in paths:
         for file_path in _source_files(Path(source)):
             frames.append(
-                pd.read_csv(file_path, dtype={"symbol": str}, low_memory=False)
+                read_panel(file_path, dtype={"symbol": str}, low_memory=False)
             )
     return combine_panel_frames(frames)
 

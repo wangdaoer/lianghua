@@ -234,6 +234,67 @@ def _validate_agreement(left: BenchmarkRow, right: BenchmarkRow, labels: str) ->
             raise ValueError(f"{labels} source disagreement for {left.date}: amount")
 
 
+SOURCE_ORDER = ("Sohu", "Yahoo", "Sina")
+SOURCE_PAIRS = (("Sohu", "Yahoo"), ("Yahoo", "Sina"), ("Sohu", "Sina"))
+SOURCE_FAILURES = (KeyError, OSError, RuntimeError, TimeoutError, TypeError, URLError, ValueError)
+
+
+def _select_source_quorum(
+    rows: Mapping[str, BenchmarkRow],
+    trading_date: date,
+) -> tuple[list[str], list[str]]:
+    """Return a mutually agreeing 2-of-3 source quorum and mismatch details."""
+
+    matching_pairs: list[tuple[str, str]] = []
+    mismatches: list[str] = []
+    for left_label, right_label in SOURCE_PAIRS:
+        if left_label not in rows or right_label not in rows:
+            continue
+        try:
+            _validate_agreement(
+                rows[left_label],
+                rows[right_label],
+                f"{left_label}/{right_label}",
+            )
+        except ValueError as exc:
+            mismatches.append(str(exc))
+        else:
+            matching_pairs.append((left_label, right_label))
+
+    if len(rows) == 3 and len(matching_pairs) == 3:
+        return list(SOURCE_ORDER), mismatches
+    if matching_pairs:
+        return list(matching_pairs[0]), mismatches
+
+    available = [label for label in SOURCE_ORDER if label in rows]
+    details = f"; details: {'; '.join(mismatches)}" if mismatches else ""
+    raise ValueError(
+        f"Benchmark requires two agreeing sources for {trading_date}; "
+        f"available={available}{details}"
+    )
+
+
+def _compose_quorum_row(
+    rows: Mapping[str, BenchmarkRow],
+    quorum_sources: list[str],
+) -> BenchmarkRow:
+    if "Sina" in quorum_sources:
+        return rows["Sina"]
+    if {"Sohu", "Yahoo"}.issubset(quorum_sources):
+        sohu_row = rows["Sohu"]
+        yahoo_row = rows["Yahoo"]
+        return BenchmarkRow(
+            date=yahoo_row.date,
+            open=yahoo_row.open,
+            high=yahoo_row.high,
+            low=yahoo_row.low,
+            close=yahoo_row.close,
+            volume=yahoo_row.volume,
+            amount=sohu_row.amount,
+        )
+    raise ValueError(f"Unsupported benchmark quorum: {quorum_sources}")
+
+
 def _load_benchmark(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Benchmark file not found: {path}")
@@ -373,22 +434,77 @@ def refresh_benchmark(
         )
 
     query_start = min(latest, asof_date)
-    sina = fetch_sina(symbol)
+    source_warnings: list[str] = []
+    unavailable_sources: list[str] = []
+
+    try:
+        sina: BenchmarkRow | None = fetch_sina(symbol)
+    except SOURCE_FAILURES as exc:
+        sina = None
+        unavailable_sources.append("Sina")
+        source_warnings.append(f"Sina unavailable: {type(exc).__name__}: {exc}")
     if (
-        sina.date == asof_date
+        sina is not None
+        and sina.date == asof_date
         and (sina.observed_time is None or sina.observed_time < time(15, 0))
     ):
         rendered_time = sina.observed_time.isoformat() if sina.observed_time else "missing"
-        raise ValueError(
-            f"Sina quote for {symbol} is before market close: {rendered_time}"
+        sina = None
+        unavailable_sources.append("Sina")
+        source_warnings.append(
+            f"Sina quote before market close and excluded from quorum: {rendered_time}"
         )
-    sohu = fetch_sohu(symbol, query_start, asof_date)
-    yahoo = fetch_yahoo(symbol, query_start, asof_date)
+
+    try:
+        sohu = fetch_sohu(symbol, query_start, asof_date)
+    except SOURCE_FAILURES as exc:
+        sohu = {}
+        unavailable_sources.append("Sohu")
+        source_warnings.append(f"Sohu unavailable: {type(exc).__name__}: {exc}")
+    try:
+        yahoo = fetch_yahoo(symbol, query_start, asof_date)
+    except SOURCE_FAILURES as exc:
+        yahoo = {}
+        unavailable_sources.append("Yahoo")
+        source_warnings.append(f"Yahoo unavailable: {type(exc).__name__}: {exc}")
+
     relevant_sohu = {key: value for key, value in sohu.items() if latest < key <= asof_date}
     relevant_yahoo = {key: value for key, value in yahoo.items() if latest < key <= asof_date}
 
     rows_to_add: list[BenchmarkRow] = []
     updated: pd.DataFrame | None = None
+    target_rows: dict[str, BenchmarkRow] = {}
+    if asof_date in sohu:
+        target_rows["Sohu"] = sohu[asof_date]
+    elif "Sohu" not in unavailable_sources:
+        unavailable_sources.append("Sohu")
+        source_warnings.append("Sohu missing requested asof-date")
+    if asof_date in yahoo:
+        target_rows["Yahoo"] = yahoo[asof_date]
+    elif "Yahoo" not in unavailable_sources:
+        unavailable_sources.append("Yahoo")
+        source_warnings.append("Yahoo missing requested asof-date")
+    if sina is not None and sina.date == asof_date:
+        target_rows["Sina"] = sina
+    elif sina is not None and sina.date < asof_date:
+        unavailable_sources.append("Sina")
+        source_warnings.append(
+            f"Sina quote stale for requested asof-date: {sina.date.isoformat()}"
+        )
+
+    result_sources, mismatch_warnings = _select_source_quorum(target_rows, asof_date)
+    source_warnings.extend(mismatch_warnings)
+    excluded_available = [
+        label for label in SOURCE_ORDER if label in target_rows and label not in result_sources
+    ]
+    for label in excluded_available:
+        if label not in unavailable_sources:
+            unavailable_sources.append(label)
+        source_warnings.append(
+            f"{label} excluded because the other two sources formed the agreeing quorum"
+        )
+    target_row = _compose_quorum_row(target_rows, result_sources)
+
     if latest == asof_date:
         existing = BenchmarkRow(
             date=latest,
@@ -399,43 +515,39 @@ def refresh_benchmark(
             volume=int(frame.iloc[-1]["volume"]),
             amount=int(frame.iloc[-1]["amount"]),
         )
-        if asof_date not in sohu or asof_date not in yahoo:
-            raise ValueError("History sources do not contain the requested asof-date")
-        _validate_agreement(existing, sohu[asof_date], "local/Sohu")
-        _validate_agreement(existing, yahoo[asof_date], "local/Yahoo")
-        if sina.date == asof_date:
-            _validate_agreement(existing, sina, "local/Sina")
-        status = "already_fresh"
+        _validate_agreement(existing, target_row, "local/quorum")
+        status = "already_fresh_degraded" if unavailable_sources else "already_fresh"
     else:
-        if set(relevant_sohu) != set(relevant_yahoo):
-            raise ValueError("Sohu/Yahoo source disagreement: trading dates do not match")
-        if asof_date not in relevant_sohu:
-            raise ValueError("History sources do not contain the requested asof-date")
-        for trading_date in sorted(relevant_sohu):
-            sohu_row = relevant_sohu[trading_date]
-            yahoo_row = relevant_yahoo[trading_date]
-            _validate_agreement(sohu_row, yahoo_row, "Sohu/Yahoo")
-            row = BenchmarkRow(
-                date=trading_date,
-                open=yahoo_row.open,
-                high=yahoo_row.high,
-                low=yahoo_row.low,
-                close=yahoo_row.close,
-                volume=yahoo_row.volume,
-                amount=sohu_row.amount,
+        prior_dates = sorted(
+            (set(relevant_sohu) | set(relevant_yahoo)) - {asof_date}
+        )
+        for trading_date in prior_dates:
+            if trading_date not in relevant_sohu or trading_date not in relevant_yahoo:
+                raise ValueError(
+                    "Historical catch-up before asof-date requires both Sohu and Yahoo; "
+                    f"missing verification for {trading_date}"
+                )
+            _validate_agreement(
+                relevant_sohu[trading_date],
+                relevant_yahoo[trading_date],
+                "Sohu/Yahoo",
             )
-            if trading_date == asof_date and sina.date == asof_date:
-                _validate_agreement(row, sina, "history/Sina")
-                row = sina
-            rows_to_add.append(row)
-        if sina.date < asof_date:
-            raise ValueError(
-                f"Sina quote is stale: {sina.date} is before requested asof-date {asof_date}"
+            rows_to_add.append(
+                _compose_quorum_row(
+                    {
+                        "Sohu": relevant_sohu[trading_date],
+                        "Yahoo": relevant_yahoo[trading_date],
+                    },
+                    ["Sohu", "Yahoo"],
+                )
             )
+        rows_to_add.append(target_row)
         additions = pd.DataFrame([row.as_record() for row in rows_to_add])
         updated = pd.concat([frame, additions], ignore_index=True)
         updated["date"] = pd.to_datetime(updated["date"])
-        status = "updated"
+        status = "updated_degraded" if unavailable_sources else "updated"
+
+    stale_sources = [label for label in SOURCE_ORDER if label in unavailable_sources]
 
     result: dict[str, object] = {
         "status": status,
@@ -445,7 +557,11 @@ def refresh_benchmark(
         "latest_date": asof_date.isoformat(),
         "rows_added": len(rows_to_add),
         "source_agreement": True,
-        "sources": ["Sohu", "Yahoo"] + (["Sina"] if sina.date == asof_date else []),
+        "source_mode": "degraded_two_source" if stale_sources else "full_history_agreement",
+        "sources": result_sources,
+        "stale_sources": stale_sources,
+        "quorum_required": 2,
+        "warnings": source_warnings,
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
         "benchmark_path": str(benchmark_path.resolve()),
     }

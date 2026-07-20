@@ -289,6 +289,8 @@ class MergedDailyOutputsTest(unittest.TestCase):
         self.assertEqual(table.loc[0, "priority_bucket"], "model_focus")
         self.assertEqual(table.loc[1, "priority_bucket"], "risk_watch")
         self.assertEqual(table.loc[1, "risk_flags"], "st_or_special_treatment")
+        self.assertFalse(bool(table.loc[1, "personal_selected"]))
+        self.assertEqual(float(table.loc[1, "personal_target_weight"]), 0.0)
 
     def test_priority_watchlist_keeps_risk_watch_visible_in_default_view(self):
         state_pattern_scan = pd.DataFrame(

@@ -9,12 +9,21 @@ import json
 import re
 import subprocess
 import sys
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import perf_counter
+from uuid import uuid4
 
 from daily_run_card import write_daily_run_card
-from workspace_paths import daily_data_root, fallback_data_root, resolve_workspace_path
+from pipeline_cache import CACHEABLE_STEPS, PipelineStepCache, build_global_fingerprint
+from workspace_paths import (
+    daily_data_root,
+    dashboard_root,
+    fallback_data_root,
+    resolve_workspace_path,
+)
 
 
 DEFAULT_DAILY_DATA_DIR = daily_data_root()
@@ -23,6 +32,7 @@ DEFAULT_DAILY_NORMALIZED_DIR = DEFAULT_DAILY_DATA_DIR / "ths_exports" / "normali
 DEFAULT_FETCH_STATUS_UTILS = DEFAULT_FALLBACK_DATA_DIR / "scripts" / "market_data_utils.py"
 DEFAULT_BENCHMARK = DEFAULT_DAILY_DATA_DIR / "benchmarks" / "510300.csv"
 DEFAULT_ALLOWED_TREND_STATES = "趋势确认,生命线健康,回调可观察"
+DEFAULT_MARKETLENS_DASHBOARD_OUTPUT = dashboard_root() / "data" / "quant-model3-latest.json"
 
 
 @dataclass(frozen=True)
@@ -32,10 +42,18 @@ class PipelineStep:
 
 
 class PipelineStepExecutionError(RuntimeError):
-    def __init__(self, step: PipelineStep, returncode: int):
+    def __init__(
+        self,
+        step: PipelineStep,
+        returncode: int,
+        execution: dict[str, object] | None = None,
+        completed_executions: list[dict[str, object]] | None = None,
+    ):
         super().__init__(f"Pipeline step {step.name} failed with exit code {returncode}")
         self.step = step
         self.returncode = returncode
+        self.execution = execution
+        self.completed_executions = list(completed_executions or [])
 
 
 @dataclass(frozen=True)
@@ -53,6 +71,9 @@ class PipelineConfig:
     benchmark: Path = DEFAULT_BENCHMARK
     research_db: Path = Path("data/research.sqlite3")
     rules: Path = Path("configs/personal_trade_habit_overlay.yaml")
+    institutional_accumulation_config: Path = Path(
+        "configs/institutional_accumulation_shadow.yaml"
+    )
     symbol_history: Path | None = None
     shadow_account_review: Path | None = None
     train_model: bool = True
@@ -72,13 +93,21 @@ class PipelineConfig:
     include_factor_decay_monitor: bool = True
     include_strategy_stability_report: bool = True
     include_strategy_family_forward_report: bool = True
+    include_strategy_arena: bool = True
     include_benchmark_refresh: bool = True
     include_regime_shadow_compare: bool = True
     include_regime_shadow_tracking: bool = True
     include_research_db_sync: bool = True
+    include_marketlens_export: bool = False
     include_trend_ignition_shadow: bool = False
+    marketlens_dashboard_output: Path = DEFAULT_MARKETLENS_DASHBOARD_OUTPUT
     regime_shadow_config: Path = Path("configs/evolution_strong_pullback.yaml")
     regime_shadow_candidate_id: str = "regime_090_balanced"
+    arena_breadth_ma_window: int = 60
+    arena_breadth_threshold: float = 0.45
+    arena_breadth_below_exposure: float = 0.55
+    arena_breadth_crash_threshold: float = 0.32
+    arena_breadth_crash_exposure: float = 0.20
     trend_ignition_scorer: Path = Path(
         "outputs/trend_ignition_training/scorer_v3_shortlist_exploratory/binned_scorer.json"
     )
@@ -86,6 +115,52 @@ class PipelineConfig:
         "outputs/trend_ignition_training/scorer_v3_shortlist_exploratory/scorer_summary.json"
     )
     trend_ignition_selection_status: str = "exploratory_posthoc"
+    max_parallel_steps: int = 1
+    enable_step_cache: bool = False
+
+
+PIPELINE_STEP_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "benchmark_refresh": (),
+    "update_panel": (),
+    "trend_state": ("update_panel",),
+    "regime_shadow_compare": ("update_panel", "benchmark_refresh"),
+    "regime_shadow_tracking": ("regime_shadow_compare",),
+    "train_rank_model": ("update_panel", "benchmark_refresh"),
+    "train_breadth_guard_challenger": ("update_panel", "benchmark_refresh"),
+    "rank_candidates": ("trend_state", "train_rank_model"),
+    "personal_overlay": ("rank_candidates",),
+    "early_pattern_watchlist": ("update_panel",),
+    "main_net_volume_shadow": ("early_pattern_watchlist",),
+    "institutional_accumulation_shadow": ("update_panel",),
+    "institutional_accumulation_tracking": ("institutional_accumulation_shadow",),
+    "czsc_structure_shadow": ("personal_overlay", "early_pattern_watchlist"),
+    "hidden_accumulation_tracking": ("early_pattern_watchlist",),
+    "factor_decay_monitor": ("update_panel",),
+    "daily_chinese_report": (
+        "personal_overlay",
+        "early_pattern_watchlist",
+        "train_rank_model",
+    ),
+    "merged_daily_outputs": ("daily_chinese_report", "trend_state"),
+    "trend_ignition_shadow": ("merged_daily_outputs",),
+    "strategy_family_forward_report": (
+        "merged_daily_outputs",
+        "main_net_volume_shadow",
+        "institutional_accumulation_tracking",
+        "czsc_structure_shadow",
+        "hidden_accumulation_tracking",
+        "trend_ignition_shadow",
+    ),
+    "strategy_arena": (
+        "strategy_family_forward_report",
+        "regime_shadow_tracking",
+        "train_rank_model",
+        "train_breadth_guard_challenger",
+        "czsc_structure_shadow",
+        "main_net_volume_shadow",
+    ),
+    "strategy_stability_report": ("train_rank_model",),
+}
 
 
 def _date_token(asof_date: str) -> str:
@@ -97,7 +172,10 @@ def _resolve(root: Path, path: Path) -> Path:
 
 
 def panel_end_date(path: Path) -> str | None:
-    match = re.fullmatch(r"data_panel_history_main_chinext_\d{8}_(\d{8})\.csv", path.name)
+    match = re.fullmatch(
+        r"data_panel_history_main_chinext_\d{8}_(\d{8})\.(?:csv|parquet)",
+        path.name,
+    )
     if not match:
         return None
     return datetime.strptime(match.group(1), "%Y%m%d").strftime("%Y-%m-%d")
@@ -105,20 +183,21 @@ def panel_end_date(path: Path) -> str | None:
 
 def discover_base_panel(project_root: Path, asof_date: str) -> Path:
     target_token = _date_token(asof_date)
-    candidates: list[tuple[str, Path]] = []
-    for path in project_root.glob("data_panel_history_main_chinext_*.csv"):
-        end_date = panel_end_date(path)
-        if end_date is None:
-            continue
-        token = _date_token(end_date)
-        if token < target_token:
-            candidates.append((token, path))
+    candidates: list[tuple[str, int, Path]] = []
+    for suffix in ("csv", "parquet"):
+        for path in project_root.glob(f"data_panel_history_main_chinext_*.{suffix}"):
+            end_date = panel_end_date(path)
+            if end_date is None:
+                continue
+            token = _date_token(end_date)
+            if token < target_token:
+                candidates.append((token, int(path.suffix.lower() == ".parquet"), path))
     if not candidates:
         raise FileNotFoundError(
             f"No base panel ending before {asof_date} was found under {project_root}. "
             "Provide --base-panel explicitly."
         )
-    return max(candidates, key=lambda item: item[0])[1]
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
 
 
 def effective_daily_start(config: PipelineConfig) -> str:
@@ -185,6 +264,16 @@ def factor_decay_monitor_status(
             "path": str(path),
             "asof_date": asof_date or None,
         }
+    replacement = payload.get("replacement_competition")
+    replacement = replacement if isinstance(replacement, dict) else {}
+    factor_metadata = payload.get("factor_metadata")
+    factor_metadata = factor_metadata if isinstance(factor_metadata, dict) else {}
+    incremental_checkpoint = payload.get("incremental_checkpoint")
+    incremental_checkpoint = (
+        incremental_checkpoint if isinstance(incremental_checkpoint, dict) else {}
+    )
+    checkpoint_parent = incremental_checkpoint.get("parent")
+    checkpoint_parent = checkpoint_parent if isinstance(checkpoint_parent, dict) else {}
     return {
         "status": payload.get("overall_status", "unknown"),
         "path": str(path),
@@ -192,6 +281,19 @@ def factor_decay_monitor_status(
         "factor": payload.get("factor"),
         "automatic_model_change": payload.get("automatic_model_change", False),
         "research_only": payload.get("research_only", True),
+        "factor_metadata": factor_metadata,
+        "calculation_mode": payload.get("calculation_mode", "full"),
+        "recompute_start": incremental_checkpoint.get("recompute_start"),
+        "checkpoint_parent_asof_date": checkpoint_parent.get("source_asof_date"),
+        "replacement_status": replacement.get("status"),
+        "replacement_shortlist": replacement.get("shortlist", []),
+        "replacement_preregistered_candidates": replacement.get(
+            "preregistered_candidates", []
+        ),
+        "replacement_validation_start_date": replacement.get(
+            "validation_start_date"
+        ),
+        "replacement_tracking_status": replacement.get("tracking_status"),
     }
 
 
@@ -428,6 +530,7 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
     daily_data_dir = _resolve(root, config.daily_data_dir)
     token = _date_token(config.asof_date)
     model_dir = output_root / f"next_open_rank_model_stock_focus_lev093_marketfilter_bench{token}_20220101_{token}"
+    breadth_model_dir = output_root / f"next_open_rank_model_breadth_guard_bench{token}_20220101_{token}"
     return {
         "base_panel": _resolve(root, config.base_panel),
         "daily_dir": daily_dir,
@@ -436,25 +539,63 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "fetch_status_utils": _resolve(root, config.fetch_status_utils),
         "benchmark": _resolve(root, config.benchmark),
         "output_root": output_root,
-        "panel": root / f"data_panel_history_main_chinext_20220101_{token}.csv",
+        "panel": root / f"data_panel_history_main_chinext_20220101_{token}.parquet",
         "trend_dir": output_root / f"trend_state_{token}",
         "model_dir": model_dir,
+        "breadth_model_dir": breadth_model_dir,
         "weights": model_dir / "rolling_feature_weights.csv",
         "base_candidates": output_root / f"rank_model_candidates_trend_gated_bench{token}_{token}.csv",
         "overlay_candidates": output_root / f"rank_model_candidates_trend_gated_personal_overlay_{token}.csv",
         "early_watchlist": output_root / f"early_pattern_watchlist_{token}.csv",
+        "main_net_volume_shadow": output_root / f"main_net_volume_shadow_{token}.csv",
+        "main_net_volume_shadow_metadata": output_root / f"main_net_volume_shadow_{token}.json",
+        "main_net_volume_shadow_report": output_root / f"main_net_volume_shadow_{token}.md",
+        "main_net_volume_shadow_chart": output_root / f"main_net_volume_shadow_{token}.png",
+        "institutional_accumulation_shadow": output_root
+        / f"institutional_accumulation_shadow_{token}.csv",
+        "institutional_accumulation_metadata": output_root
+        / f"institutional_accumulation_shadow_{token}.json",
+        "institutional_accumulation_report": output_root
+        / f"institutional_accumulation_shadow_{token}.md",
+        "institutional_accumulation_tracking": output_root
+        / f"institutional_accumulation_tracking_{token}.csv",
+        "institutional_accumulation_tracking_summary": output_root
+        / f"institutional_accumulation_tracking_{token}.json",
+        "institutional_accumulation_tracking_report": output_root
+        / f"institutional_accumulation_tracking_{token}.md",
+        "czsc_structure_shadow": output_root / f"czsc_structure_shadow_{token}.csv",
+        "czsc_structure_shadow_metadata": output_root / f"czsc_structure_shadow_{token}.json",
+        "czsc_structure_shadow_report": output_root / f"czsc_structure_shadow_{token}.md",
         "hidden_accumulation_tracking": output_root / f"hidden_accumulation_trade_watch_tracking_{token}.csv",
         "factor_decay_monitor_csv": output_root / f"factor_decay_monitor_{token}.csv",
         "factor_decay_monitor_json": output_root / f"factor_decay_monitor_{token}.json",
         "factor_decay_monitor_report": output_root / f"factor_decay_monitor_{token}.md",
         "factor_decay_observation": output_root / f"liquidity_stability_observation_{token}.csv",
         "factor_decay_history": output_root / "factor_decay_monitor_history.csv",
+        "factor_replacement_daily_ic": output_root / f"factor_replacement_daily_ic_{token}.csv",
+        "factor_replacement_competition": output_root
+        / f"factor_replacement_competition_{token}.csv",
+        "factor_replacement_report": output_root
+        / f"factor_replacement_competition_{token}.md",
+        "factor_replacement_preregistration": root
+        / "configs"
+        / "factor_replacement_preregistration.json",
+        "factor_replacement_tracking": output_root
+        / f"factor_replacement_tracking_{token}.csv",
+        "factor_replacement_tracking_json": output_root
+        / f"factor_replacement_tracking_{token}.json",
         "merged_state_pattern_scan": output_root / f"merged_state_pattern_scan_{token}.csv",
         "merged_model_decision_table": output_root / f"merged_model_decision_table_{token}.csv",
         "merged_priority_watchlist": output_root / f"merged_priority_watchlist_{token}.csv",
         "strategy_family_forward_summary": output_root / f"strategy_family_forward_summary_{token}.csv",
         "strategy_family_health": output_root / f"strategy_family_health_{token}.csv",
         "strategy_family_forward_report": output_root / f"strategy_family_forward_report_{token}.md",
+        "strategy_arena_portfolio": output_root / f"strategy_arena_portfolio_{token}.csv",
+        "strategy_arena_pairwise": output_root / f"strategy_arena_pairwise_{token}.csv",
+        "strategy_arena_signal_division": output_root / f"strategy_arena_signal_division_{token}.csv",
+        "strategy_arena_metadata": output_root / f"strategy_arena_{token}.json",
+        "strategy_arena_report": output_root / f"strategy_arena_{token}.md",
+        "strategy_arena_history": output_root / "strategy_arena_history.csv",
         "daily_run_card_json": output_root / f"daily_run_card_{token}.json",
         "daily_run_card_markdown": output_root / f"daily_run_card_{token}.md",
         "daily_report": output_root / f"daily_personal_overlay_report_{token}.md",
@@ -472,8 +613,12 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "regime_shadow_tracking_summary": output_root / "regime_shadow_tracking_summary.json",
         "regime_shadow_tracking_report": output_root / "regime_shadow_tracking_report.md",
         "benchmark_refresh_status": output_root / f"benchmark_refresh_status_{token}.json",
+        "pipeline_step_cache": output_root / f"pipeline_step_cache_{token}.json",
         "research_db": _resolve(root, config.research_db),
         "research_database_sync_status": output_root / f"research_database_sync_{token}.json",
+        "marketlens_feed": output_root / "marketlens_model3_latest.json",
+        "marketlens_state_input": output_root / f".marketlens_state_{token}.json",
+        "marketlens_dashboard_feed": _resolve(root, config.marketlens_dashboard_output),
         "trend_ignition_scorer": _resolve(root, config.trend_ignition_scorer),
         "trend_ignition_scorer_summary": _resolve(root, config.trend_ignition_scorer_summary),
         "trend_ignition_shadow_dir": output_root / f"trend_ignition_shadow_{token}",
@@ -625,6 +770,53 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                 ),
             )
         )
+        if config.include_strategy_arena and config.include_regime_shadow_compare:
+            steps.append(
+                PipelineStep(
+                    "train_breadth_guard_challenger",
+                    (
+                        config.python_exe,
+                        str(config.project_root / "train_next_open_rank_model.py"),
+                        "--data",
+                        str(paths["panel"]),
+                        "--output-dir",
+                        str(paths["breadth_model_dir"]),
+                        "--train-days",
+                        str(config.train_days),
+                        "--retrain-frequency",
+                        str(config.retrain_frequency),
+                        "--rebalance-frequency",
+                        str(config.rebalance_frequency),
+                        "--top-n",
+                        str(config.top_n),
+                        "--max-position-weight",
+                        str(config.max_position_weight),
+                        "--leverage",
+                        str(config.leverage),
+                        "--benchmark",
+                        str(paths["benchmark"]),
+                        "--market-ma-window",
+                        str(config.market_ma_window),
+                        "--market-below-ma-exposure",
+                        str(config.market_below_ma_exposure),
+                        "--market-risk-off-drawdown-20d",
+                        str(config.market_risk_off_drawdown_20d),
+                        "--market-crash-exposure",
+                        str(config.market_crash_exposure),
+                        "--breadth-filter",
+                        "--breadth-ma-window",
+                        str(config.arena_breadth_ma_window),
+                        "--breadth-threshold",
+                        str(config.arena_breadth_threshold),
+                        "--breadth-below-exposure",
+                        str(config.arena_breadth_below_exposure),
+                        "--breadth-crash-threshold",
+                        str(config.arena_breadth_crash_threshold),
+                        "--breadth-crash-exposure",
+                        str(config.arena_breadth_crash_exposure),
+                    ),
+                )
+            )
     steps.append(
         PipelineStep(
             "rank_candidates",
@@ -664,6 +856,8 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
         str(paths["base_candidates"]),
         "--rules",
         str(paths["rules"]),
+        "--names-source",
+        str(paths["names_source"]),
         "--output",
         str(paths["overlay_candidates"]),
         "--reselect-top-n",
@@ -707,6 +901,100 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
 
     steps.append(
         PipelineStep(
+            "main_net_volume_shadow",
+            (
+                config.python_exe,
+                str(config.project_root / "main_net_volume_shadow.py"),
+                "--data",
+                str(paths["panel"]),
+                "--output",
+                str(paths["main_net_volume_shadow"]),
+                "--asof-date",
+                config.asof_date,
+                "--names-source",
+                str(paths["names_source"]),
+                "--early-watchlist",
+                str(paths["early_watchlist"]),
+                "--minimum-history",
+                "5",
+                "--top-n",
+                "30",
+            ),
+        )
+    )
+
+    steps.append(
+        PipelineStep(
+            "institutional_accumulation_shadow",
+            (
+                config.python_exe,
+                str(config.project_root / "institutional_accumulation_shadow.py"),
+                "--data",
+                str(paths["panel"]),
+                "--output",
+                str(paths["institutional_accumulation_shadow"]),
+                "--asof-date",
+                config.asof_date,
+                "--config",
+                str(_resolve(config.project_root, config.institutional_accumulation_config)),
+                "--names-source",
+                str(paths["names_source"]),
+            ),
+        )
+    )
+
+    steps.append(
+        PipelineStep(
+            "institutional_accumulation_tracking",
+            (
+                config.python_exe,
+                str(config.project_root / "track_institutional_accumulation_shadow.py"),
+                "--data",
+                str(paths["panel"]),
+                "--watchlist-dir",
+                str(paths["output_root"]),
+                "--output",
+                str(paths["institutional_accumulation_tracking"]),
+                "--config",
+                str(_resolve(config.project_root, config.institutional_accumulation_config)),
+                "--horizons",
+                "1,3,5,10",
+                "--max-abs-daily-return",
+                str(config.max_abs_daily_return),
+            ),
+        )
+    )
+
+    steps.append(
+        PipelineStep(
+            "czsc_structure_shadow",
+            (
+                config.python_exe,
+                str(config.project_root / "czsc_structure_shadow.py"),
+                "--data",
+                str(paths["panel"]),
+                "--candidates",
+                str(paths["overlay_candidates"]),
+                "--candidates",
+                str(paths["early_watchlist"]),
+                "--output",
+                str(paths["czsc_structure_shadow"]),
+                "--asof-date",
+                config.asof_date,
+                "--names-source",
+                str(paths["names_source"]),
+                "--min-bars",
+                "100",
+                "--max-abs-daily-return",
+                str(config.max_abs_daily_return),
+                "--top-n",
+                "30",
+            ),
+        )
+    )
+
+    steps.append(
+        PipelineStep(
             "hidden_accumulation_tracking",
             (
                 config.python_exe,
@@ -734,10 +1022,14 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                     str(config.project_root / "monitor_factor_decay.py"),
                     "--data",
                     str(paths["panel"]),
+                    "--base-panel",
+                    str(paths["base_panel"]),
                     "--asof-date",
                     config.asof_date,
                     "--output-dir",
                     str(paths["output_root"]),
+                    "--replacement-preregistration",
+                    str(paths["factor_replacement_preregistration"]),
                 ),
             )
         )
@@ -850,6 +1142,44 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                 ),
             )
         )
+    if config.include_strategy_arena and config.include_regime_shadow_compare:
+        arena_command = [
+            config.python_exe,
+            str(config.project_root / "build_strategy_arena_report.py"),
+            "--asof-date",
+            config.asof_date,
+            "--champion-equity",
+            str(paths["model_dir"] / "equity_curve.csv"),
+            "--champion-metrics",
+            str(paths["model_dir"] / "metrics.json"),
+            "--breadth-equity",
+            str(paths["breadth_model_dir"] / "equity_curve.csv"),
+            "--breadth-metrics",
+            str(paths["breadth_model_dir"] / "metrics.json"),
+            "--baseline-equity",
+            str(paths["regime_shadow_dir"] / "baseline" / "equity_curve.csv"),
+            "--baseline-metrics",
+            str(paths["regime_shadow_dir"] / "baseline" / "metrics.json"),
+            "--dynamic-equity",
+            str(paths["regime_shadow_dir"] / "dynamic" / "equity_curve.csv"),
+            "--dynamic-metrics",
+            str(paths["regime_shadow_dir"] / "dynamic" / "metrics.json"),
+            "--tracking-summary",
+            str(paths["regime_shadow_tracking_summary"]),
+            "--czsc-metadata",
+            str(paths["czsc_structure_shadow_metadata"]),
+            "--flow-metadata",
+            str(paths["main_net_volume_shadow_metadata"]),
+            "--output-dir",
+            str(paths["output_root"]),
+            "--history",
+            str(paths["strategy_arena_history"]),
+            "--min-common-days",
+            "252",
+        ]
+        if config.include_strategy_family_forward_report:
+            arena_command.extend(["--family-health", str(paths["strategy_family_health"])])
+        steps.append(PipelineStep("strategy_arena", tuple(arena_command)))
     if config.include_strategy_stability_report:
         steps.append(
             PipelineStep(
@@ -885,15 +1215,233 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
     return steps
 
 
-def run_steps(steps: list[PipelineStep], project_root: Path, dry_run: bool = False) -> None:
-    for index, step in enumerate(steps, start=1):
-        print(f"[{index}/{len(steps)}] {step.name}")
-        print(" ".join(step.command))
-        if not dry_run:
-            try:
-                subprocess.run(step.command, cwd=project_root, check=True)
-            except subprocess.CalledProcessError as exc:
-                raise PipelineStepExecutionError(step, int(exc.returncode)) from exc
+def build_marketlens_export_step(config: PipelineConfig) -> PipelineStep | None:
+    if not config.include_marketlens_export:
+        return None
+    paths = _paths(config)
+    return PipelineStep(
+        "marketlens_export",
+        (
+            config.python_exe,
+            str(config.project_root / "export_marketlens_model3_feed.py"),
+            "--asof-date",
+            config.asof_date,
+            "--output-root",
+            str(paths["output_root"]),
+            "--state-record",
+            str(paths["marketlens_state_input"]),
+            "--output",
+            str(paths["marketlens_feed"]),
+            "--dashboard-output",
+            str(paths["marketlens_dashboard_feed"]),
+            "--require-complete-inputs",
+        ),
+    )
+
+
+def pipeline_step_dependencies(steps: list[PipelineStep]) -> dict[str, tuple[str, ...]]:
+    names = [step.name for step in steps]
+    if len(names) != len(set(names)):
+        raise ValueError("Pipeline step names must be unique")
+    available = set(names)
+    dependencies: dict[str, tuple[str, ...]] = {}
+    previous_name: str | None = None
+    for step in steps:
+        configured = PIPELINE_STEP_DEPENDENCIES.get(step.name)
+        if configured is None:
+            dependencies[step.name] = (previous_name,) if previous_name else ()
+        else:
+            dependencies[step.name] = tuple(
+                dependency for dependency in configured if dependency in available
+            )
+        previous_name = step.name
+
+    terminal_steps = {"research_database_sync"}
+    for step in steps:
+        if step.name in terminal_steps:
+            dependencies[step.name] = tuple(
+                prior_name for prior_name in names if prior_name != step.name
+            )
+    return dependencies
+
+
+def _run_pipeline_step(
+    step: PipelineStep,
+    project_root: Path,
+    index: int,
+    total: int,
+) -> dict[str, object]:
+    started_at = datetime.now().isoformat(timespec="milliseconds")
+    started = perf_counter()
+    print(f"[{index}/{total}] {step.name}")
+    print(" ".join(step.command))
+    try:
+        subprocess.run(step.command, cwd=project_root, check=True)
+    except subprocess.CalledProcessError as exc:
+        execution = {
+            "name": step.name,
+            "status": "failed",
+            "started_at": started_at,
+            "finished_at": datetime.now().isoformat(timespec="milliseconds"),
+            "duration_seconds": round(perf_counter() - started, 6),
+            "returncode": int(exc.returncode),
+            "cache_hit": False,
+        }
+        raise PipelineStepExecutionError(
+            step,
+            int(exc.returncode),
+            execution=execution,
+        ) from exc
+    return {
+        "name": step.name,
+        "status": "success",
+        "started_at": started_at,
+        "finished_at": datetime.now().isoformat(timespec="milliseconds"),
+        "duration_seconds": round(perf_counter() - started, 6),
+        "returncode": 0,
+        "cache_hit": False,
+    }
+
+
+def run_steps(
+    steps: list[PipelineStep],
+    project_root: Path,
+    dry_run: bool = False,
+    max_parallel_steps: int = 1,
+    step_cache: PipelineStepCache | None = None,
+) -> list[dict[str, object]]:
+    if max_parallel_steps < 1:
+        raise ValueError("max_parallel_steps must be at least 1")
+    if dry_run:
+        for index, step in enumerate(steps, start=1):
+            print(f"[{index}/{len(steps)}] {step.name}")
+            print(" ".join(step.command))
+        return []
+    if not steps:
+        return []
+
+    dependencies = pipeline_step_dependencies(steps)
+    order = {step.name: index for index, step in enumerate(steps)}
+    pending = {step.name: step for step in steps}
+    completed: set[str] = set()
+    executions: list[dict[str, object]] = []
+    execution_by_name: dict[str, dict[str, object]] = {}
+    running: dict[Future[dict[str, object]], PipelineStep] = {}
+    executor = ThreadPoolExecutor(max_workers=min(max_parallel_steps, len(steps)))
+    try:
+        while pending or running:
+            ready = [
+                step
+                for step in steps
+                if step.name in pending
+                and set(dependencies[step.name]).issubset(completed)
+            ]
+            restored_any = False
+            if step_cache is not None:
+                for step in ready:
+                    dependency_cache_hits = (
+                        bool(execution_by_name[dependency].get("cache_hit"))
+                        for dependency in dependencies[step.name]
+                        if dependency in CACHEABLE_STEPS
+                    )
+                    started_at = datetime.now().isoformat(timespec="milliseconds")
+                    started = perf_counter()
+                    if not step_cache.restore(
+                        step.name,
+                        step.command,
+                        dependency_cache_hits,
+                    ):
+                        continue
+                    pending.pop(step.name)
+                    execution = {
+                        "name": step.name,
+                        "status": "cached",
+                        "started_at": started_at,
+                        "finished_at": datetime.now().isoformat(timespec="milliseconds"),
+                        "duration_seconds": round(perf_counter() - started, 6),
+                        "returncode": 0,
+                        "cache_hit": True,
+                    }
+                    print(f"[{order[step.name] + 1}/{len(steps)}] {step.name} [cache hit]")
+                    executions.append(execution)
+                    execution_by_name[step.name] = execution
+                    completed.add(step.name)
+                    restored_any = True
+                if restored_any:
+                    continue
+            while ready and len(running) < max_parallel_steps:
+                step = ready.pop(0)
+                pending.pop(step.name)
+                future = executor.submit(
+                    _run_pipeline_step,
+                    step,
+                    project_root,
+                    order[step.name] + 1,
+                    len(steps),
+                )
+                running[future] = step
+
+            if not running:
+                unresolved = {
+                    name: dependencies[name]
+                    for name in pending
+                }
+                raise RuntimeError(f"Pipeline dependency cycle or missing dependency: {unresolved}")
+
+            finished, _ = wait(tuple(running), return_when=FIRST_COMPLETED)
+            for future in finished:
+                step = running.pop(future)
+                try:
+                    execution = future.result()
+                except PipelineStepExecutionError as exc:
+                    if exc.execution is not None:
+                        executions.append(exc.execution)
+                    exc.completed_executions = sorted(
+                        executions,
+                        key=lambda item: order.get(str(item.get("name")), len(order)),
+                    )
+                    for outstanding in running:
+                        outstanding.cancel()
+                    raise
+                executions.append(execution)
+                execution_by_name[step.name] = execution
+                completed.add(step.name)
+                if step_cache is not None:
+                    step_cache.record_success(step.name, step.command)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    return sorted(
+        executions,
+        key=lambda item: order.get(str(item.get("name")), len(order)),
+    )
+
+
+def execution_summary(
+    step_executions: list[dict[str, object]] | None,
+    max_parallel_steps: int,
+) -> dict[str, object]:
+    executions = list(step_executions or [])
+    durations = [float(item.get("duration_seconds") or 0.0) for item in executions]
+    status_counts: dict[str, int] = {}
+    for item in executions:
+        status = str(item.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    started = [str(item["started_at"]) for item in executions if item.get("started_at")]
+    finished = [str(item["finished_at"]) for item in executions if item.get("finished_at")]
+    wall_duration = 0.0
+    if started and finished:
+        wall_duration = (
+            datetime.fromisoformat(max(finished)) - datetime.fromisoformat(min(started))
+        ).total_seconds()
+    return {
+        "max_parallel_steps": max_parallel_steps,
+        "wall_duration_seconds": round(max(wall_duration, 0.0), 6),
+        "summed_step_duration_seconds": round(sum(durations), 6),
+        "status_counts": status_counts,
+        "cache_hits": sum(bool(item.get("cache_hit")) for item in executions),
+        "steps": executions,
+    }
 
 
 def build_daily_run_state(
@@ -903,11 +1451,29 @@ def build_daily_run_state(
     test_status: str = "not_run_by_pipeline",
     run_status: str = "success",
     failure: dict[str, object] | None = None,
+    step_executions: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     paths = _paths(config)
     tracking_enabled = getattr(config, "include_regime_shadow_tracking", True)
+    failure_step = str((failure or {}).get("step") or "")
+    if not config.include_marketlens_export:
+        marketlens_export_status = "skipped"
+    elif failure_step == "marketlens_export":
+        marketlens_export_status = "failed"
+    elif run_status == "failed":
+        marketlens_export_status = "not_run"
+    else:
+        marketlens_export_status = "pending"
     priority_path = _latest_artifact(paths["merged_priority_watchlist"])
     early_path = _latest_artifact(paths["early_watchlist"])
+    main_net_volume_shadow_path = _latest_artifact(paths["main_net_volume_shadow"])
+    institutional_accumulation_path = _latest_artifact(
+        paths["institutional_accumulation_shadow"]
+    )
+    institutional_accumulation_tracking_path = _latest_artifact(
+        paths["institutional_accumulation_tracking"]
+    )
+    czsc_structure_shadow_path = _latest_artifact(paths["czsc_structure_shadow"])
     hidden_tracking_path = _latest_artifact(paths["hidden_accumulation_tracking"])
     model_path = _latest_artifact(paths["merged_model_decision_table"])
     strategy_family_summary_path = _latest_artifact(paths["strategy_family_forward_summary"])
@@ -919,6 +1485,34 @@ def build_daily_run_state(
     )
     priority_rows = _read_csv_rows(priority_path)
     early_rows = _read_csv_rows(early_path)
+    main_net_volume_shadow_rows = _read_csv_rows(main_net_volume_shadow_path)
+    main_net_volume_shadow_metadata = _read_json_object(
+        paths["main_net_volume_shadow_metadata"]
+    )
+    institutional_accumulation_rows = _read_csv_rows(institutional_accumulation_path)
+    institutional_accumulation_metadata = _read_json_object(
+        paths["institutional_accumulation_metadata"]
+    )
+    institutional_accumulation_tracking_rows = _read_csv_rows(
+        institutional_accumulation_tracking_path
+    )
+    institutional_accumulation_tracking_summary = _read_json_object(
+        paths["institutional_accumulation_tracking_summary"]
+    )
+    czsc_structure_shadow_rows = _read_csv_rows(czsc_structure_shadow_path)
+    czsc_structure_shadow_metadata = _read_json_object(
+        paths["czsc_structure_shadow_metadata"]
+    )
+    arena_enabled = config.include_strategy_arena and config.include_regime_shadow_compare
+    strategy_arena_metadata = (
+        _read_json_object(paths["strategy_arena_metadata"]) if arena_enabled else {}
+    )
+    if strategy_arena_metadata.get("asof_date") != config.asof_date:
+        strategy_arena_metadata = {}
+    strategy_arena_portfolio_path = _latest_artifact(paths["strategy_arena_portfolio"])
+    strategy_arena_portfolio_rows = (
+        _read_csv_rows(strategy_arena_portfolio_path) if strategy_arena_metadata else []
+    )
     hidden_tracking_rows = _read_csv_rows(hidden_tracking_path)
     model_rows = _read_csv_rows(model_path)
     strategy_family_summary_rows = _read_csv_rows(strategy_family_summary_path)
@@ -1025,6 +1619,7 @@ def build_daily_run_state(
     if regime_shadow.get("benchmark_fresh") is not True:
         regime_latest = {}
     return {
+        "schema_version": 2,
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
         "run_status": run_status,
         "failure": failure,
@@ -1037,6 +1632,7 @@ def build_daily_run_state(
         "argv": argv or [],
         "steps": [step.name for step in steps],
         "commands": [" ".join(step.command) for step in steps],
+        "execution": execution_summary(step_executions, config.max_parallel_steps),
         "verification": {
             "tests": test_status,
             "priority_rows": len(priority_rows),
@@ -1045,6 +1641,113 @@ def build_daily_run_state(
             "priority_strategy_family_counts": _value_counts(priority_rows, "strategy_family"),
             "early_pattern_rows": len(early_rows),
             "early_pattern_counts": _value_counts(early_rows, "pattern_type"),
+            "main_net_volume_shadow_status": main_net_volume_shadow_metadata.get("status"),
+            "main_net_volume_shadow_rows": len(main_net_volume_shadow_rows),
+            "main_net_volume_source_latest_date": main_net_volume_shadow_metadata.get(
+                "source_latest_date"
+            ),
+            "main_net_volume_source_sessions": main_net_volume_shadow_metadata.get(
+                "available_source_sessions"
+            ),
+            "main_net_volume_latest_coverage": main_net_volume_shadow_metadata.get(
+                "latest_source_coverage"
+            ),
+            "main_net_volume_eligible_5d_rows": main_net_volume_shadow_metadata.get(
+                "eligible_5d_rows"
+            ),
+            "main_net_volume_early_pattern_overlap": main_net_volume_shadow_metadata.get(
+                "early_pattern_overlap_count"
+            ),
+            "main_net_volume_selection_effect": main_net_volume_shadow_metadata.get(
+                "selection_effect"
+            ),
+            "institutional_accumulation_status": institutional_accumulation_metadata.get(
+                "status"
+            ),
+            "institutional_accumulation_rows": len(institutional_accumulation_rows),
+            "institutional_accumulation_active_signals": institutional_accumulation_metadata.get(
+                "active_signal_rows"
+            ),
+            "institutional_accumulation_flow_sessions": institutional_accumulation_metadata.get(
+                "available_flow_sessions"
+            ),
+            "institutional_accumulation_source_columns_available": institutional_accumulation_metadata.get(
+                "source_columns_available"
+            ),
+            "institutional_accumulation_source_column_latest_dates": institutional_accumulation_metadata.get(
+                "source_column_latest_dates"
+            ),
+            "institutional_accumulation_registration_id": institutional_accumulation_metadata.get(
+                "registration_id"
+            ),
+            "institutional_accumulation_validation_start_date": institutional_accumulation_metadata.get(
+                "validation_start_date"
+            ),
+            "institutional_accumulation_config_sha256": institutional_accumulation_metadata.get(
+                "config_sha256"
+            ),
+            "institutional_accumulation_implementation_sha256": institutional_accumulation_metadata.get(
+                "implementation_sha256"
+            ),
+            "institutional_accumulation_selection_effect": institutional_accumulation_metadata.get(
+                "selection_effect"
+            ),
+            "institutional_accumulation_tracking_rows": len(
+                institutional_accumulation_tracking_rows
+            ),
+            "institutional_accumulation_tracking_status": institutional_accumulation_tracking_summary.get(
+                "status"
+            ),
+            "institutional_accumulation_completed_5d": institutional_accumulation_tracking_summary.get(
+                "primary_completed_samples"
+            ),
+            "institutional_accumulation_gate_allowed": institutional_accumulation_tracking_summary.get(
+                "gate_evaluation_allowed"
+            ),
+            "institutional_accumulation_promotion_allowed": institutional_accumulation_tracking_summary.get(
+                "promotion_allowed"
+            ),
+            "czsc_structure_shadow_status": czsc_structure_shadow_metadata.get("status"),
+            "czsc_structure_shadow_rows": len(czsc_structure_shadow_rows),
+            "czsc_structure_analyzed_rows": czsc_structure_shadow_metadata.get(
+                "analyzed_count"
+            ),
+            "czsc_structure_pattern_confluence": czsc_structure_shadow_metadata.get(
+                "pattern_confluence_count"
+            ),
+            "czsc_structure_second_buy_count": czsc_structure_shadow_metadata.get(
+                "second_buy_count"
+            ),
+            "czsc_structure_third_buy_consistent_count": czsc_structure_shadow_metadata.get(
+                "third_buy_zone_consistent_count"
+            ),
+            "czsc_structure_selection_effect": czsc_structure_shadow_metadata.get(
+                "selection_effect"
+            ),
+            "strategy_arena_status": (
+                strategy_arena_metadata.get("status")
+                if arena_enabled
+                else "skipped"
+            ),
+            "strategy_arena_portfolio_entrants": len(strategy_arena_portfolio_rows),
+            "strategy_arena_production_champion": strategy_arena_metadata.get(
+                "production_champion"
+            ),
+            "strategy_arena_pareto_by_league": strategy_arena_metadata.get(
+                "historical_pareto_by_league"
+            ),
+            "strategy_arena_observation_status": strategy_arena_metadata.get(
+                "independent_observation_status"
+            ),
+            "strategy_arena_observation_count": strategy_arena_metadata.get(
+                "independent_observation_count"
+            ),
+            "strategy_arena_observation_target": strategy_arena_metadata.get(
+                "independent_observation_target"
+            ),
+            "strategy_arena_automatic_promotion": strategy_arena_metadata.get(
+                "automatic_promotion"
+            ),
             "hidden_trade_watch_tracking_rows": len(hidden_tracking_rows),
             "hidden_trade_watch_tracking_status_counts": _value_counts(hidden_tracking_rows, "tracking_status"),
             "model_decision_rows": len(model_rows),
@@ -1075,9 +1778,37 @@ def build_daily_run_state(
             "benchmark_rows_added": benchmark_refresh.get("rows_added"),
             "research_database_sync_status": research_database_sync.get("status"),
             "research_database_latest_date": research_database_sync.get("database_latest_date"),
+            "research_database_source_latest_date": research_database_sync.get(
+                "source_latest_date"
+            ),
+            "research_database_price_usable_latest_date": research_database_sync.get(
+                "price_usable_latest_date"
+            ),
+            "research_database_factor_usable_latest_date": research_database_sync.get(
+                "factor_usable_latest_date"
+            ),
+            "research_database_price_usable_rows": research_database_sync.get(
+                "price_usable_rows"
+            ),
+            "research_database_price_usable_ratio": research_database_sync.get(
+                "price_usable_ratio"
+            ),
+            "research_database_factor_usable_rows": research_database_sync.get(
+                "factor_usable_rows"
+            ),
+            "research_database_factor_usable_ratio": research_database_sync.get(
+                "factor_usable_ratio"
+            ),
+            "research_database_factor_column_coverage": research_database_sync.get(
+                "factor_column_coverage"
+            ),
             "research_database_asof_rows": research_database_sync.get("database_asof_rows"),
             "research_database_daily_rows": research_database_sync.get("database_daily_rows"),
             "research_database_observation_rows": research_database_sync.get("database_observation_rows"),
+            "research_database_removed_source_alias_rows": research_database_sync.get(
+                "observation_removed_source_alias_rows"
+            ),
+            "marketlens_export_status": marketlens_export_status,
             "trend_ignition_shadow_status": trend_ignition_shadow.get("status"),
             "trend_ignition_shadow_source_rows": trend_ignition_coverage.get("source_rows"),
             "trend_ignition_shadow_eligible_rows": trend_ignition_coverage.get("eligible_rows"),
@@ -1097,15 +1828,142 @@ def build_daily_run_state(
                 "passes_research_gate"
             ),
             "factor_decay_monitor": factor_decay,
+            "factor_decay_calculation_mode": factor_decay.get("calculation_mode"),
+            "factor_decay_recompute_start": factor_decay.get("recompute_start"),
+            "factor_decay_checkpoint_parent_asof_date": factor_decay.get(
+                "checkpoint_parent_asof_date"
+            ),
+            "factor_current_availability": (
+                factor_decay.get("factor_metadata", {}).get("factor_current_availability")
+                if isinstance(factor_decay.get("factor_metadata"), dict)
+                else None
+            ),
+            "factor_current_coverage": (
+                factor_decay.get("factor_metadata", {}).get("factor_current_coverage")
+                if isinstance(factor_decay.get("factor_metadata"), dict)
+                else None
+            ),
+            "factor_input_latest_dates": (
+                factor_decay.get("factor_metadata", {}).get("factor_input_latest_dates")
+                if isinstance(factor_decay.get("factor_metadata"), dict)
+                else None
+            ),
+            "factor_replacement_tracking_status": factor_decay.get(
+                "replacement_tracking_status"
+            ),
+            "factor_replacement_shortlist": factor_decay.get(
+                "replacement_shortlist"
+            ),
+            "factor_replacement_preregistered_candidates": factor_decay.get(
+                "replacement_preregistered_candidates"
+            ),
         },
         "top10": _top_rows(priority_rows, ["symbol", "stock_name", "strategy_family", "priority_bucket"]),
         "artifacts": {
+            "pipeline_step_cache": (
+                str(paths["pipeline_step_cache"])
+                if config.enable_step_cache
+                else None
+            ),
             "priority": str(priority_path),
             "priority_cn": str(_latest_artifact(priority_cn_base)),
             "report": str(_latest_artifact(paths["daily_report"])),
             "selected": str(selected_path),
             "changes": str(changes_path),
             "early_watchlist": str(early_path),
+            "main_net_volume_shadow": str(main_net_volume_shadow_path),
+            "main_net_volume_shadow_cn": str(
+                _latest_artifact(
+                    paths["main_net_volume_shadow"].with_name(
+                        f"{paths['main_net_volume_shadow'].stem}_cn.csv"
+                    )
+                )
+            ),
+            "main_net_volume_shadow_metadata": str(
+                _latest_artifact(paths["main_net_volume_shadow_metadata"])
+            ),
+            "main_net_volume_shadow_report": str(
+                _latest_artifact(paths["main_net_volume_shadow_report"])
+            ),
+            "main_net_volume_shadow_chart": str(
+                _latest_artifact(paths["main_net_volume_shadow_chart"])
+            ),
+            "institutional_accumulation_shadow": str(institutional_accumulation_path),
+            "institutional_accumulation_shadow_cn": str(
+                _latest_artifact(
+                    paths["institutional_accumulation_shadow"].with_name(
+                        f"{paths['institutional_accumulation_shadow'].stem}_cn.csv"
+                    )
+                )
+            ),
+            "institutional_accumulation_metadata": str(
+                _latest_artifact(paths["institutional_accumulation_metadata"])
+            ),
+            "institutional_accumulation_report": str(
+                _latest_artifact(paths["institutional_accumulation_report"])
+            ),
+            "institutional_accumulation_tracking": str(
+                institutional_accumulation_tracking_path
+            ),
+            "institutional_accumulation_tracking_summary": str(
+                _latest_artifact(paths["institutional_accumulation_tracking_summary"])
+            ),
+            "institutional_accumulation_tracking_report": str(
+                _latest_artifact(paths["institutional_accumulation_tracking_report"])
+            ),
+            "czsc_structure_shadow": str(czsc_structure_shadow_path),
+            "czsc_structure_shadow_cn": str(
+                _latest_artifact(
+                    paths["czsc_structure_shadow"].with_name(
+                        f"{paths['czsc_structure_shadow'].stem}_cn.csv"
+                    )
+                )
+            ),
+            "czsc_structure_shadow_metadata": str(
+                _latest_artifact(paths["czsc_structure_shadow_metadata"])
+            ),
+            "czsc_structure_shadow_report": str(
+                _latest_artifact(paths["czsc_structure_shadow_report"])
+            ),
+            "strategy_arena_portfolio": (
+                str(strategy_arena_portfolio_path) if strategy_arena_metadata else None
+            ),
+            "strategy_arena_portfolio_cn": (
+                str(
+                    _latest_artifact(
+                        paths["strategy_arena_portfolio"].with_name(
+                            f"{paths['strategy_arena_portfolio'].stem}_cn.csv"
+                        )
+                    )
+                )
+                if strategy_arena_metadata
+                else None
+            ),
+            "strategy_arena_pairwise": (
+                str(_latest_artifact(paths["strategy_arena_pairwise"]))
+                if strategy_arena_metadata
+                else None
+            ),
+            "strategy_arena_signal_division": (
+                str(_latest_artifact(paths["strategy_arena_signal_division"]))
+                if strategy_arena_metadata
+                else None
+            ),
+            "strategy_arena_metadata": (
+                str(_latest_artifact(paths["strategy_arena_metadata"]))
+                if strategy_arena_metadata
+                else None
+            ),
+            "strategy_arena_report": (
+                str(_latest_artifact(paths["strategy_arena_report"]))
+                if strategy_arena_metadata
+                else None
+            ),
+            "strategy_arena_history": (
+                str(paths["strategy_arena_history"])
+                if strategy_arena_metadata and paths["strategy_arena_history"].exists()
+                else None
+            ),
             "hidden_accumulation_tracking": str(hidden_tracking_path),
             "factor_decay_monitor_csv": (
                 str(_latest_artifact(paths["factor_decay_monitor_csv"]))
@@ -1128,11 +1986,45 @@ def build_daily_run_state(
                 if paths["factor_decay_history"].exists()
                 else None
             ),
+            "factor_replacement_daily_ic": (
+                str(_latest_artifact(paths["factor_replacement_daily_ic"]))
+                if paths["factor_replacement_daily_ic"].exists()
+                else None
+            ),
+            "factor_replacement_competition": (
+                str(_latest_artifact(paths["factor_replacement_competition"]))
+                if paths["factor_replacement_competition"].exists()
+                else None
+            ),
+            "factor_replacement_report": (
+                str(_latest_artifact(paths["factor_replacement_report"]))
+                if paths["factor_replacement_report"].exists()
+                else None
+            ),
+            "factor_replacement_preregistration": (
+                str(paths["factor_replacement_preregistration"])
+                if paths["factor_replacement_preregistration"].exists()
+                else None
+            ),
+            "factor_replacement_tracking": (
+                str(_latest_artifact(paths["factor_replacement_tracking"]))
+                if paths["factor_replacement_tracking"].exists()
+                else None
+            ),
+            "factor_replacement_tracking_json": (
+                str(_latest_artifact(paths["factor_replacement_tracking_json"]))
+                if paths["factor_replacement_tracking_json"].exists()
+                else None
+            ),
             "model_decision": str(model_path),
             "strategy_family_forward_report": str(_latest_artifact(paths["strategy_family_forward_report"])),
             "strategy_family_forward_summary": str(strategy_family_summary_path),
             "strategy_family_health": str(strategy_family_health_path),
-            "stability_report": str(_latest_artifact(paths["strategy_stability_report"])),
+            "stability_report": (
+                str(_latest_artifact(paths["strategy_stability_report"]))
+                if config.include_strategy_stability_report
+                else None
+            ),
             "regime_shadow_report": str(_latest_artifact(paths["regime_shadow_report"])),
             "regime_shadow_comparison": str(_latest_artifact(paths["regime_shadow_comparison"])),
             "regime_shadow_tracking_ledger": tracking_ledger_artifact,
@@ -1146,6 +2038,8 @@ def build_daily_run_state(
             ),
             "research_database": str(paths["research_db"]) if config.include_research_db_sync else None,
             "research_database_sync_status": research_database_sync_artifact,
+            "marketlens_feed": None,
+            "marketlens_dashboard_feed": None,
             "trend_ignition_shadow_manifest": trend_ignition_shadow_manifest_artifact,
             "trend_ignition_shadow_scores": (
                 str(_latest_artifact(paths["trend_ignition_shadow_scores"]))
@@ -1198,6 +2092,67 @@ def attach_daily_run_card_safely(
         return None
 
 
+def _write_json_atomic(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _mark_marketlens_export_success(
+    record: dict[str, object],
+    config: PipelineConfig,
+) -> None:
+    paths = _paths(config)
+    verification = record.get("verification")
+    if not isinstance(verification, dict):
+        verification = {}
+        record["verification"] = verification
+    verification["marketlens_export_status"] = "success"
+    artifacts = record.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+        record["artifacts"] = artifacts
+    artifacts["marketlens_feed"] = str(paths["marketlens_feed"])
+    artifacts["marketlens_dashboard_feed"] = str(paths["marketlens_dashboard_feed"])
+
+
+def _run_marketlens_export(
+    config: PipelineConfig,
+    step: PipelineStep,
+    record: dict[str, object],
+) -> list[dict[str, object]]:
+    state_input = _paths(config)["marketlens_state_input"]
+    try:
+        _write_json_atomic(state_input, record)
+        return run_steps([step], config.project_root)
+    except PipelineStepExecutionError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise PipelineStepExecutionError(step, 1) from exc
+    finally:
+        state_input.unlink(missing_ok=True)
+
+
+def build_pipeline_step_cache(config: PipelineConfig) -> PipelineStepCache:
+    paths = _paths(config)
+    fingerprint, inputs = build_global_fingerprint(
+        project_root=config.project_root,
+        base_panel=paths["base_panel"],
+        daily_dir=paths["daily_dir"],
+        daily_start=effective_daily_start(config),
+        asof_date=config.asof_date,
+        benchmark=paths["benchmark"],
+    )
+    return PipelineStepCache(paths["pipeline_step_cache"], fingerprint, inputs)
+
+
 def execute_pipeline(
     config: PipelineConfig,
     steps: list[PipelineStep],
@@ -1208,13 +2163,46 @@ def execute_pipeline(
     skip_state_log: bool = False,
     dry_run: bool = False,
 ) -> None:
+    marketlens_step = build_marketlens_export_step(config)
+    audit_steps = [*steps, marketlens_step] if marketlens_step is not None else list(steps)
+    step_executions: list[dict[str, object]] = []
+    step_cache: PipelineStepCache | None = None
     try:
-        run_steps(steps, config.project_root, dry_run=dry_run)
+        if dry_run or not config.enable_step_cache:
+            step_executions = run_steps(
+                steps,
+                config.project_root,
+                dry_run=dry_run,
+                max_parallel_steps=config.max_parallel_steps,
+            )
+        else:
+            benchmark_steps = [step for step in steps if step.name == "benchmark_refresh"]
+            remaining_steps = [step for step in steps if step.name != "benchmark_refresh"]
+            if benchmark_steps:
+                step_executions.extend(
+                    run_steps(
+                        benchmark_steps,
+                        config.project_root,
+                        max_parallel_steps=1,
+                    )
+                )
+            step_cache = build_pipeline_step_cache(config)
+            step_executions.extend(
+                run_steps(
+                    remaining_steps,
+                    config.project_root,
+                    max_parallel_steps=config.max_parallel_steps,
+                    step_cache=step_cache,
+                )
+            )
     except PipelineStepExecutionError as exc:
+        step_executions.extend(exc.completed_executions)
+        if step_cache is not None:
+            step_cache.save()
         if not dry_run and not skip_state_log:
             record = build_daily_run_state(
                 config,
-                steps,
+                audit_steps,
                 argv=argv,
                 test_status=test_status,
                 run_status="failed",
@@ -1223,17 +2211,53 @@ def execute_pipeline(
                     "returncode": exc.returncode,
                     "message": str(exc),
                 },
+                step_executions=step_executions,
             )
             attach_daily_run_card_safely(config, record)
             append_daily_run_state(state_log, record)
         raise
-    if not dry_run and not skip_state_log:
-        record = build_daily_run_state(
-            config,
-            steps,
-            argv=argv,
-            test_status=test_status,
+    if step_cache is not None:
+        step_cache.save()
+    if dry_run:
+        if marketlens_step is not None:
+            run_steps([marketlens_step], config.project_root, dry_run=True)
+        return
+
+    record = build_daily_run_state(
+        config,
+        audit_steps,
+        argv=argv,
+        test_status=test_status,
+        step_executions=step_executions,
+    )
+    if marketlens_step is not None:
+        try:
+            marketlens_execution = _run_marketlens_export(config, marketlens_step, record)
+        except PipelineStepExecutionError as exc:
+            if not skip_state_log:
+                failed_record = build_daily_run_state(
+                    config,
+                    audit_steps,
+                    argv=argv,
+                    test_status=test_status,
+                    run_status="failed",
+                    failure={
+                        "step": exc.step.name,
+                        "returncode": exc.returncode,
+                        "message": str(exc),
+                    },
+                    step_executions=[*step_executions, *exc.completed_executions],
+                )
+                attach_daily_run_card_safely(config, failed_record)
+                append_daily_run_state(state_log, failed_record)
+            raise
+        step_executions.extend(marketlens_execution)
+        record["execution"] = execution_summary(
+            step_executions,
+            config.max_parallel_steps,
         )
+        _mark_marketlens_export_success(record, config)
+    if not skip_state_log:
         attach_daily_run_card_safely(config, record)
         append_daily_run_state(state_log, record)
 
@@ -1262,12 +2286,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-factor-decay-monitor", action="store_true")
     parser.add_argument("--skip-strategy-family-forward", action="store_true")
+    parser.add_argument("--skip-strategy-arena", action="store_true")
     parser.add_argument("--skip-strategy-stability", action="store_true")
     parser.add_argument("--enable-strategy-stability", action="store_true")
     parser.add_argument("--skip-benchmark-refresh", action="store_true")
     parser.add_argument("--skip-regime-shadow-compare", action="store_true")
     parser.add_argument("--skip-regime-shadow-tracking", action="store_true")
     parser.add_argument("--skip-research-db-sync", action="store_true")
+    parser.add_argument("--skip-marketlens-export", action="store_true")
+    parser.add_argument(
+        "--marketlens-dashboard-output",
+        default=str(DEFAULT_MARKETLENS_DASHBOARD_OUTPUT),
+    )
     parser.add_argument("--enable-trend-ignition-shadow", action="store_true")
     parser.add_argument("--regime-shadow-config", default="configs/evolution_strong_pullback.yaml")
     parser.add_argument("--regime-shadow-candidate-id", default="regime_090_balanced")
@@ -1286,6 +2316,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--state-log", default="daily_run_state.jsonl")
     parser.add_argument("--state-test-status", default="not_run_by_pipeline")
+    parser.add_argument(
+        "--max-parallel-steps",
+        type=int,
+        default=2,
+        help="Maximum number of dependency-safe pipeline subprocesses to run concurrently.",
+    )
+    parser.add_argument(
+        "--disable-step-cache",
+        action="store_true",
+        help="Recompute every pipeline step even when strict content hashes match.",
+    )
     parser.add_argument("--skip-state-log", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -1293,6 +2334,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.max_parallel_steps < 1:
+        raise ValueError("--max-parallel-steps must be at least 1")
     project_root = Path(args.project_root).resolve()
     daily_dir = _resolve(project_root, Path(args.daily_dir))
     asof_date = args.asof_date or discover_latest_daily_date(daily_dir)
@@ -1343,17 +2386,22 @@ def main() -> None:
         train_model=not args.skip_train,
         include_factor_decay_monitor=not args.skip_factor_decay_monitor,
         include_strategy_family_forward_report=not args.skip_strategy_family_forward,
+        include_strategy_arena=not args.skip_strategy_arena,
         include_strategy_stability_report=include_strategy_stability,
         include_benchmark_refresh=not args.skip_benchmark_refresh,
         include_regime_shadow_compare=not args.skip_regime_shadow_compare,
         include_regime_shadow_tracking=not args.skip_regime_shadow_tracking,
         include_research_db_sync=not args.skip_research_db_sync,
+        include_marketlens_export=not args.skip_marketlens_export,
         include_trend_ignition_shadow=args.enable_trend_ignition_shadow,
+        marketlens_dashboard_output=Path(args.marketlens_dashboard_output),
         regime_shadow_config=Path(args.regime_shadow_config),
         regime_shadow_candidate_id=args.regime_shadow_candidate_id,
         trend_ignition_scorer=Path(args.trend_ignition_scorer),
         trend_ignition_scorer_summary=Path(args.trend_ignition_scorer_summary),
         trend_ignition_selection_status=args.trend_ignition_selection_status,
+        max_parallel_steps=args.max_parallel_steps,
+        enable_step_cache=not args.disable_step_cache,
     )
     fetch_status = fetch_status_summary(_resolve(project_root, config.fetch_status_utils))
     print("Daily market data fetch status:")
@@ -1378,8 +2426,12 @@ def main() -> None:
     print(output_root / f"daily_personal_overlay_selected_{token}.csv")
     print(output_root / f"daily_personal_overlay_changes_{token}.csv")
     print(output_root / f"hidden_accumulation_trade_watch_tracking_{token}.csv")
+    print(output_root / f"institutional_accumulation_shadow_{token}.md")
+    print(output_root / f"institutional_accumulation_tracking_{token}.md")
     if config.include_factor_decay_monitor:
         print(output_root / f"factor_decay_monitor_{token}.md")
+        print(output_root / f"factor_replacement_competition_{token}.md")
+        print(output_root / f"factor_replacement_tracking_{token}.json")
     print(output_root / f"merged_state_pattern_scan_{token}.csv")
     print(output_root / f"merged_model_decision_table_{token}.csv")
     print(output_root / f"merged_priority_watchlist_{token}.csv")
@@ -1388,8 +2440,14 @@ def main() -> None:
         print(output_root / f"trend_ignition_shadow_{token}" / "manifest.json")
     if config.include_strategy_family_forward_report:
         print(output_root / f"strategy_family_forward_report_{token}.md")
+    if config.include_strategy_arena and config.include_regime_shadow_compare:
+        print(output_root / f"strategy_arena_{token}.md")
+        print(output_root / f"strategy_arena_portfolio_{token}_cn.csv")
     if config.include_strategy_stability_report:
         print(output_root / f"core_risk_filter_finalist_stability_{token}.md")
+    if config.include_marketlens_export:
+        print(output_root / "marketlens_model3_latest.json")
+        print(_resolve(project_root, config.marketlens_dashboard_output))
     if config.include_regime_shadow_compare:
         print(output_root / f"regime_shadow_compare_{token}" / "report.md")
     if config.include_regime_shadow_tracking:

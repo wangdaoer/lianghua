@@ -32,3 +32,7 @@ avoid_discretionary_sell_before: "10:00"
 reselect_top_n: 40
 default_target_weight:
 selection_mode: conservative_fill
+
+# ST stocks remain visible in risk-watch reports but cannot occupy simulated positions
+# until their point-in-time 5% limit rules are fully modeled.
+special_treatment_action: watch_only

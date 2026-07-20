@@ -100,6 +100,100 @@ class MarketLensModel3ExportTest(unittest.TestCase):
 
             self.assertEqual(json.loads(model_output.read_text(encoding="utf-8")), feed)
             self.assertEqual(json.loads(dashboard_output.read_text(encoding="utf-8")), feed)
+            self.assertEqual(list(output.glob(".*.tmp")), [])
+            self.assertEqual(list(dashboard_output.parent.glob(".*.tmp")), [])
+
+    def test_strict_feed_uses_injected_current_state_instead_of_stale_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            token = "20260708"
+            priority = output / f"merged_priority_watchlist_{token}.csv"
+            early = output / f"early_pattern_watchlist_{token}.csv"
+            model = output / f"merged_model_decision_table_{token}.csv"
+            self._write_csv(
+                priority,
+                [{"symbol": "000001", "stock_name": "Alpha", "priority_bucket": "model_focus"}],
+            )
+            self._write_csv(early, [])
+            self._write_csv(model, [])
+            state_log = root / "daily_run_state.jsonl"
+            state_log.write_text(
+                json.dumps(
+                    {
+                        "asof_date": "2026-07-08",
+                        "run_status": "success",
+                        "run_type": "stale_log",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            current_state = {
+                "asof_date": "2026-07-08",
+                "run_status": "success",
+                "run_type": "full_train",
+                "verification": {
+                    "tests": "100 passed",
+                    "priority_rows": 1,
+                    "early_pattern_rows": 0,
+                    "model_decision_rows": 0,
+                },
+                "artifacts": {
+                    "priority": str(priority),
+                    "early_watchlist": str(early),
+                    "model_decision": str(model),
+                },
+            }
+
+            feed = build_feed(
+                "2026-07-08",
+                output,
+                state_log,
+                state_record=current_state,
+                require_complete_inputs=True,
+            )
+
+            self.assertEqual(feed["runType"], "full_train")
+            self.assertEqual(feed["verification"]["tests"], "100 passed")
+
+    def test_strict_feed_rejects_pending_artifact_in_current_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            token = "20260708"
+            priority = output / f"merged_priority_watchlist_{token}.csv"
+            early = output / f"early_pattern_watchlist_{token}.csv"
+            model = output / f"merged_model_decision_table_{token}.csv"
+            self._write_csv(
+                priority,
+                [{"symbol": "000001", "stock_name": "Alpha", "priority_bucket": "model_focus"}],
+            )
+            self._write_csv(early, [])
+            self._write_csv(model, [])
+            state_record = {
+                "asof_date": "2026-07-08",
+                "run_status": "success",
+                "verification": {
+                    "priority_rows": 1,
+                    "early_pattern_rows": 0,
+                    "model_decision_rows": 0,
+                },
+                "artifacts": {
+                    "priority": str(output / f"merged_priority_watchlist_{token}_pending.csv"),
+                    "early_watchlist": str(early),
+                    "model_decision": str(model),
+                },
+            }
+
+            with self.assertRaisesRegex(ValueError, "artifact mismatch for priority"):
+                build_feed(
+                    "2026-07-08",
+                    output,
+                    root / "missing.jsonl",
+                    state_record=state_record,
+                    require_complete_inputs=True,
+                )
 
     @staticmethod
     def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:

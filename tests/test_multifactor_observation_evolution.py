@@ -26,13 +26,37 @@ from multifactor_observation_evolution import (
 )
 from run_multifactor_observation_evolution import (
     _candidate_parameters,
+    load_market_data,
     run_evolution,
     select_search_groups,
 )
+from panel_io import write_panel_atomic
 from strategy_evolution_core import PromotionDecision, PromotionPolicy
 
 
 CONFIG_PATH = Path("configs/evolution_multifactor_observation.yaml")
+
+
+def test_load_market_data_accepts_parquet_panel(tmp_path: Path) -> None:
+    path = tmp_path / "panel.parquet"
+    panel = pd.DataFrame(
+        {
+            "date": ["2026-07-20"],
+            "symbol": ["000001"],
+            "open": [10.0],
+            "high": [10.5],
+            "low": [9.8],
+            "close": [10.2],
+            "volume": [100.0],
+            "amount": [1020.0],
+        }
+    )
+    write_panel_atomic(panel, path)
+
+    loaded = load_market_data([path])
+
+    assert loaded["symbol"].tolist() == ["000001"]
+    assert loaded["date"].max() == pd.Timestamp("2026-07-20")
 
 
 def parameter_set(**overrides):

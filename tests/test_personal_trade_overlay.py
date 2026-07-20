@@ -134,6 +134,80 @@ class PersonalTradeOverlayTest(unittest.TestCase):
         self.assertAlmostEqual(by_symbol.loc["000001", "personal_adjusted_target_weight"], 0.03)
         self.assertAlmostEqual(by_symbol.loc["000002", "personal_adjusted_target_weight"], 0.0)
 
+    def test_special_treatment_stock_is_watch_only(self):
+        decision = decide_row(
+            pd.Series(
+                {
+                    "stock_name": "*ST示例",
+                    "close_position": 0.20,
+                    "return_20d": 0.10,
+                    "personal_trades": 0,
+                }
+            ),
+            DEFAULT_RULES,
+        )
+
+        self.assertEqual(decision["personal_action"], "watch_only")
+        self.assertEqual(decision["personal_weight_multiplier"], 0.0)
+        self.assertIn(
+            "special_treatment_execution_unsupported",
+            decision["personal_reasons"],
+        )
+
+    def test_st_letters_outside_name_prefix_do_not_trigger_watch_only(self):
+        decision = decide_row(
+            pd.Series(
+                {
+                    "stock_name": "BEST示例",
+                    "close_position": 0.20,
+                    "return_20d": 0.10,
+                    "personal_trades": 0,
+                }
+            ),
+            DEFAULT_RULES,
+        )
+
+        self.assertEqual(decision["personal_action"], "allow")
+        self.assertNotIn(
+            "special_treatment_execution_unsupported",
+            decision["personal_reasons"],
+        )
+
+    def test_reselect_fills_st_seat_with_non_st_candidate(self):
+        candidates = pd.DataFrame(
+            [
+                {
+                    "symbol": "1",
+                    "stock_name": "*ST示例",
+                    "score": 0.90,
+                    "selected": True,
+                    "target_weight": 0.02,
+                    "close_position": 0.20,
+                    "return_20d": 0.10,
+                },
+                {
+                    "symbol": "2",
+                    "stock_name": "普通股票",
+                    "score": 0.80,
+                    "selected": False,
+                    "target_weight": 0.0,
+                    "close_position": 0.20,
+                    "return_20d": 0.10,
+                },
+            ]
+        )
+
+        out = apply_overlay(
+            candidates,
+            pd.DataFrame(columns=["symbol"]),
+            DEFAULT_RULES,
+            reselect_top_n=1,
+            base_target_weight=0.02,
+        ).set_index("symbol")
+
+        self.assertFalse(bool(out.loc["000001", "personal_selected"]))
+        self.assertTrue(bool(out.loc["000002", "personal_selected"]))
+
 
 if __name__ == "__main__":
     unittest.main()

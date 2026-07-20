@@ -71,11 +71,30 @@ def test_unresolved_observation_files_exposes_undated_and_invalid_names(tmp_path
 
 def test_select_supported_observation_files_rejects_unrelated_dated_csv(tmp_path):
     supported = tmp_path / "merged_priority_watchlist_20260713.csv"
+    flow_shadow = tmp_path / "main_net_volume_shadow_20260713.csv"
+    institutional_shadow = tmp_path / "institutional_accumulation_shadow_20260713.csv"
+    institutional_tracking = tmp_path / "institutional_accumulation_tracking_20260713.csv"
+    czsc_shadow = tmp_path / "czsc_structure_shadow_20260713.csv"
+    arena = tmp_path / "strategy_arena_portfolio_20260713.csv"
+    chinese_copy = tmp_path / "czsc_structure_shadow_20260713_cn.csv"
     unrelated = tmp_path / "unrelated_export_20260713.csv"
     supported.touch()
+    flow_shadow.touch()
+    institutional_shadow.touch()
+    institutional_tracking.touch()
+    czsc_shadow.touch()
+    arena.touch()
+    chinese_copy.touch()
     unrelated.touch()
 
-    assert select_supported_observation_files(tmp_path, "20260713") == [supported]
+    assert select_supported_observation_files(tmp_path, "20260713") == [
+        czsc_shadow,
+        institutional_shadow,
+        institutional_tracking,
+        flow_shadow,
+        supported,
+        arena,
+    ]
 
 
 def test_prepare_observation_frame_rejects_future_dates(tmp_path):

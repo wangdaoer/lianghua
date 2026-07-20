@@ -27,7 +27,7 @@ class DailyRunCardTest(unittest.TestCase):
 
             card = build_daily_run_card(record, generated_at="2026-06-29T16:00:00")
 
-            self.assertEqual(card["schema_version"], 1)
+            self.assertEqual(card["schema_version"], 2)
             self.assertEqual(card["asof_date"], "2026-06-29")
             self.assertEqual(card["run_type"], "full_train")
             self.assertIn("config_hash", card)
@@ -63,6 +63,30 @@ class DailyRunCardTest(unittest.TestCase):
             payload = json.loads(paths["json"].read_text(encoding="utf-8"))
             self.assertEqual(payload["verification"]["selected_rows"], 1)
             self.assertIn("# Daily Run Card 2026-06-29", paths["markdown"].read_text(encoding="utf-8"))
+
+    def test_run_card_preserves_step_execution_audit(self):
+        execution = {
+            "max_parallel_steps": 2,
+            "wall_duration_seconds": 8.0,
+            "summed_step_duration_seconds": 12.5,
+            "cache_hits": 0,
+            "status_counts": {"success": 2},
+            "steps": [
+                {
+                    "name": "update_panel",
+                    "status": "success",
+                    "duration_seconds": 8.0,
+                    "cache_hit": False,
+                }
+            ],
+        }
+
+        card = build_daily_run_card(
+            {"asof_date": "2026-06-29", "execution": execution, "artifacts": {}},
+            generated_at="2026-06-29T16:00:00",
+        )
+
+        self.assertEqual(card["execution"], execution)
 
     def test_build_daily_run_card_ignores_unavailable_optional_artifact_paths(self):
         card = build_daily_run_card(
@@ -107,6 +131,45 @@ class DailyRunCardTest(unittest.TestCase):
 
         self.assertEqual(first["record_hash"], second["record_hash"])
         self.assertEqual(first["artifacts"], second["artifacts"])
+
+    def test_detailed_passing_test_status_does_not_emit_warning(self):
+        card = build_daily_run_card(
+            {
+                "asof_date": "2026-07-15",
+                "verification": {"tests": "560 passed; 563 subtests passed"},
+                "artifacts": {},
+            }
+        )
+
+        self.assertEqual(card["warnings"], [])
+
+    def test_detailed_failed_test_status_emits_warning(self):
+        card = build_daily_run_card(
+            {
+                "asof_date": "2026-07-15",
+                "verification": {"tests": "560 passed, 1 failed"},
+                "artifacts": {},
+            }
+        )
+
+        self.assertIn("tests:560 passed, 1 failed", card["warnings"])
+
+    def test_degraded_benchmark_refresh_emits_warning(self):
+        card = build_daily_run_card(
+            {
+                "asof_date": "2026-07-16",
+                "verification": {
+                    "tests": "passed",
+                    "benchmark_refresh_status": "updated_degraded",
+                },
+                "artifacts": {},
+            }
+        )
+
+        self.assertIn(
+            "benchmark_refresh:updated_degraded",
+            card["warnings"],
+        )
 
     @staticmethod
     def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:

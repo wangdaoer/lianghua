@@ -18,6 +18,7 @@ from execution_rules import (
     apply_open_constraints_with_diagnostics,
     drop_terminal_zero_placeholders,
 )
+from panel_io import read_panel
 
 try:
     import yaml
@@ -196,7 +197,7 @@ def prepare_prices(
 
 def load_prices(data_path: Path, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     return prepare_prices(
-        pd.read_csv(data_path),
+        read_panel(data_path),
         start,
         end,
         strict_validation=False,
@@ -856,7 +857,7 @@ class BacktestEngine:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="High-risk strategy backtest scaffold.")
-    parser.add_argument("--data", required=True, help="Path to OHLCV or close-only CSV.")
+    parser.add_argument("--data", required=True, help="Path to OHLCV CSV or Parquet panel.")
     parser.add_argument("--config", required=True, help="Path to YAML config.")
     parser.add_argument(
         "--output-dir",

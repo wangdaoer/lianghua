@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -30,10 +31,84 @@ def test_sync_daily_research_database_is_incremental_and_auditable(tmp_path):
     assert first["daily_changed_rows"] == 2
     assert first["observation_changed_rows"] == 1
     assert first["database_asof_rows"] == 2
+    assert first["source_latest_date"] == "2026-07-13"
+    assert first["price_usable_latest_date"] == "2026-07-13"
+    assert first["factor_usable_latest_date"] == "2026-07-13"
+    assert first["price_usable_rows"] == 2
+    assert first["factor_usable_rows"] == 2
+    assert first["price_usable_ratio"] == 1.0
+    assert first["factor_column_coverage"]["amount"] == 1.0
     assert second["daily_changed_rows"] == 0
     assert second["observation_changed_rows"] == 0
+    assert second["observation_removed_source_alias_rows"] == 0
     db = ResearchDatabase(db_path)
-    assert db.query("SELECT symbol FROM daily_prices ORDER BY symbol")["symbol"].tolist() == ["000001", "300001"]
+    stored = db.query("SELECT symbol, volume, amount FROM daily_prices ORDER BY symbol")
+    assert stored["symbol"].tolist() == ["000001", "300001"]
+    assert stored["volume"].tolist() == [100.0, 200.0]
+    assert stored["amount"].tolist() == [1124.0, 4000.0]
+
+
+def test_sync_canonicalizes_relative_and_absolute_observation_sources(tmp_path, monkeypatch):
+    daily_dir = tmp_path / "daily"
+    output_dir = tmp_path / "outputs"
+    daily_dir.mkdir()
+    output_dir.mkdir()
+    (daily_dir / "ths_hs_a_share_2026-07-13.xls").write_text(
+        "代码\t现价\t开盘\t最高\t最低\n000001\t11.24\t11.00\t11.30\t10.90\n",
+        encoding="gb18030",
+    )
+    pd.DataFrame({"symbol": ["000001"], "score": [0.9]}).to_csv(
+        output_dir / "merged_priority_watchlist_20260713.csv", index=False
+    )
+    db_path = tmp_path / "research.sqlite3"
+    monkeypatch.chdir(tmp_path)
+
+    first = sync_daily_research_database(
+        db_path, Path("daily"), Path("outputs"), "2026-07-13"
+    )
+    second = sync_daily_research_database(
+        db_path, daily_dir.resolve(), output_dir.resolve(), "2026-07-13"
+    )
+
+    db = ResearchDatabase(db_path)
+    assert first["observation_changed_rows"] == 1
+    assert second["observation_changed_rows"] == 0
+    assert second["observation_removed_source_alias_rows"] == 0
+    assert db.query("SELECT COUNT(*) AS rows FROM observations").iloc[0]["rows"] == 1
+    source = db.query("SELECT source FROM observations").iloc[0]["source"]
+    assert source == str((output_dir / "merged_priority_watchlist_20260713.csv").resolve())
+
+
+def test_sync_removes_legacy_relative_source_aliases(tmp_path, monkeypatch):
+    daily_dir = tmp_path / "daily"
+    output_dir = tmp_path / "outputs"
+    daily_dir.mkdir()
+    output_dir.mkdir()
+    (daily_dir / "ths_hs_a_share_2026-07-13.xls").write_text(
+        "代码\t现价\t开盘\t最高\t最低\n000001\t11.24\t11.00\t11.30\t10.90\n",
+        encoding="gb18030",
+    )
+    observation = output_dir / "merged_priority_watchlist_20260713.csv"
+    pd.DataFrame({"symbol": ["000001"], "score": [0.9]}).to_csv(observation, index=False)
+    db_path = tmp_path / "research.sqlite3"
+    monkeypatch.chdir(tmp_path)
+    frame = pd.DataFrame(
+        {"date": ["2026-07-13"], "symbol": ["000001"], "score": [0.9]}
+    )
+    db = ResearchDatabase(db_path)
+    db.import_observations(
+        frame,
+        observation.stem,
+        str(Path("outputs") / observation.name),
+    )
+
+    status = sync_daily_research_database(
+        db_path, daily_dir, output_dir, "2026-07-13"
+    )
+
+    assert status["observation_removed_source_alias_rows"] == 1
+    assert db.query("SELECT COUNT(*) AS rows FROM observations").iloc[0]["rows"] == 1
+    assert db.query("SELECT source FROM observations").iloc[0]["source"] == str(observation.resolve())
 
 
 def test_sync_rejects_mismatched_daily_dates_without_changing_database(tmp_path):
@@ -64,7 +139,9 @@ def test_sync_ignores_unapproved_dated_csv_files(tmp_path):
     daily_dir.mkdir()
     output_dir.mkdir()
     (daily_dir / "ths_hs_a_share_2026-07-13.xls").write_text(
-        "代码\t现价\n000001\t11.24\n", encoding="gb18030"
+        "代码\t现价\t开盘\t最高\t最低\n"
+        "000001\t11.24\t11.00\t11.30\t10.90\n",
+        encoding="gb18030",
     )
     pd.DataFrame({"symbol": ["000001"], "score": [0.9]}).to_csv(
         output_dir / "merged_priority_watchlist_20260713.csv", index=False
@@ -79,6 +156,89 @@ def test_sync_ignores_unapproved_dated_csv_files(tmp_path):
 
     assert status["observation_file_count"] == 1
     assert status["observation_files"][0].endswith("merged_priority_watchlist_20260713.csv")
+    assert status["price_usable_latest_date"] == "2026-07-13"
+    assert status["factor_usable_latest_date"] is None
+
+
+def test_sync_excludes_unusable_ohlc_and_records_source_coverage(tmp_path):
+    daily_dir = tmp_path / "daily"
+    output_dir = tmp_path / "outputs"
+    daily_dir.mkdir()
+    output_dir.mkdir()
+    (daily_dir / "ths_hs_a_share_2026-07-13.xls").write_text(
+        "代码\t现价\t开盘\t最高\t最低\n"
+        "000001\t11.24\t11.00\t11.30\t10.90\n"
+        "000002\t12.00\t--\t12.10\t11.90\n",
+        encoding="gb18030",
+    )
+    pd.DataFrame({"symbol": ["000001"], "score": [0.9]}).to_csv(
+        output_dir / "merged_priority_watchlist_20260713.csv", index=False
+    )
+    db_path = tmp_path / "research.sqlite3"
+
+    status = sync_daily_research_database(db_path, daily_dir, output_dir, "2026-07-13")
+
+    db = ResearchDatabase(db_path)
+    assert status["source_unique_symbols"] == 2
+    assert status["price_usable_rows"] == 1
+    assert status["price_unusable_rows"] == 1
+    assert status["price_unusable_symbols"] == ["000002"]
+    assert status["price_usable_ratio"] == 0.5
+    assert status["daily_import_rows"] == 1
+    assert db.query("SELECT symbol FROM daily_prices")["symbol"].tolist() == ["000001"]
+
+
+def test_sync_removes_prior_asof_rows_that_are_no_longer_price_usable(tmp_path):
+    daily_dir = tmp_path / "daily"
+    output_dir = tmp_path / "outputs"
+    daily_dir.mkdir()
+    output_dir.mkdir()
+    daily_path = daily_dir / "ths_hs_a_share_2026-07-13.xls"
+    daily_path.write_text(
+        "代码\t现价\t开盘\t最高\t最低\n"
+        "000001\t11.24\t11.00\t11.30\t10.90\n"
+        "000002\t12.00\t11.90\t12.10\t11.80\n",
+        encoding="gb18030",
+    )
+    pd.DataFrame({"symbol": ["000001"], "score": [0.9]}).to_csv(
+        output_dir / "merged_priority_watchlist_20260713.csv", index=False
+    )
+    db_path = tmp_path / "research.sqlite3"
+    sync_daily_research_database(db_path, daily_dir, output_dir, "2026-07-13")
+    daily_path.write_text(
+        "代码\t现价\t开盘\t最高\t最低\n"
+        "000001\t11.24\t11.00\t11.30\t10.90\n"
+        "000002\t--\t--\t--\t--\n",
+        encoding="gb18030",
+    )
+
+    status = sync_daily_research_database(db_path, daily_dir, output_dir, "2026-07-13")
+
+    assert status["daily_removed_unusable_rows"] == 1
+    assert status["database_asof_rows"] == 1
+    db = ResearchDatabase(db_path)
+    assert db.query("SELECT symbol FROM daily_prices")["symbol"].tolist() == ["000001"]
+
+
+def test_sync_rejects_duplicate_date_symbol_rows(tmp_path):
+    daily_dir = tmp_path / "daily"
+    output_dir = tmp_path / "outputs"
+    daily_dir.mkdir()
+    output_dir.mkdir()
+    (daily_dir / "ths_hs_a_share_2026-07-13.xls").write_text(
+        "代码\t现价\t开盘\t最高\t最低\n"
+        "000001\t11.24\t11.00\t11.30\t10.90\n"
+        "000001\t11.25\t11.00\t11.30\t10.90\n",
+        encoding="gb18030",
+    )
+    pd.DataFrame({"symbol": ["000001"], "score": [0.9]}).to_csv(
+        output_dir / "merged_priority_watchlist_20260713.csv", index=False
+    )
+
+    with pytest.raises(ValueError, match="duplicate date-symbol"):
+        sync_daily_research_database(
+            tmp_path / "research.sqlite3", daily_dir, output_dir, "2026-07-13"
+        )
 
 
 def test_write_status_atomic_replaces_existing_file(tmp_path):
