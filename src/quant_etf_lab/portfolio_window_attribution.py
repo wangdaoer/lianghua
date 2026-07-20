@@ -10,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 
+from ._compat import read_text
 from .portfolio import (
     CurveConfig,
     PortfolioConfig,
@@ -58,7 +59,7 @@ def _parse_variant(value: str) -> tuple[str, Path]:
 def _read_selected_params(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Selected params file not found: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(read_text(path))
     if not isinstance(payload, dict):
         raise ValueError(f"Selected params must be a JSON object: {path}")
     return payload

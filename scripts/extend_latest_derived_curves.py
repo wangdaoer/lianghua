@@ -52,7 +52,10 @@ DEFAULT_SATELLITE_CONFIG = PROJECT_ROOT / "configs" / "ashare_main_chinext_multi
 DEFAULT_SATELLITE_WF_DIR = PROJECT_ROOT / "outputs" / "walk_forward" / "main_chinext_satellite_quality_v2_full"
 DEFAULT_PORTFOLIO_CONFIG = PROJECT_ROOT / "configs" / "portfolio_core_source_selection_quality_reversal_v1.yaml"
 DEFAULT_PORTFOLIO_WF_DIR = (
-    PROJECT_ROOT / "outputs" / "portfolio_source_selection" / "main_chinext_portfolio_source_selection_validation6_v1"
+    PROJECT_ROOT
+    / "outputs"
+    / "portfolio_source_selection"
+    / "main_chinext_source_selection_highgain_pos8_dd50_cap30_activation_dd50_20260624"
 )
 
 
@@ -209,6 +212,7 @@ def extend_stock_walk_forward(
     test_months: int,
     step_months: int,
     max_train_drawdown: float,
+    selection_validation_months: int = 0,
     skip_missing: bool = True,
 ) -> dict[str, Any]:
     config = load_config(config_path)
@@ -288,7 +292,7 @@ def extend_stock_walk_forward(
         test_months,
         step_months,
         max_train_drawdown,
-        selection_validation_months=0,
+        selection_validation_months=selection_validation_months,
     )
     audit = {
         "status": "extended",

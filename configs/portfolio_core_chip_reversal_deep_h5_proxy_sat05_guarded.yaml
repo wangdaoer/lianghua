@@ -1,0 +1,19 @@
+extends: base/portfolio_core_satellite_guarded_base.yaml
+
+project:
+  name: main_chinext_core_chip_reversal_deep_h5_proxy_sat05_guarded
+
+curves:
+  satellite:
+    path: outputs/research/chip_reversal_event_portfolio_deep_h5_pos10_2018_2025_20260618/equity_curve.csv
+    equity_column: equity
+
+weights:
+  risk_on:
+    core: 0.95
+    satellite: 0.05
+
+notes: >
+  Research-only allocator test using the chip-reversal deep bucket 5-day
+  event-proxy curve as a small satellite. The satellite curve is generated
+  from historical research labels and is not a broker-executable trade log.

@@ -1,0 +1,18 @@
+extends: custom_watchlist_multifactor_opportunity_v2.yaml
+
+project:
+  name: custom_watchlist_multifactor_opportunity_v2_growth
+
+risk:
+  benchmark_off_exposure: 0.35
+  benchmark_crash_exposure: 0.0
+  benchmark_drop_threshold: -0.05
+  drawdown_levels:
+    - drawdown: 0.08
+      exposure: 0.55
+    - drawdown: 0.15
+      exposure: 0.30
+    - drawdown: 0.25
+      exposure: 0.0
+  protection_drawdown: 0.25
+  recovery_drawdown: 0.12

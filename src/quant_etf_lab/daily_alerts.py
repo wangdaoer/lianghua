@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from .artifact_io import publish_json_if_semantically_changed, write_text_if_changed
 
 
 SEVERITY_RANK = {"normal": 0, "info": 1, "warning": 2, "critical": 3}
@@ -53,6 +54,11 @@ ACTION_RULES = {
         "monitor_model_build_audit",
         "Monitor model-build audit",
         "Model-build audit has no open action rows; keep the future-dated status visible during routine review.",
+    ),
+    "model_audit_resolved_attention": (
+        "monitor_model_build_audit",
+        "Monitor model-build audit",
+        "Model-build audit reports attention status but has no open action rows; keep it visible during routine review.",
     ),
     "promotion_evidence_correlated": (
         "monitor_allocator_promotion_evidence",
@@ -484,6 +490,20 @@ def build_daily_alert_payload(
                 alerts,
                 "info",
                 "model_audit_resolved_future_dated",
+                "Model-build audit has no open action rows",
+                (
+                    f"Model audit status is `{model_audit_status}`, but the action list is empty: "
+                    f"{model_audit_action_items} action item(s), {model_audit_resume_candidates} resume/finalize candidate(s), "
+                    f"{model_audit_archive_candidates} archive-review candidate(s). "
+                    f"Audit report: `{model_audit_report}`. Action CSV: `{model_audit_actions}`."
+                ),
+                "Keep the audit visible for provenance; no model-build action is blocking this pipeline run.",
+            )
+        elif not model_audit_has_open_actions:
+            _alert(
+                alerts,
+                "info",
+                "model_audit_resolved_attention",
                 "Model-build audit has no open action rows",
                 (
                     f"Model audit status is `{model_audit_status}`, but the action list is empty: "
@@ -1220,9 +1240,9 @@ def write_daily_alerts(
     output_dir: str | Path,
     latest_report_path: str | Path | None = None,
     stock_target_review_warning_only_after_close: bool = False,
+    publish_artifacts: bool = True,
 ) -> DailyAlertsResult:
     resolved_output = Path(output_dir)
-    resolved_output.mkdir(parents=True, exist_ok=True)
     report_path = resolved_output / "alerts.md"
     json_path = resolved_output / "alerts.json"
     latest_path = Path(latest_report_path) if latest_report_path is not None else resolved_output.parent / "latest_alerts.md"
@@ -1233,11 +1253,12 @@ def write_daily_alerts(
     payload["alerts_report_path"] = str(report_path)
     payload["alerts_json_path"] = str(json_path)
     payload["latest_alerts_path"] = str(latest_path)
-    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    report_text = _render_alert_report(payload)
-    report_path.write_text(report_text, encoding="utf-8")
-    latest_path.parent.mkdir(parents=True, exist_ok=True)
-    latest_path.write_text(report_text, encoding="utf-8")
+    if publish_artifacts:
+        payload, changed = publish_json_if_semantically_changed(json_path, payload)
+        if changed or not report_path.exists() or not latest_path.exists():
+            report_text = _render_alert_report(payload)
+            write_text_if_changed(report_path, report_text)
+            write_text_if_changed(latest_path, report_text)
     return DailyAlertsResult(
         output_dir=resolved_output,
         report_path=report_path,

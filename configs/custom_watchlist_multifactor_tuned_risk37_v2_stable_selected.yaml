@@ -1,0 +1,29 @@
+extends: custom_watchlist_multifactor_tuned_risk37_v2.yaml
+
+project:
+  name: custom_watchlist_multifactor_tuned_risk37_v2_stable_selected
+
+strategy:
+  factor_weights:
+    momentum: 0.10
+    trend: 0.15
+    reversal: 0.40
+    volatility: 0.25
+    liquidity: 0.10
+  factor_rebalance_interval: 20
+  max_positions: 10
+
+risk:
+  enabled: true
+  benchmark_off_exposure: 0.2
+  benchmark_crash_exposure: 0.0
+  benchmark_drop_threshold: -0.04
+  drawdown_levels:
+    - drawdown: 0.06
+      exposure: 0.45
+    - drawdown: 0.12
+      exposure: 0.20
+    - drawdown: 0.20
+      exposure: 0.00
+  protection_drawdown: 0.2
+  recovery_drawdown: 0.08

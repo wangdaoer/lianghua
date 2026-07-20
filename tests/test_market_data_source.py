@@ -87,6 +87,84 @@ class MarketDataSourceTests(unittest.TestCase):
             self.assertEqual(result.trade_date, "2026-06-15")
             self.assertEqual(result.rows[0]["security_code"], "000001")
 
+    def test_load_market_snapshot_prefers_ths_normalized_exports(self) -> None:
+        try:
+            from quant_etf_lab.market_data_source import load_market_snapshot_rows
+        except ImportError as exc:
+            self.fail(f"market_data_source module should exist: {exc}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            daily = root / "daily-market-data"
+            ingest = root / "exchange-ingest"
+            (daily / "ths_exports" / "normalized").mkdir(parents=True)
+            ths_path = daily / "ths_exports" / "normalized" / "ths_hs_a_share_2026-06-29.csv"
+            _write_fake_ingest(ingest)
+            pd.DataFrame(
+                [
+                    {
+                        "market": "sse",
+                        "trade_date": "2026-06-29",
+                        "security_code": "688548",
+                        "security_name": "THS",
+                        "close_price": 46.49,
+                        "change_ratio": 20.01,
+                        "source": "ths_hs_a_share_export",
+                    }
+                ]
+            ).to_csv(ths_path, index=False)
+
+            result = load_market_snapshot_rows(daily_data_dir=daily, ingest_project_dir=ingest)
+
+            self.assertEqual(result.source_kind, "daily_market_data_csv")
+            self.assertEqual(result.trade_date, "2026-06-29")
+            self.assertEqual(result.source_path, ths_path)
+            self.assertEqual(result.rows[0]["security_code"], "688548")
+
+    def test_load_market_snapshot_accepts_simplified_ths_normalized_exports(self) -> None:
+        try:
+            from quant_etf_lab.market_data_source import load_market_snapshot_rows
+        except ImportError as exc:
+            self.fail(f"market_data_source module should exist: {exc}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            daily = root / "daily-market-data"
+            ingest = root / "exchange-ingest"
+            (daily / "ths_exports" / "normalized").mkdir(parents=True)
+            ths_path = daily / "ths_exports" / "normalized" / "ths_hs_a_share_2026-06-30.csv"
+            _write_fake_ingest(ingest)
+            pd.DataFrame(
+                [
+                    {
+                        "date": "2026-06-30",
+                        "code": "300044",
+                        "name": "*ST赛为",
+                        "open": 4.26,
+                        "high": 5.14,
+                        "low": 4.25,
+                        "close": 5.14,
+                        "volume": "",
+                        "turnover_value": "",
+                    }
+                ]
+            ).to_csv(ths_path, index=False)
+
+            result = load_market_snapshot_rows(
+                trade_date="2026-06-30",
+                daily_data_dir=daily,
+                ingest_project_dir=ingest,
+            )
+
+            self.assertEqual(result.source_kind, "daily_market_data_csv")
+            self.assertEqual(result.trade_date, "2026-06-30")
+            self.assertEqual(result.source_path, ths_path)
+            self.assertEqual(result.rows[0]["market"], "szse")
+            self.assertEqual(result.rows[0]["security_code"], "300044")
+            self.assertEqual(result.rows[0]["security_name"], "*ST赛为")
+            self.assertEqual(result.rows[0]["close_price"], 5.14)
+            self.assertIsNone(result.rows[0]["turnover"])
+
     def test_load_market_snapshot_falls_back_to_exchange_ingest_when_daily_latest_missing(self) -> None:
         try:
             from quant_etf_lab.market_data_source import load_market_snapshot_rows

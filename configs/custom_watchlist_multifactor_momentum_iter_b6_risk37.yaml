@@ -1,0 +1,9 @@
+﻿extends: custom_watchlist_multifactor_momentum_iter_b6.yaml
+
+project:
+  name: custom_watchlist_multifactor_momentum_iter_b6_risk37
+
+risk:
+  enabled: true
+  protection_drawdown: 0.37
+  recovery_drawdown: 0.20

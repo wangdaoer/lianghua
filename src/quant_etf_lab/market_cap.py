@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .market_data_source import DEFAULT_DAILY_MARKET_DATA_DIR, DEFAULT_EXCHANGE_INGEST_DIR, load_market_snapshot_rows
+
 
 DEFAULT_STOCK_MARKET_CAP_PATH = Path("data/processed/stock_market_cap_yi.csv")
 MARKET_CAP_SOURCE = "akshare.stock_zh_a_spot_em"
@@ -43,7 +45,6 @@ def _code_series(series: pd.Series) -> pd.Series:
 
 def _numeric_series(series: pd.Series) -> pd.Series:
     text = series.astype(str).str.strip().str.replace(",", "", regex=False)
-    text = text.replace({"": np.nan, "-": np.nan, "--": np.nan, "None": np.nan, "nan": np.nan})
     return pd.to_numeric(text, errors="coerce")
 
 
@@ -262,12 +263,185 @@ def fetch_stock_market_cap_for_symbols(
     return normalize_stock_market_cap_frame(frame, source="akshare.stock_zh_a_daily.outstanding_share")
 
 
+def _snapshot_value(row: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _snapshot_numeric(row: dict[str, Any], keys: tuple[str, ...]) -> float:
+    value = _snapshot_value(row, keys)
+    if value in (None, ""):
+        return float("nan")
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return float(numeric) if pd.notna(numeric) else float("nan")
+
+
+def _snapshot_cap_pair(row: dict[str, Any], yi_keys: tuple[str, ...], yuan_keys: tuple[str, ...]) -> tuple[float, float]:
+    yi_value = _snapshot_numeric(row, yi_keys)
+    if np.isfinite(yi_value):
+        return yi_value, yi_value * 100_000_000.0
+    yuan_value = _snapshot_numeric(row, yuan_keys)
+    if not np.isfinite(yuan_value):
+        return float("nan"), float("nan")
+    return yuan_value / 100_000_000.0, yuan_value
+
+
+def _snapshot_trade_date(row: dict[str, Any]) -> str:
+    value = _snapshot_value(row, ("trade_date", "date", "snapshot_date"))
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return datetime.now().strftime("%Y-%m-%d")
+    return pd.Timestamp(parsed).strftime("%Y-%m-%d")
+
+
+def _prior_cap_row(prior: pd.Series, quote_close: float, updated_at: str, trade_date: str, source: str) -> dict[str, Any]:
+    prior_price = pd.to_numeric(pd.Series([prior.get("latest_price")]), errors="coerce").iloc[0]
+    ratio = quote_close / float(prior_price) if pd.notna(prior_price) and float(prior_price) > 0 and np.isfinite(quote_close) else np.nan
+
+    market_cap_yuan = pd.to_numeric(pd.Series([prior.get("market_cap_yuan")]), errors="coerce").iloc[0]
+    if pd.isna(market_cap_yuan):
+        market_cap_yi = pd.to_numeric(pd.Series([prior.get("market_cap_yi")]), errors="coerce").iloc[0]
+        market_cap_yuan = float(market_cap_yi) * 100_000_000.0 if pd.notna(market_cap_yi) else np.nan
+    market_cap_yuan = float(market_cap_yuan) * ratio if np.isfinite(ratio) and pd.notna(market_cap_yuan) else np.nan
+
+    float_cap_yuan = pd.to_numeric(pd.Series([prior.get("float_market_cap_yuan")]), errors="coerce").iloc[0]
+    if pd.isna(float_cap_yuan):
+        float_cap_yi = pd.to_numeric(pd.Series([prior.get("float_market_cap_yi")]), errors="coerce").iloc[0]
+        float_cap_yuan = float(float_cap_yi) * 100_000_000.0 if pd.notna(float_cap_yi) else np.nan
+    float_cap_yuan = float(float_cap_yuan) * ratio if np.isfinite(ratio) and pd.notna(float_cap_yuan) else np.nan
+
+    prior_source = str(prior.get("source") or "").strip()
+    source_parts = [part for part in [prior_source, source, "close_rollforward"] if part]
+    return {
+        "code": str(prior.get("code") or "").zfill(6)[-6:],
+        "name": str(prior.get("name") or ""),
+        "market_cap_yi": market_cap_yuan / 100_000_000.0 if np.isfinite(market_cap_yuan) else np.nan,
+        "market_cap_yuan": market_cap_yuan,
+        "float_market_cap_yi": float_cap_yuan / 100_000_000.0 if np.isfinite(float_cap_yuan) else np.nan,
+        "float_market_cap_yuan": float_cap_yuan,
+        "latest_price": quote_close,
+        "pct_change": np.nan,
+        "snapshot_date": trade_date,
+        "updated_at": updated_at,
+        "source": "+".join(dict.fromkeys(source_parts)),
+    }
+
+
+def roll_forward_stock_market_cap_frame(
+    cache: pd.DataFrame,
+    snapshot_rows: list[dict[str, Any]] | pd.DataFrame,
+    updated_at: str | None = None,
+) -> pd.DataFrame:
+    """Update a market-cap cache from a local daily market snapshot.
+
+    If the snapshot carries market-cap values, rebuild the cache from the
+    snapshot. Otherwise roll the prior cap forward by close/latest_price ratio.
+    """
+    rows = snapshot_rows.to_dict(orient="records") if isinstance(snapshot_rows, pd.DataFrame) else list(snapshot_rows)
+    if not rows:
+        return normalize_stock_market_cap_frame(cache, source="local_market_cap_cache")
+
+    now = updated_at or datetime.now().isoformat(timespec="seconds")
+    prior = normalize_stock_market_cap_frame(cache, source="local_market_cap_cache") if not cache.empty else pd.DataFrame(columns=MARKET_CAP_COLUMNS)
+    prior_lookup = prior.set_index("code").to_dict(orient="index") if not prior.empty else {}
+
+    parsed_rows: list[dict[str, Any]] = []
+    snapshot_has_cap = False
+    for row in rows:
+        code_value = _snapshot_value(row, ("security_code", "code", "symbol", "raw_security_code", "prefixed_security_code"))
+        if code_value in (None, ""):
+            continue
+        code = _code_series(pd.Series([code_value])).iloc[0]
+        if not code or len(code) != 6:
+            continue
+        trade_date = _snapshot_trade_date(row)
+        source = str(_snapshot_value(row, ("source",)) or "daily_market_snapshot")
+        close_price = _snapshot_numeric(row, ("close_price", "close", "last_price", "latest_price"))
+        pct_change = _snapshot_numeric(row, ("change_ratio", "pct_change"))
+        cap_yi, cap_yuan = _snapshot_cap_pair(
+            row,
+            ("market_cap_yi", "total_market_cap_yi"),
+            ("market_cap", "market_cap_yuan", "total_market_cap_yuan"),
+        )
+        float_cap_yi, float_cap_yuan = _snapshot_cap_pair(
+            row,
+            ("float_market_cap_yi", "circulating_market_cap_yi"),
+            ("float_market_cap", "float_market_cap_yuan", "circulating_market_cap_yuan"),
+        )
+        if np.isfinite(cap_yuan):
+            snapshot_has_cap = True
+            parsed_rows.append(
+                {
+                    "code": code,
+                    "name": str(_snapshot_value(row, ("security_name", "name")) or prior_lookup.get(code, {}).get("name") or ""),
+                    "market_cap_yi": cap_yi,
+                    "market_cap_yuan": cap_yuan,
+                    "float_market_cap_yi": float_cap_yi,
+                    "float_market_cap_yuan": float_cap_yuan,
+                    "latest_price": close_price,
+                    "pct_change": pct_change,
+                    "snapshot_date": trade_date,
+                    "updated_at": now,
+                    "source": source,
+                }
+            )
+            continue
+        prior_row = prior_lookup.get(code)
+        if prior_row is not None and np.isfinite(close_price):
+            rolled = _prior_cap_row(pd.Series(prior_row), close_price, now, trade_date, source)
+            rolled["code"] = code
+            rolled["name"] = str(_snapshot_value(row, ("security_name", "name")) or rolled["name"])
+            rolled["pct_change"] = pct_change
+            parsed_rows.append(rolled)
+
+    if not parsed_rows:
+        return prior
+    frame = pd.DataFrame(parsed_rows)
+    if not snapshot_has_cap and not prior.empty:
+        missing = prior[~prior["code"].isin(frame["code"])].copy()
+        frame = pd.concat([frame, missing], ignore_index=True)
+    return normalize_stock_market_cap_frame(frame, source="daily_market_snapshot")
+
+
 def load_stock_market_cap_cache(path: str | Path) -> pd.DataFrame:
     resolved = Path(path)
     if not resolved.exists():
         raise FileNotFoundError(f"Stock market-cap cache not found: {resolved}")
     frame = pd.read_csv(resolved, dtype={"code": str})
     return normalize_stock_market_cap_frame(frame, source="local_market_cap_cache")
+
+
+def load_stock_market_cap_from_daily_snapshot(
+    output_path: str | Path = DEFAULT_STOCK_MARKET_CAP_PATH,
+    trade_date: str | datetime | None = None,
+    daily_data_dir: str | Path | None = DEFAULT_DAILY_MARKET_DATA_DIR,
+    ingest_project_dir: str | Path | None = DEFAULT_EXCHANGE_INGEST_DIR,
+    symbols: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Build a market-cap cache from the unified local daily market snapshot."""
+    result = load_market_snapshot_rows(
+        trade_date=str(trade_date) if trade_date is not None else None,
+        market="all",
+        daily_data_dir=daily_data_dir,
+        ingest_project_dir=ingest_project_dir,
+        require_success=True,
+    )
+    if not result.rows:
+        return pd.DataFrame(columns=MARKET_CAP_COLUMNS)
+
+    try:
+        cache = load_stock_market_cap_cache(output_path)
+    except (FileNotFoundError, OSError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        cache = pd.DataFrame(columns=MARKET_CAP_COLUMNS)
+
+    frame = roll_forward_stock_market_cap_frame(cache, result.rows)
+    if symbols is not None and not symbols.empty and "code" in symbols.columns:
+        codes = set(_code_series(symbols["code"]).dropna())
+        frame = frame[frame["code"].isin(codes)].reset_index(drop=True)
+    return frame
 
 
 def update_stock_market_cap_cache(
@@ -277,10 +451,29 @@ def update_stock_market_cap_cache(
     symbols: pd.DataFrame | None = None,
     as_of_date: str | datetime | None = None,
     lookback_days: int = 10,
+    daily_data_dir: str | Path | None = DEFAULT_DAILY_MARKET_DATA_DIR,
+    ingest_project_dir: str | Path | None = DEFAULT_EXCHANGE_INGEST_DIR,
+    prefer_local_daily: bool = True,
 ) -> pd.DataFrame:
-    if symbols is None:
+    resolved = Path(output_path)
+    frame: pd.DataFrame | None = None
+    if prefer_local_daily:
+        try:
+            local_frame = load_stock_market_cap_from_daily_snapshot(
+                output_path=resolved,
+                trade_date=as_of_date,
+                daily_data_dir=daily_data_dir,
+                ingest_project_dir=ingest_project_dir,
+                symbols=symbols,
+            )
+            if not local_frame.empty:
+                frame = local_frame
+        except (FileNotFoundError, ImportError, RuntimeError, ValueError, OSError):
+            frame = None
+
+    if frame is None and symbols is None:
         frame = fetch_stock_market_cap_snapshot(retry_count=retry_count, pause_seconds=pause_seconds)
-    else:
+    elif frame is None:
         frame = fetch_stock_market_cap_for_symbols(
             symbols,
             as_of_date=as_of_date,
@@ -288,7 +481,7 @@ def update_stock_market_cap_cache(
             retry_count=retry_count,
             pause_seconds=pause_seconds,
         )
-    resolved = Path(output_path)
+
     resolved.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(resolved, index=False, encoding="utf-8")
     return frame

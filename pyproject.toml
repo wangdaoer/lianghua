@@ -22,3 +22,6 @@ quant-etf-lab = "quant_etf_lab.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

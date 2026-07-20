@@ -1,0 +1,16 @@
+extends: portfolio_core_chip_reversal_true_h5_exp80_sat30_guarded.yaml
+
+project:
+  name: main_chinext_core_chip_reversal_true_h5_exp80_sat30_guarded_rel20
+
+satellite_filter:
+  relative_momentum_window: 20
+  min_relative_momentum: 0.0
+  relative_momentum_scale: 0.0
+
+notes: >
+  Research-only allocator test. Extends the sat30 guarded true-position
+  chip-reversal satellite with a relative-strength guard: when the
+  satellite curve underperforms the core curve over the previous 20
+  trading days, the satellite sleeve is set to 0 on the next trading day
+  and reallocated to the core sleeve. broker_action=none.

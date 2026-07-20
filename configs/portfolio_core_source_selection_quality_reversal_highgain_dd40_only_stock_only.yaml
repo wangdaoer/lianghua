@@ -1,0 +1,24 @@
+extends: portfolio_core_source_selection_quality_reversal_highgain_dd40_only.yaml
+
+project:
+  name: main_chinext_core_source_selection_quality_reversal_highgain_dd40_only_stock_only
+
+curves:
+  core:
+    path: outputs/walk_forward/main_chinext_stable_v2_full_20260613_011322/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+regime:
+  benchmark_path: outputs/walk_forward/main_chinext_stable_v2_full_20260613_011322/oos_equity_stitched.csv
+  benchmark_close_column: stitched_equity
+  ma_window: 60
+  drop_window: 20
+  risk_on_drop_threshold: -0.03
+  crash_drop_threshold: -0.07
+  default_regime: risk_off
+
+notes: >
+  Stock-only source-selection variant for the highgain-dd40 satellite family.
+  It keeps the quality/reversal baseline source pool plus the protected
+  highgain-dd40 source, while replacing the ETF benchmark gate with the
+  stock-only core equity curve.

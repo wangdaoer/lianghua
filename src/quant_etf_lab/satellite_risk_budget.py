@@ -10,6 +10,8 @@ from typing import Any
 
 import pandas as pd
 
+from ._compat import read_text
+
 
 @dataclass(frozen=True)
 class SatelliteRiskBudgetReviewResult:
@@ -23,13 +25,37 @@ class SatelliteRiskBudgetReviewResult:
 ALERT_RANK = {"normal": 0, "info": 1, "warning": 2, "critical": 3}
 NETWORK_SIGNAL_MONITOR = "network_signal_monitor"
 NETWORK_SIGNAL_HOLD = "network_signal_hold"
+MIN_GROUP_OPPORTUNITY_EVALUABLE = 5
+MIN_GROUP_OPPORTUNITY_WIN_RATE = 0.65
+MIN_GROUP_OPPORTUNITY_AVG_RETURN = 0.03
+SATELLITE_TRIAL_RULE_COLUMNS = [
+    "rule_id",
+    "trial_rule_status",
+    "activation_gate",
+    "dimension",
+    "group_value",
+    "horizon",
+    "evaluable_count",
+    "avg_return",
+    "win_rate",
+    "active_total_budget",
+    "active_group_weight_cap",
+    "reference_total_budget",
+    "reference_group_weight_cap",
+    "max_total_budget",
+    "allocation_filter",
+    "risk_gate",
+    "note",
+    "broker_action",
+    "research_only",
+]
 
 
 def _load_json(path: str | Path, label: str) -> dict[str, Any]:
     resolved = Path(path)
     if not resolved.exists():
         raise FileNotFoundError(f"Missing {label}: {resolved}")
-    return json.loads(resolved.read_text(encoding="utf-8"))
+    return json.loads(read_text(resolved))
 
 
 def _as_float(value: Any) -> float | None:
@@ -61,6 +87,10 @@ def _json_ready(value: Any) -> Any:
     if hasattr(value, "item"):
         return value.item()
     return value
+
+
+def _json_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    return [_json_ready(record) for record in frame.to_dict(orient="records")]
 
 
 def _pct(value: Any) -> str:
@@ -232,7 +262,69 @@ def _group_for_horizon(outcome_payload: dict[str, Any], key: str, horizon: str) 
 
 
 def _horizon_metric(row: dict[str, Any], metric: str, horizon: str) -> float | None:
-    return _as_float(row.get(f"{metric}_{horizon}"))
+    value = _as_float(row.get(f"{metric}_{horizon}"))
+    if value is not None:
+        return value
+    return _as_float(row.get(metric))
+
+
+def _horizon_evaluable(row: dict[str, Any], horizon: str) -> int | None:
+    for key in (f"evaluable_{horizon}", f"evaluable_count_{horizon}", "evaluable_count"):
+        value = _as_int(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _strong_group_opportunities(
+    outcome_payload: dict[str, Any],
+    ready_horizons: list[str],
+    *,
+    min_evaluable: int = MIN_GROUP_OPPORTUNITY_EVALUABLE,
+    min_win_rate: float = MIN_GROUP_OPPORTUNITY_WIN_RATE,
+    min_avg_return: float = MIN_GROUP_OPPORTUNITY_AVG_RETURN,
+) -> list[dict[str, Any]]:
+    rows = outcome_payload.get("top_analysis_rows") or []
+    if not isinstance(rows, list):
+        return []
+
+    opportunities: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        dimension = str(row.get("dimension") or "")
+        group_value = str(row.get("group_value") or "")
+        if dimension == "overall" and group_value == "all":
+            continue
+        for horizon in ready_horizons:
+            evaluable = _horizon_evaluable(row, horizon)
+            avg_return = _horizon_metric(row, "avg_return", horizon)
+            win_rate = _horizon_metric(row, "win_rate", horizon)
+            if evaluable is None or avg_return is None or win_rate is None:
+                continue
+            if evaluable < min_evaluable or avg_return < min_avg_return or win_rate < min_win_rate:
+                continue
+            opportunities.append(
+                {
+                    "horizon": horizon,
+                    "dimension": dimension,
+                    "group_value": group_value,
+                    "evaluable_count": int(evaluable),
+                    "avg_return": float(avg_return),
+                    "win_rate": float(win_rate),
+                }
+            )
+
+    return sorted(
+        opportunities,
+        key=lambda item: (
+            -float(item.get("avg_return") or 0.0),
+            -float(item.get("win_rate") or 0.0),
+            _horizon_sort_key(item.get("horizon")),
+            str(item.get("dimension") or ""),
+            str(item.get("group_value") or ""),
+        ),
+    )
 
 
 def _budget_context(
@@ -261,6 +353,16 @@ def _budget_context(
     worst_win_rate = _horizon_metric(worst_group, "win_rate", selected_horizon or "") if selected_horizon else None
     current_satellite = _as_float(snapshot.get("paper_latest_satellite_weight")) or 0.0
     capped_trial = max(0.0, min(float(trial_satellite_budget), float(max_satellite_budget)))
+    group_opportunities = _strong_group_opportunities(outcome_payload, ready)
+    group_opportunity_status = "none"
+    group_opportunity_reason = "No ready group passes the strong-opportunity thresholds."
+    if group_opportunities:
+        if blockers:
+            group_opportunity_status = "blocked_by_pipeline_gates"
+            group_opportunity_reason = "Strong groups exist, but pipeline gates must clear before any satellite trial."
+        else:
+            group_opportunity_status = "candidate"
+            group_opportunity_reason = "One or more ready groups pass the strong-opportunity thresholds for research review."
 
     network_monitors = list(network_signal_monitors or [])
     if blockers:
@@ -325,6 +427,13 @@ def _budget_context(
         "worst_group": worst_group,
         "worst_group_win_rate": worst_win_rate,
         "worst_group_avg_return": worst_avg_return,
+        "strong_group_opportunities": group_opportunities,
+        "strong_group_opportunity_count": len(group_opportunities),
+        "strong_group_opportunity_status": group_opportunity_status,
+        "strong_group_opportunity_reason": group_opportunity_reason,
+        "strong_group_opportunity_min_evaluable": int(MIN_GROUP_OPPORTUNITY_EVALUABLE),
+        "strong_group_opportunity_min_win_rate": float(MIN_GROUP_OPPORTUNITY_WIN_RATE),
+        "strong_group_opportunity_min_avg_return": float(MIN_GROUP_OPPORTUNITY_AVG_RETURN),
         "trial_satellite_budget": float(trial_satellite_budget),
         "max_satellite_budget": float(max_satellite_budget),
         "min_overall_win_rate": float(min_overall_win_rate),
@@ -385,6 +494,17 @@ def _checklist_rows(snapshot: dict[str, Any], blockers: list[str]) -> list[dict[
             "next_action": "Review worst group before increasing budget if the guard is breached.",
         },
         {
+            "section": "outcome",
+            "item": "strong_group_opportunity",
+            "value": (
+                f"count={snapshot.get('strong_group_opportunity_count', 0)}, "
+                f"min_win={_pct(snapshot.get('strong_group_opportunity_min_win_rate'))}, "
+                f"min_avg={_pct(snapshot.get('strong_group_opportunity_min_avg_return'))}"
+            ),
+            "status": snapshot.get("strong_group_opportunity_status") or "none",
+            "next_action": snapshot.get("strong_group_opportunity_reason"),
+        },
+        {
             "section": "risk_budget",
             "item": "recommended_satellite_budget",
             "value": _pct(snapshot.get("recommended_satellite_budget")),
@@ -398,6 +518,128 @@ def _group_label(group: dict[str, Any]) -> str:
     if not group:
         return "N/A"
     return f"{group.get('dimension') or 'N/A'}={group.get('group_value') or 'N/A'}"
+
+
+def _render_group_opportunity_rows(snapshot: dict[str, Any]) -> str:
+    rows = snapshot.get("strong_group_opportunities") or []
+    if not isinstance(rows, list) or not rows:
+        return "| N/A | N/A | N/A | N/A | N/A |"
+    rendered = []
+    for row in rows[:10]:
+        if not isinstance(row, dict):
+            continue
+        rendered.append(
+            "| {horizon} | `{group}` | {count} | {avg_return} | {win_rate} |".format(
+                horizon=row.get("horizon") or "N/A",
+                group=_group_label(row),
+                count=row.get("evaluable_count") if row.get("evaluable_count") is not None else "N/A",
+                avg_return=_pct(row.get("avg_return")),
+                win_rate=_pct(row.get("win_rate")),
+            )
+        )
+    return "\n".join(rendered) if rendered else "| N/A | N/A | N/A | N/A | N/A |"
+
+
+def _dedup_group_opportunities(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = (str(row.get("dimension") or ""), str(row.get("group_value") or ""))
+        if not key[0] or not key[1]:
+            continue
+        if key not in deduped:
+            deduped[key] = row
+    return list(deduped.values())
+
+
+def _satellite_trial_rule_status(snapshot: dict[str, Any]) -> str:
+    if int(snapshot.get("strong_group_opportunity_count") or 0) <= 0:
+        return "no_opportunity"
+    if snapshot.get("risk_budget_decision") == "eligible_for_small_satellite_trial":
+        return "eligible_when_risk_on"
+    if snapshot.get("blocking_items"):
+        return "blocked_by_pipeline_gates"
+    return "research_candidate"
+
+
+def _satellite_trial_rules(snapshot: dict[str, Any]) -> pd.DataFrame:
+    opportunities = snapshot.get("strong_group_opportunities") or []
+    rules = _dedup_group_opportunities(opportunities if isinstance(opportunities, list) else [])
+    if not rules:
+        return pd.DataFrame(columns=SATELLITE_TRIAL_RULE_COLUMNS)
+
+    rule_status = _satellite_trial_rule_status(snapshot)
+    rule_count = len(rules)
+    active_total = (
+        _as_float(snapshot.get("recommended_satellite_budget"))
+        if rule_status == "eligible_when_risk_on"
+        else 0.0
+    )
+    active_total = max(0.0, float(active_total or 0.0))
+    reference_total = max(
+        0.0,
+        min(
+            float(_as_float(snapshot.get("trial_satellite_budget")) or 0.0),
+            float(_as_float(snapshot.get("max_satellite_budget")) or 0.0),
+        ),
+    )
+    active_group_cap = active_total / rule_count if rule_count else 0.0
+    reference_group_cap = reference_total / rule_count if rule_count else 0.0
+
+    rows: list[dict[str, Any]] = []
+    for index, rule in enumerate(rules, start=1):
+        dimension = str(rule.get("dimension") or "")
+        group_value = str(rule.get("group_value") or "")
+        rows.append(
+            {
+                "rule_id": f"sat_trial_{index:02d}",
+                "trial_rule_status": rule_status,
+                "activation_gate": "risk_on_only",
+                "dimension": dimension,
+                "group_value": group_value,
+                "horizon": rule.get("horizon") or "",
+                "evaluable_count": rule.get("evaluable_count"),
+                "avg_return": rule.get("avg_return"),
+                "win_rate": rule.get("win_rate"),
+                "active_total_budget": active_total,
+                "active_group_weight_cap": active_group_cap,
+                "reference_total_budget": reference_total,
+                "reference_group_weight_cap": reference_group_cap,
+                "max_total_budget": _as_float(snapshot.get("max_satellite_budget")) or 0.0,
+                "allocation_filter": f"{dimension}={group_value}",
+                "risk_gate": "pipeline_gates_cleared; risk_on_regime; research_only",
+                "note": (
+                    "Strong outcome group is eligible for research review only; "
+                    "do not create broker orders from this rule."
+                ),
+                "broker_action": "none",
+                "research_only": True,
+            }
+        )
+    return pd.DataFrame(rows, columns=SATELLITE_TRIAL_RULE_COLUMNS)
+
+
+def _render_trial_rule_rows(snapshot: dict[str, Any]) -> str:
+    rows = snapshot.get("satellite_trial_rules") or []
+    if not isinstance(rows, list) or not rows:
+        return "| N/A | N/A | N/A | N/A | N/A | N/A | N/A |"
+    rendered = []
+    for row in rows[:10]:
+        if not isinstance(row, dict):
+            continue
+        rendered.append(
+            "| {rule_id} | `{status}` | `{gate}` | `{group}` | {active} | {reference} | {evidence} |".format(
+                rule_id=row.get("rule_id") or "N/A",
+                status=row.get("trial_rule_status") or "N/A",
+                gate=row.get("activation_gate") or "N/A",
+                group=_group_label(row),
+                active=_pct(row.get("active_group_weight_cap")),
+                reference=_pct(row.get("reference_group_weight_cap")),
+                evidence=f"{_pct(row.get('avg_return'))} / {_pct(row.get('win_rate'))}",
+            )
+        )
+    return "\n".join(rendered) if rendered else "| N/A | N/A | N/A | N/A | N/A | N/A | N/A |"
 
 
 def _render_report(snapshot: dict[str, Any], checklist: pd.DataFrame) -> str:
@@ -441,6 +683,18 @@ This is a research-only satellite budget review. It does not connect to brokers,
 | Worst group win rate / avg return | {_pct(snapshot.get("worst_group_win_rate"))} / {_pct(snapshot.get("worst_group_avg_return"))} |
 | Worst group loss guard | {_pct(snapshot.get("max_worst_group_loss"))} |
 
+## Group Opportunity Evidence
+
+| Horizon | Group | Evaluable | Avg return | Win rate |
+| --- | --- | ---: | ---: | ---: |
+{_render_group_opportunity_rows(snapshot)}
+
+## Satellite Trial Rules
+
+| Rule | Status | Activation gate | Group | Active group cap | Reference group cap | Avg return / win rate |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+{_render_trial_rule_rows(snapshot)}
+
 ## Checklist
 
 | Section | Item | Status | Value | Next action |
@@ -460,6 +714,8 @@ This is a research-only satellite budget review. It does not connect to brokers,
 - Network lab snapshot: `{snapshot.get("network_snapshot_path")}`
 - Checklist CSV: `satellite_risk_budget_checklist.csv`
 - Snapshot JSON: `satellite_risk_budget_snapshot.json`
+- Satellite trial rules CSV: `satellite_trial_rules.csv`
+- Satellite trial rules JSON: `satellite_trial_rules.json`
 """
 
 
@@ -518,8 +774,21 @@ def run_satellite_risk_budget_review(
     checklist_path = out_dir / "satellite_risk_budget_checklist.csv"
     snapshot_path = out_dir / "satellite_risk_budget_snapshot.json"
     report_path = out_dir / "satellite_risk_budget_review.md"
+    trial_rules_path = out_dir / "satellite_trial_rules.csv"
+    trial_rules_json_path = out_dir / "satellite_trial_rules.json"
+
+    trial_rules = _satellite_trial_rules(snapshot)
+    snapshot["satellite_trial_rules_path"] = str(trial_rules_path)
+    snapshot["satellite_trial_rules_json_path"] = str(trial_rules_json_path)
+    snapshot["satellite_trial_rule_count"] = int(len(trial_rules))
+    snapshot["satellite_trial_rules"] = _json_records(trial_rules)
 
     checklist.to_csv(checklist_path, index=False, encoding="utf-8-sig")
+    trial_rules.to_csv(trial_rules_path, index=False, encoding="utf-8-sig")
+    trial_rules_json_path.write_text(
+        json.dumps(_json_records(trial_rules), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     snapshot_path.write_text(json.dumps(_json_ready(snapshot), ensure_ascii=False, indent=2), encoding="utf-8")
     report_path.write_text(_render_report(snapshot, checklist), encoding="utf-8")
 

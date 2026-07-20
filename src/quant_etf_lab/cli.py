@@ -12,6 +12,8 @@ from .allocator_promotion import run_allocator_promotion_review
 from .allocator_switch import run_allocator_switch_readiness
 from .attribution import run_drawdown_attribution
 from .backtest import run_backtest
+from .berkshire_quality_factor import run_berkshire_quality_factor
+from .broker_statement import run_broker_statement_review
 from .chip_reversal_candidate_outcomes import run_chip_reversal_candidate_outcomes
 from .chip_reversal_daily_candidates import run_chip_reversal_daily_candidates
 from .chip_reversal_lab import run_chip_reversal_lab
@@ -20,11 +22,13 @@ from .chip_reversal_pit_audit import run_chip_reversal_pit_audit
 from .config import load_config
 from .data import update_data
 from .dashboard import run_daily_dashboard
+from .daily_fast_decision import run_daily_fast_decision
 from .daily_pipeline import run_daily_pipeline
 from .daily_check import run_daily_model_check
 from .daily_run_status import run_daily_run_status
 from .diagnostics import run_batch_diagnostics, run_diagnostics
 from .factor_lab import run_factor_lab
+from .industry_chain_factor import run_industry_chain_factor
 from .live_shadow import (
     run_live_shadow,
     run_live_shadow_import_template,
@@ -56,19 +60,33 @@ from .portfolio_window_attribution import run_portfolio_window_attribution
 from .process_lock import ProcessLockError, process_lock
 from .report import resolve_run_dir, write_report
 from .satellite_risk_budget import run_satellite_risk_budget_review
+from .satellite_trial_replay import (
+    DEFAULT_HORIZONS as DEFAULT_SATELLITE_TRIAL_REPLAY_HORIZONS,
+)
+from .satellite_trial_replay import (
+    DEFAULT_OUTCOMES_HISTORY_PATH as DEFAULT_SATELLITE_TRIAL_REPLAY_OUTCOMES_HISTORY_PATH,
+)
+from .satellite_trial_replay import DEFAULT_OUTPUT_DIR as DEFAULT_SATELLITE_TRIAL_REPLAY_OUTPUT_DIR
+from .satellite_trial_replay import DEFAULT_RULES_PATH as DEFAULT_SATELLITE_TRIAL_REPLAY_RULES_PATH
+from .satellite_trial_replay import run_satellite_trial_replay
+from .satellite_filter_research import run_satellite_filter_model, run_satellite_filter_research
 from .source_decision import run_source_decision_review
 from .source_guard_decomposition import run_source_guard_decomposition
 from .source_risk_budget import run_source_risk_budget_review
+from .stock_outcome_gate import run_stock_outcome_gate
 from .theme_map_builder import DEFAULT_OUTPUT_DIR as DEFAULT_THEME_MAP_OUTPUT_DIR
 from .theme_map_builder import run_theme_map_build
 from .theme_state import run_theme_state
+from .trigger_monitor_sync import sync_thsdk_trigger_monitor_outputs
 from .validation import run_validation
 from .walk_forward import run_walk_forward
 
 
 DEFAULT_CONFIG = Path("configs/etf_trend.yaml")
 DEFAULT_PORTFOLIO_CONFIG = Path("configs/portfolio_core_satellite_v1.yaml")
-DEFAULT_RESEARCH_ALLOCATOR_DIR = Path("outputs/portfolio_source_selection/main_chinext_portfolio_source_selection_validation6_v1")
+DEFAULT_RESEARCH_ALLOCATOR_DIR = Path(
+    "outputs/portfolio_source_selection/main_chinext_source_selection_highgain_pos8_dd50_cap30_activation_dd50_20260624"
+)
 DEFAULT_PHASE2_COMPONENTS_PATH = Path(
     "outputs/research/phase2_model_status_source_selection_default_20260614/phase2_components.csv"
 )
@@ -107,6 +125,40 @@ WALK_FORWARD_PRESETS = {
         "grid": "opportunity",
         "objective": "robust",
         "max_train_drawdown": 0.25,
+    },
+    "opportunity-v2-q-full": {
+        "train_years": 4,
+        "test_months": 12,
+        "step_months": 6,
+        "grid": "stable_v2",
+        "objective": "opportunity_q_full",
+        "max_train_drawdown": 0.25,
+        "selection_validation_months": 6,
+    },
+    "opportunity-v2-q-full-aggressive": {
+        "train_years": 4,
+        "test_months": 12,
+        "step_months": 6,
+        "grid": "stable_v2",
+        "objective": "opportunity_q_full",
+        "max_train_drawdown": 0.28,
+    },
+    "opportunity-v2-growthfull": {
+        "train_years": 4,
+        "test_months": 12,
+        "step_months": 6,
+        "grid": "stable_v2",
+        "objective": "opportunity_growth",
+        "max_train_drawdown": 0.28,
+    },
+    "highgain-dd40": {
+        "train_years": 4,
+        "test_months": 6,
+        "step_months": 6,
+        "grid": "opportunity_v2",
+        "objective": "capital",
+        "max_train_drawdown": 0.40,
+        "selection_validation_months": 6,
     },
     "main-chinext-stable": {
         "train_years": 4,
@@ -215,6 +267,27 @@ def _parse_source_switch_margin_by_source(raw_items: list[str] | None) -> dict[s
     return _parse_source_float_map(raw_items, "--source-switch-margin-by-source", "MARGIN")
 
 
+def _parse_source_groups(raw_items: list[str] | None) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    seen_sources: dict[str, str] = {}
+    for raw in raw_items or []:
+        if "=" not in raw:
+            raise ValueError("--source-group must use GROUP=SOURCE1,SOURCE2.")
+        group, sources_raw = raw.split("=", 1)
+        group = group.strip()
+        if not group:
+            raise ValueError("--source-group group cannot be empty.")
+        sources = [source.strip() for source in sources_raw.split(",") if source.strip()]
+        if len(sources) < 2:
+            raise ValueError(f"--source-group {group} must include at least two sources.")
+        for source in sources:
+            if source in seen_sources:
+                raise ValueError(f"source {source} appears in multiple groups: {seen_sources[source]} and {group}.")
+            seen_sources[source] = group
+        groups[group] = sources
+    return groups
+
+
 def _alert_gate_failed(level: object, threshold: str) -> bool:
     if threshold == "none":
         return False
@@ -267,6 +340,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     market_cap_parser.add_argument("--as-of-date", default=None, help="As-of date for --symbols-file fallback, YYYY-MM-DD or YYYYMMDD.")
     market_cap_parser.add_argument("--lookback-days", type=int, default=10, help="Calendar-day lookback for the symbol fallback.")
+    market_cap_parser.add_argument(
+        "--daily-data-dir",
+        default=str(DEFAULT_DAILY_MARKET_DATA_DIR),
+        help="Unified daily market data directory used before external quote fallback.",
+    )
+    market_cap_parser.add_argument(
+        "--ingest-project-dir",
+        default=str(DEFAULT_EXCHANGE_INGEST_DIR),
+        help="Exchange-ingest project directory used for fetch-status checks and fallback rows.",
+    )
+    market_cap_parser.add_argument(
+        "--no-local-daily",
+        action="store_true",
+        help="Skip the local daily market snapshot and fetch directly from external quote APIs.",
+    )
 
     backtest_parser = subparsers.add_parser("backtest", help="Run a configured backtest.")
     _add_config_arg(backtest_parser)
@@ -344,6 +432,140 @@ def build_parser() -> argparse.ArgumentParser:
     factor_lab_parser.add_argument("--warmup-days", type=int, default=180, help="Calendar-day warmup before --start-date for rolling factors.")
     factor_lab_parser.add_argument("--no-save-panel", dest="save_panel", action="store_false", default=True, help="Skip writing the large factor_panel.csv file.")
     factor_lab_parser.add_argument("--recursive", action="store_true", help="Read CSV files recursively under --data-dir.")
+
+    berkshire_quality_parser = subparsers.add_parser(
+        "berkshire-quality-factor",
+        help="Build research-only Berkshire-style fundamental quality scores for stock candidates.",
+    )
+    berkshire_quality_parser.add_argument(
+        "--candidates-path",
+        default="outputs/research/paper_account_latest/stock_targets.csv",
+        help="CSV with code/security_code and optional name/priority_score columns.",
+    )
+    berkshire_quality_parser.add_argument(
+        "--fundamentals-path",
+        default=None,
+        help="Optional CSV with ROE, FCF, interest coverage, margins, cash conversion, and dilution fields.",
+    )
+    berkshire_quality_parser.add_argument(
+        "--qualitative-path",
+        default=None,
+        help="Optional CSV with moat, management, safety margin, thesis clarity, red flags, and data confidence.",
+    )
+    berkshire_quality_parser.add_argument(
+        "--output-dir",
+        default="outputs/research/berkshire_quality_factor_latest",
+        help="Directory for Berkshire quality scores, template, snapshot, and report.",
+    )
+    berkshire_quality_parser.add_argument(
+        "--top-n",
+        type=int,
+        default=30,
+        help="Number of candidate rows to include in the research data template.",
+    )
+
+    industry_chain_parser = subparsers.add_parser(
+        "industry-chain-factor",
+        help="Build research-only industry-chain and bottleneck-node scores for stock candidates.",
+    )
+    industry_chain_parser.add_argument(
+        "--candidates-path",
+        default="outputs/research/chip_reversal_daily_candidates_20260622/chip_reversal_daily_candidates.csv",
+        help="CSV with code/security_code and optional name/priority_score columns.",
+    )
+    industry_chain_parser.add_argument(
+        "--chain-map-path",
+        default=None,
+        help="Optional CSV mapping stocks to industry chains, nodes, evidence fields, and risk fields.",
+    )
+    industry_chain_parser.add_argument(
+        "--market-snapshot-path",
+        default=None,
+        help="Optional daily market snapshot CSV with market cap, turnover, and change ratio.",
+    )
+    industry_chain_parser.add_argument(
+        "--output-dir",
+        default="outputs/research/industry_chain_factor_latest",
+        help="Directory for industry-chain scores, template, snapshot, and report.",
+    )
+    industry_chain_parser.add_argument(
+        "--top-n",
+        type=int,
+        default=30,
+        help="Number of candidate rows to include in the research chain-map template.",
+    )
+
+    satellite_filter_research_parser = subparsers.add_parser(
+        "satellite-filter-research",
+        help="Mine stock-target outcome history for research-only satellite filter candidates.",
+    )
+    satellite_filter_research_parser.add_argument(
+        "--outcomes-history",
+        default="outputs/research/stock_target_review_outcomes_history.csv",
+        help="CSV of stock-target realized outcomes.",
+    )
+    satellite_filter_research_parser.add_argument(
+        "--output-dir",
+        default="outputs/research/satellite_filter_research_latest",
+        help="Directory for satellite filter research outputs.",
+    )
+    satellite_filter_research_parser.add_argument("--horizons", default="1d,5d,10d,20d", help="Comma-separated return horizons.")
+    satellite_filter_research_parser.add_argument(
+        "--dimensions",
+        default="review_bucket,action_code,manual_status_normalized",
+        help="Comma-separated grouping columns to evaluate.",
+    )
+    satellite_filter_research_parser.add_argument(
+        "--confirmation-horizons",
+        default="5d,10d",
+        help="Comma-separated horizons required for confirmed/watch filter candidates.",
+    )
+    satellite_filter_research_parser.add_argument("--min-sample-count", type=int, default=5, help="Minimum rows per group.")
+    satellite_filter_research_parser.add_argument("--min-win-rate", type=float, default=0.55, help="Minimum win rate.")
+    satellite_filter_research_parser.add_argument("--min-avg-return", type=float, default=0.0, help="Minimum average return.")
+    satellite_filter_research_parser.add_argument(
+        "--max-worst-return",
+        type=float,
+        default=-0.20,
+        help="Minimum acceptable worst realized return.",
+    )
+
+    satellite_filter_model_parser = subparsers.add_parser(
+        "satellite-filter-model",
+        help="Apply satellite filter candidates to current stock candidates as a research-only gate.",
+    )
+    satellite_filter_model_parser.add_argument(
+        "--candidates-path",
+        required=True,
+        help="Current stock candidate CSV, typically stock_target_review.csv.",
+    )
+    satellite_filter_model_parser.add_argument(
+        "--filter-candidates-path",
+        default="outputs/research/satellite_filter_research_latest/satellite_filter_candidates.csv",
+        help="CSV generated by satellite-filter-research.",
+    )
+    satellite_filter_model_parser.add_argument(
+        "--industry-chain-scores-path",
+        default=None,
+        help="Optional industry_chain_factor_scores.csv used as an additional confirmation gate.",
+    )
+    satellite_filter_model_parser.add_argument(
+        "--min-industry-chain-score",
+        type=float,
+        default=60.0,
+        help="Minimum industry-chain score for confirmed satellite research trials.",
+    )
+    satellite_filter_model_parser.add_argument(
+        "--min-bottleneck-score",
+        type=float,
+        default=55.0,
+        help="Minimum bottleneck-node score for confirmed satellite research trials.",
+    )
+    satellite_filter_model_parser.add_argument(
+        "--output-dir",
+        default="outputs/research/satellite_filter_model_latest",
+        help="Directory for satellite filter model outputs.",
+    )
 
     theme_state_parser = subparsers.add_parser(
         "theme-state",
@@ -468,7 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     momentum_focus_parser = subparsers.add_parser(
         "momentum-focus",
-        help="Build a research-only focus pool from limit-up and >=7%% A-share gainers.",
+        help="Build a research-only focus pool from >=5%% A-share strong-gainers.",
     )
     momentum_focus_parser.add_argument(
         "--output-dir",
@@ -494,7 +716,7 @@ def build_parser() -> argparse.ArgumentParser:
     momentum_focus_parser.add_argument(
         "--strong-gain-threshold-pct",
         type=float,
-        default=7.0,
+        default=5.0,
         help="Minimum daily percentage gain for the strong-gain research bucket.",
     )
     momentum_focus_parser.add_argument(
@@ -522,7 +744,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     momentum_outcomes_parser = subparsers.add_parser(
         "momentum-outcomes",
-        help="Evaluate historical outcomes for limit-up and >=7%% A-share events.",
+        help="Evaluate historical outcomes for >=5%% strong-gain A-share events.",
     )
     momentum_outcomes_parser.add_argument(
         "--data-dir",
@@ -538,7 +760,7 @@ def build_parser() -> argparse.ArgumentParser:
     momentum_outcomes_parser.add_argument(
         "--strong-gain-threshold-pct",
         type=float,
-        default=7.0,
+        default=5.0,
         help="Minimum signal-day gain for the strong-gain research bucket.",
     )
     momentum_outcomes_parser.add_argument(
@@ -824,6 +1046,28 @@ def build_parser() -> argparse.ArgumentParser:
     sentiment_parser.add_argument("--window", type=int, default=120, help="Rolling z-score window.")
     sentiment_parser.add_argument("--strict", action="store_true", help="Fail when any cached history is missing.")
 
+    trigger_sync_parser = subparsers.add_parser(
+        "trigger-sync",
+        help="Sync external THSDK trigger-monitor outputs into the local research contract.",
+    )
+    trigger_sync_parser.add_argument(
+        "--output-root",
+        default="D:/codex/outputs",
+        help="Root directory containing THSDK monitor reports and signal_journal/signal_journal.csv.",
+    )
+    trigger_sync_parser.add_argument("--report-path", default=None, help="Optional explicit THSDK monitor Markdown report.")
+    trigger_sync_parser.add_argument("--journal-path", default=None, help="Optional explicit signal journal CSV.")
+    trigger_sync_parser.add_argument(
+        "--expected-trade-date",
+        default=None,
+        help="Optional expected trade date used to audit whether the synced trigger report is current.",
+    )
+    trigger_sync_parser.add_argument(
+        "--include-risk-signals",
+        action="store_true",
+        help="Include risk-category rows in signals_latest.csv in addition to candidate rows.",
+    )
+
     phase2_parser = subparsers.add_parser("phase2", help="Write the phase-2 model construction status report.")
     phase2_parser.add_argument(
         "--output-dir",
@@ -951,8 +1195,8 @@ def build_parser() -> argparse.ArgumentParser:
     paper_account_parser.add_argument(
         "--stock-tracking-max-market-cap-yi",
         type=float,
-        default=1500.0,
-        help="Skip stock-target tracking when total market cap is above this Yi Yuan threshold.",
+        default=None,
+        help="Skip stock-target tracking when total market cap is above this Yi Yuan threshold. Set <=0 to disable.",
     )
     paper_account_parser.add_argument(
         "--stock-review-notes-path",
@@ -995,6 +1239,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--reviewed-at",
         default=None,
         help="Optional timestamp to write into reviewed_at for applied rows.",
+    )
+
+    broker_statement_parser = subparsers.add_parser(
+        "broker-statement",
+        help="Import a local broker statement CSV and write a research-only execution audit.",
+    )
+    broker_statement_parser.add_argument("--input", required=True, help="Local broker statement CSV path.")
+    broker_statement_parser.add_argument(
+        "--output-dir",
+        default="outputs/research/broker_statement_latest",
+        help="Directory for broker statement audit outputs.",
+    )
+    broker_statement_parser.add_argument(
+        "--encoding",
+        default="utf-8-sig",
+        help="CSV encoding for the broker statement input.",
     )
 
     live_shadow_parser = subparsers.add_parser(
@@ -1202,7 +1462,7 @@ def build_parser() -> argparse.ArgumentParser:
     daily_pipeline_parser.add_argument(
         "--momentum-focus-threshold",
         type=float,
-        default=7.0,
+        default=5.0,
         help="Minimum daily percentage gain for the momentum-focus strong-gain bucket.",
     )
     daily_pipeline_parser.add_argument(
@@ -1257,6 +1517,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--satellite-risk-budget-output-dir",
         default=None,
         help="Directory for the automatic satellite risk-budget review produced after the daily run.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--satellite-trial-replay-output-dir",
+        default=None,
+        help="Directory for the automatic satellite trial replay produced after the daily run.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--satellite-trial-replay-horizons",
+        default=",".join(DEFAULT_SATELLITE_TRIAL_REPLAY_HORIZONS),
+        help="Comma-separated satellite trial replay horizons, e.g. 1d,5d,10d.",
     )
     daily_pipeline_parser.add_argument(
         "--network-lab-snapshot",
@@ -1360,8 +1630,8 @@ def build_parser() -> argparse.ArgumentParser:
     daily_pipeline_parser.add_argument(
         "--stock-tracking-max-market-cap-yi",
         type=float,
-        default=1500.0,
-        help="Skip stock-target tracking when total market cap is above this Yi Yuan threshold.",
+        default=None,
+        help="Skip stock-target tracking when total market cap is above this Yi Yuan threshold. Set <=0 to disable.",
     )
     daily_pipeline_parser.add_argument("--stock-review-notes-path", default=None, help="Persistent manual notes CSV for stock-target review rows.")
     daily_pipeline_parser.add_argument("--stock-review-outcomes-history-path", default=None, help="Persistent cumulative outcome-history CSV for stock-target review rows.")
@@ -1466,6 +1736,94 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Write to latest-style output directories instead of dated directories.",
     )
+    daily_pipeline_parser.add_argument(
+        "--publish-fast-decision",
+        action="store_true",
+        help="Publish the cached fast-decision summary in the same Python process after a successful pipeline run.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--fast-decision-output-dir",
+        default="outputs/research/daily_fast_decision_latest",
+        help="Output directory used when --publish-fast-decision is enabled.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--fast-decision-research-dir",
+        default="outputs/research",
+        help="Latest research artifact directory used by the in-process fast-decision publisher.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--fast-decision-top-candidates",
+        type=int,
+        default=20,
+        help="Maximum momentum candidates included by the in-process fast-decision publisher.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--publish-stock-outcome-gate",
+        action="store_true",
+        help="Publish the stock outcome gate in the same Python process after a successful pipeline run.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--stock-outcome-gate-output-dir",
+        default="outputs/research/stock_outcome_gate_latest",
+        help="Output directory used by the in-process stock outcome gate.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--stock-outcome-gate-primary-horizon",
+        default="5d",
+        help="Preferred mature horizon used by the in-process stock outcome gate.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--stock-outcome-gate-relaxed-caution-multiplier",
+        type=float,
+        default=0.5,
+        help="Research-only caution multiplier used by the in-process stock outcome gate.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--stock-outcome-gate-relaxed-prefer-trial-weight",
+        type=float,
+        default=0.20,
+        help="Research-only prefer allocation cap used by the in-process stock outcome gate.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--stock-outcome-gate-weak-output-dir",
+        default=None,
+        help="Optional weak-sentiment opportunity output directory used by the in-process gate.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--stock-outcome-gate-weak-single-weight-cap",
+        type=float,
+        default=0.05,
+        help="Research-only per-stock cap for the in-process weak-sentiment trial.",
+    )
+    daily_pipeline_parser.add_argument(
+        "--stock-outcome-gate-weak-total-weight-cap",
+        type=float,
+        default=0.20,
+        help="Research-only total cap for the in-process weak-sentiment trial.",
+    )
+
+    daily_fast_decision_parser = subparsers.add_parser(
+        "daily-fast-decision",
+        help="Build a cached, read-only decision summary without training or backtesting.",
+    )
+    daily_fast_decision_parser.add_argument(
+        "--output-dir",
+        default="outputs/research/daily_fast_decision_latest",
+        help="Directory for the fast decision snapshot and Chinese report.",
+    )
+    daily_fast_decision_parser.add_argument(
+        "--research-dir",
+        default="outputs/research",
+        help="Directory containing the latest pipeline, paper, momentum, dashboard, and preflight outputs.",
+    )
+    daily_fast_decision_parser.add_argument(
+        "--top-candidates",
+        type=int,
+        default=20,
+        help="Maximum momentum candidates included in the compact output.",
+    )
+    daily_fast_decision_parser.add_argument("--force", action="store_true", help="Ignore a matching input cache.")
+    daily_fast_decision_parser.add_argument("--print-json", action="store_true", help="Print the full snapshot JSON.")
 
     daily_run_status_parser = subparsers.add_parser(
         "daily-run-status",
@@ -1757,6 +2115,100 @@ def build_parser() -> argparse.ArgumentParser:
     risk_budget_parser.add_argument("--min-overall-avg-return", type=float, default=0.0, help="Minimum overall average return required for a trial.")
     risk_budget_parser.add_argument("--max-worst-group-loss", type=float, default=-0.05, help="Worst-group average-return loss guard.")
 
+    satellite_trial_replay_parser = subparsers.add_parser(
+        "satellite-trial-replay",
+        help="Replay research-only satellite trial rules against stock-target outcome history.",
+    )
+    satellite_trial_replay_parser.add_argument(
+        "--rules-path",
+        default=str(DEFAULT_SATELLITE_TRIAL_REPLAY_RULES_PATH),
+        help="satellite_trial_rules.csv generated by satellite-risk-budget-review.",
+    )
+    satellite_trial_replay_parser.add_argument(
+        "--outcomes-history",
+        default=str(DEFAULT_SATELLITE_TRIAL_REPLAY_OUTCOMES_HISTORY_PATH),
+        help="stock_target_review_outcomes_history.csv to replay against.",
+    )
+    satellite_trial_replay_parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_SATELLITE_TRIAL_REPLAY_OUTPUT_DIR),
+        help="Satellite trial replay output directory.",
+    )
+    satellite_trial_replay_parser.add_argument(
+        "--horizons",
+        default=",".join(DEFAULT_SATELLITE_TRIAL_REPLAY_HORIZONS),
+        help="Comma-separated horizons, e.g. 1d,5d,10d.",
+    )
+
+    stock_outcome_gate_parser = subparsers.add_parser(
+        "stock-outcome-gate",
+        help="Build a research-only gate from mature stock-target outcome groups.",
+    )
+    stock_outcome_gate_parser.add_argument(
+        "--outcome-analysis-path",
+        required=True,
+        help="Path to stock_target_review_outcome_analysis.json.",
+    )
+    stock_outcome_gate_parser.add_argument(
+        "--stock-target-review-path",
+        default=None,
+        help="Optional current stock_target_review.csv to overlay research priorities onto target rows.",
+    )
+    stock_outcome_gate_parser.add_argument(
+        "--output-dir",
+        default="outputs/research/stock_outcome_gate_latest",
+        help="Stock outcome gate output directory.",
+    )
+    stock_outcome_gate_parser.add_argument(
+        "--primary-horizon",
+        default="5d",
+        help="Preferred mature horizon for gate classification, e.g. 5d.",
+    )
+    stock_outcome_gate_parser.add_argument("--min-group-evaluable", type=int, default=5, help="Minimum group samples required.")
+    stock_outcome_gate_parser.add_argument("--prefer-min-avg-return", type=float, default=0.03, help="Average return threshold for prefer.")
+    stock_outcome_gate_parser.add_argument("--prefer-min-win-rate", type=float, default=0.50, help="Win-rate threshold for prefer.")
+    stock_outcome_gate_parser.add_argument("--caution-max-avg-return", type=float, default=-0.02, help="Average return threshold for caution.")
+    stock_outcome_gate_parser.add_argument("--caution-max-win-rate", type=float, default=0.35, help="Win-rate threshold for caution.")
+    stock_outcome_gate_parser.add_argument(
+        "--relaxed-caution-multiplier",
+        type=float,
+        default=0.5,
+        help="Research-only relaxed shadow multiplier for caution target weights.",
+    )
+    stock_outcome_gate_parser.add_argument(
+        "--relaxed-prefer-trial-weight",
+        type=float,
+        default=0.20,
+        help="Research-only max baseline-weight share reallocated into prefer targets in relaxed shadow selection.",
+    )
+    stock_outcome_gate_parser.add_argument(
+        "--pipeline-snapshot-path",
+        default=None,
+        help="Optional daily_pipeline_snapshot.json used to annotate weak-sentiment opportunity trial output.",
+    )
+    stock_outcome_gate_parser.add_argument(
+        "--paper-ledger-path",
+        default=None,
+        help="Optional paper-account ledger.csv used to annotate weak-sentiment opportunity trial output.",
+    )
+    stock_outcome_gate_parser.add_argument(
+        "--weak-sentiment-opportunity-output-dir",
+        default=None,
+        help="Optional directory for Chinese weak-sentiment research-only opportunity trial files.",
+    )
+    stock_outcome_gate_parser.add_argument(
+        "--weak-sentiment-single-weight-cap",
+        type=float,
+        default=0.05,
+        help="Research-only per-stock cap for weak-sentiment opportunity trial rows.",
+    )
+    stock_outcome_gate_parser.add_argument(
+        "--weak-sentiment-total-weight-cap",
+        type=float,
+        default=0.20,
+        help="Research-only total cap for weak-sentiment opportunity trial rows.",
+    )
+
     live_preflight_parser = subparsers.add_parser(
         "live-preflight",
         help="Run a read-only pre-live readiness checklist from dashboard and paper-account outputs.",
@@ -1813,6 +2265,7 @@ def build_parser() -> argparse.ArgumentParser:
             "compact",
             "bear",
             "opportunity",
+            "opportunity_v2",
             "stable",
             "stable_v2",
             "reversal",
@@ -1825,7 +2278,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     walk_parser.add_argument(
         "--objective",
-        choices=["balanced", "robust", "stable", "satellite", "capital", "opportunity_quality"],
+        choices=["balanced", "robust", "stable", "satellite", "capital", "opportunity_quality", "opportunity_growth", "opportunity_q_full"],
         default=None,
         help="Training objective used to select parameters.",
     )
@@ -1863,7 +2316,7 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_walk_parser.add_argument("--step-months", type=int, default=6, help="Rolling step length in months.")
     portfolio_walk_parser.add_argument(
         "--grid",
-        choices=["compact", "guarded", "activation"],
+        choices=["compact", "guarded", "activation", "activation_dd50"],
         default="guarded",
         help="Allocation candidate grid.",
     )
@@ -1897,7 +2350,7 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_source_parser.add_argument("--step-months", type=int, default=6, help="Rolling step length in months.")
     portfolio_source_parser.add_argument(
         "--grid",
-        choices=["compact", "guarded", "activation"],
+        choices=["compact", "guarded", "activation", "activation_dd50"],
         default="activation",
         help="Allocation candidate grid crossed with every satellite source.",
     )
@@ -1961,6 +2414,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional source-specific risk-on satellite cap, e.g. reversal=0.20. Can be repeated.",
     )
     portfolio_source_parser.add_argument(
+        "--source-group",
+        action="append",
+        default=[],
+        help="Optional source preselection group, e.g. highyield=highgain_pos8_dd50,highgain_dd40_protected. Can be repeated.",
+    )
+    portfolio_source_parser.add_argument(
         "--output-dir",
         default="outputs/portfolio_source_selection",
         help="Portfolio source-selection output directory.",
@@ -1979,6 +2438,77 @@ def resolve_walk_forward_options(args: argparse.Namespace) -> dict[str, object]:
         if value is not None:
             options[key] = value
     return options
+
+
+def _publish_fast_decision_for_pipeline(args: argparse.Namespace) -> object | None:
+    try:
+        fast_decision_key = _lock_key(
+            "daily-fast-decision",
+            Path(args.fast_decision_output_dir).resolve(),
+            Path(args.fast_decision_research_dir).resolve(),
+            args.fast_decision_top_candidates,
+            False,
+        )
+        with process_lock(_lock_dir(), fast_decision_key, _command_line()):
+            result = run_daily_fast_decision(
+                project_root=Path("."),
+                output_dir=Path(args.fast_decision_output_dir),
+                research_dir=Path(args.fast_decision_research_dir),
+                top_candidates=args.fast_decision_top_candidates,
+            )
+        print(f"Fast decision completed: {result.output_dir}")
+        print(f"Fast decision cache hit: {result.snapshot.get('cache_hit')}")
+        print(f"Fast decision report: {result.report_path}")
+        return result
+    except Exception as error:
+        # This publisher was historically a non-blocking follow-up command.
+        print(f"Warning: fast decision report failed; continuing: {error}", file=sys.stderr)
+        return None
+
+
+def _publish_stock_outcome_gate_for_pipeline(args: argparse.Namespace, pipeline_result: object) -> object:
+    paper_result = pipeline_result.paper_account_result
+    ledger_record = paper_result.ledger.tail(1).iloc[0].to_dict() if not paper_result.ledger.empty else {}
+    gate_key = _lock_key(
+        "stock-outcome-gate",
+        Path(paper_result.stock_target_review_outcome_analysis_json_path).resolve(),
+        Path(paper_result.stock_target_review_path).resolve(),
+        Path(args.stock_outcome_gate_output_dir).resolve(),
+        args.stock_outcome_gate_primary_horizon,
+        args.stock_outcome_gate_relaxed_caution_multiplier,
+        args.stock_outcome_gate_relaxed_prefer_trial_weight,
+        Path(args.stock_outcome_gate_weak_output_dir).resolve()
+        if args.stock_outcome_gate_weak_output_dir
+        else "no-weak-sentiment-output",
+        args.stock_outcome_gate_weak_single_weight_cap,
+        args.stock_outcome_gate_weak_total_weight_cap,
+    )
+    with process_lock(_lock_dir(), gate_key, _command_line()):
+        result = run_stock_outcome_gate(
+            outcome_analysis_path=paper_result.stock_target_review_outcome_analysis_json_path,
+            stock_target_review_path=paper_result.stock_target_review_path,
+            output_dir=Path(args.stock_outcome_gate_output_dir),
+            primary_horizon=args.stock_outcome_gate_primary_horizon,
+            relaxed_caution_multiplier=args.stock_outcome_gate_relaxed_caution_multiplier,
+            relaxed_prefer_trial_weight=args.stock_outcome_gate_relaxed_prefer_trial_weight,
+            pipeline_snapshot_path=pipeline_result.snapshot_path,
+            paper_ledger_path=paper_result.ledger_path,
+            weak_sentiment_opportunity_output_dir=(
+                Path(args.stock_outcome_gate_weak_output_dir)
+                if args.stock_outcome_gate_weak_output_dir
+                else None
+            ),
+            weak_sentiment_single_weight_cap=args.stock_outcome_gate_weak_single_weight_cap,
+            weak_sentiment_total_weight_cap=args.stock_outcome_gate_weak_total_weight_cap,
+            outcome_payload_override=paper_result.stock_target_review_outcome_analysis_payload,
+            stock_target_review_frame=paper_result.stock_target_review,
+            pipeline_snapshot_override=pipeline_result.snapshot,
+            paper_ledger_record_override=ledger_record,
+        )
+    print(f"Stock outcome gate completed: {result.output_dir}")
+    print(f"Stock outcome gate decision: {result.snapshot.get('decision')}")
+    print(f"Stock outcome gate report: {result.report_path}")
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2024,6 +2554,9 @@ def main(argv: list[str] | None = None) -> int:
                         symbols=symbols,
                         as_of_date=args.as_of_date,
                         lookback_days=args.lookback_days,
+                        daily_data_dir=Path(args.daily_data_dir),
+                        ingest_project_dir=Path(args.ingest_project_dir),
+                        prefer_local_daily=not args.no_local_daily,
                     )
             except ProcessLockError as error:
                 return _duplicate_process_exit(error)
@@ -2140,7 +2673,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Source kind: {result.snapshot.get('source_kind')}")
         print(f"Candidate rows: {result.snapshot.get('candidate_count')}")
         print(f"Limit-up rows: {result.snapshot.get('limit_up_count')}")
-        print(f">=7% rows: {result.snapshot.get('strong_gain_count')}")
+        print(f">=5% rows: {result.snapshot.get('strong_gain_count')}")
         print(f"Candidates CSV: {result.candidates_path}")
         print(f"Snapshot JSON: {result.snapshot_path}")
         print(f"Report written: {result.report_path}")
@@ -2486,6 +3019,141 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Best spread factor: {result.snapshot.get('best_spread_factor')} h={result.snapshot.get('best_spread_horizon')}")
         return 0
 
+    if args.command == "berkshire-quality-factor":
+        key = _lock_key(
+            "berkshire-quality-factor",
+            Path(args.candidates_path).resolve(),
+            Path(args.output_dir).resolve(),
+            Path(args.fundamentals_path).resolve() if args.fundamentals_path else "no-fundamentals",
+            Path(args.qualitative_path).resolve() if args.qualitative_path else "no-qualitative",
+            args.top_n,
+        )
+        try:
+            with process_lock(_lock_dir(), key, _command_line()):
+                result = run_berkshire_quality_factor(
+                    candidates_path=Path(args.candidates_path),
+                    fundamentals_path=Path(args.fundamentals_path) if args.fundamentals_path else None,
+                    qualitative_path=Path(args.qualitative_path) if args.qualitative_path else None,
+                    output_dir=Path(args.output_dir),
+                    top_n=args.top_n,
+                )
+        except ProcessLockError as error:
+            return _duplicate_process_exit(error)
+        print(f"Berkshire quality factor completed: {result.output_dir}")
+        print(f"Status: {result.snapshot.get('status')}")
+        print(f"Candidates: {result.snapshot.get('candidate_count')}")
+        print(f"Mapped candidates: {result.snapshot.get('mapped_candidate_count')}")
+        print(f"Scores CSV: {result.scores_path}")
+        print(f"Template CSV: {result.template_path}")
+        print(f"Snapshot JSON: {result.snapshot_path}")
+        print(f"Report written: {result.report_path}")
+        print(f"Broker action: {result.snapshot.get('broker_action')}")
+        return 0
+
+    if args.command == "industry-chain-factor":
+        key = _lock_key(
+            "industry-chain-factor",
+            Path(args.candidates_path).resolve(),
+            Path(args.output_dir).resolve(),
+            Path(args.chain_map_path).resolve() if args.chain_map_path else "no-chain-map",
+            Path(args.market_snapshot_path).resolve() if args.market_snapshot_path else "no-market-snapshot",
+            args.top_n,
+        )
+        try:
+            with process_lock(_lock_dir(), key, _command_line()):
+                result = run_industry_chain_factor(
+                    candidates_path=Path(args.candidates_path),
+                    chain_map_path=Path(args.chain_map_path) if args.chain_map_path else None,
+                    market_snapshot_path=Path(args.market_snapshot_path) if args.market_snapshot_path else None,
+                    output_dir=Path(args.output_dir),
+                    top_n=args.top_n,
+                )
+        except ProcessLockError as error:
+            return _duplicate_process_exit(error)
+        print(f"Industry chain factor completed: {result.output_dir}")
+        print(f"Status: {result.snapshot.get('status')}")
+        print(f"Candidates: {result.snapshot.get('candidate_count')}")
+        print(f"Mapped candidates: {result.snapshot.get('mapped_candidate_count')}")
+        print(f"Scores CSV: {result.scores_path}")
+        print(f"Template CSV: {result.template_path}")
+        print(f"Snapshot JSON: {result.snapshot_path}")
+        print(f"Report written: {result.report_path}")
+        print(f"Broker action: {result.snapshot.get('broker_action')}")
+        return 0
+
+    if args.command == "satellite-filter-research":
+        key = _lock_key(
+            "satellite-filter-research",
+            Path(args.outcomes_history).resolve(),
+            Path(args.output_dir).resolve(),
+            args.horizons,
+            args.dimensions,
+            args.confirmation_horizons,
+            args.min_sample_count,
+            args.min_win_rate,
+            args.min_avg_return,
+            args.max_worst_return,
+        )
+        try:
+            with process_lock(_lock_dir(), key, _command_line()):
+                result = run_satellite_filter_research(
+                    outcomes_history_path=Path(args.outcomes_history),
+                    output_dir=Path(args.output_dir),
+                    horizons=args.horizons,
+                    dimensions=args.dimensions,
+                    confirmation_horizons=args.confirmation_horizons,
+                    min_sample_count=args.min_sample_count,
+                    min_win_rate=args.min_win_rate,
+                    min_avg_return=args.min_avg_return,
+                    max_worst_return=args.max_worst_return,
+                )
+        except ProcessLockError as error:
+            return _duplicate_process_exit(error)
+        print(f"Satellite filter research completed: {result.output_dir}")
+        print(f"Status: {result.snapshot.get('research_status')}")
+        print(f"Satellite rows: {result.snapshot.get('satellite_rows')}")
+        print(f"Candidate filters: {result.snapshot.get('candidate_count')}")
+        print(f"Group scores CSV: {result.group_scores_path}")
+        print(f"Candidates CSV: {result.candidates_path}")
+        print(f"Snapshot JSON: {result.snapshot_path}")
+        print(f"Report written: {result.report_path}")
+        return 0
+
+    if args.command == "satellite-filter-model":
+        key = _lock_key(
+            "satellite-filter-model",
+            Path(args.candidates_path).resolve(),
+            Path(args.filter_candidates_path).resolve(),
+            Path(args.output_dir).resolve(),
+            Path(args.industry_chain_scores_path).resolve() if args.industry_chain_scores_path else "no-industry-chain",
+            args.min_industry_chain_score,
+            args.min_bottleneck_score,
+        )
+        try:
+            with process_lock(_lock_dir(), key, _command_line()):
+                result = run_satellite_filter_model(
+                    candidates_path=Path(args.candidates_path),
+                    filter_candidates_path=Path(args.filter_candidates_path),
+                    industry_chain_scores_path=Path(args.industry_chain_scores_path)
+                    if args.industry_chain_scores_path
+                    else None,
+                    min_industry_chain_score=args.min_industry_chain_score,
+                    min_bottleneck_score=args.min_bottleneck_score,
+                    output_dir=Path(args.output_dir),
+                )
+        except ProcessLockError as error:
+            return _duplicate_process_exit(error)
+        print(f"Satellite filter model completed: {result.output_dir}")
+        print(f"Status: {result.snapshot.get('status')}")
+        print(f"Satellite candidates: {result.snapshot.get('satellite_candidate_count')}")
+        print(f"Allow count: {result.snapshot.get('allow_count')}")
+        print(f"Watch count: {result.snapshot.get('watch_count')}")
+        print(f"Scores CSV: {result.scores_path}")
+        print(f"Snapshot JSON: {result.snapshot_path}")
+        print(f"Report written: {result.report_path}")
+        print(f"Broker action: {result.snapshot.get('broker_action')}")
+        return 0
+
     if args.command == "theme-map":
         if args.theme_map_command == "build":
             key = _lock_key(
@@ -2717,6 +3385,37 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Report written: {result.report_path}")
         return 0
 
+    if args.command == "trigger-sync":
+        key = _lock_key(
+            "trigger-sync",
+            Path(args.output_root).resolve(),
+            Path(args.report_path).resolve() if args.report_path else "latest-report",
+            Path(args.journal_path).resolve() if args.journal_path else "default-journal",
+            args.include_risk_signals,
+            args.expected_trade_date or "no-expected-trade-date",
+        )
+        try:
+            with process_lock(_lock_dir(), key, _command_line()):
+                result = sync_thsdk_trigger_monitor_outputs(
+                    output_root=Path(args.output_root),
+                    report_path=Path(args.report_path) if args.report_path else None,
+                    journal_path=Path(args.journal_path) if args.journal_path else None,
+                    include_risk_signals=args.include_risk_signals,
+                    expected_trade_date=args.expected_trade_date,
+                )
+        except ProcessLockError as error:
+            return _duplicate_process_exit(error)
+        print(f"Trigger sync completed: {result.output_root}")
+        print(f"Trade date: {result.snapshot.get('trade_date')}")
+        print(f"Expected trade date: {result.snapshot.get('expected_trade_date')}")
+        print(f"Trigger sync freshness: {result.snapshot.get('trigger_sync_freshness_status')}")
+        print(f"Source rows: {result.snapshot.get('source_row_count')}")
+        print(f"Latest signals: {result.snapshot.get('latest_signal_count')}")
+        print(f"Latest trigger: {result.latest_trigger_path}")
+        print(f"Latest signals CSV: {result.latest_signal_path}")
+        print(f"Snapshot JSON: {result.snapshot_path}")
+        return 0
+
     if args.command == "phase2":
         result = run_phase2_status(
             project_root=Path("."),
@@ -2882,6 +3581,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Blank ignored rows: {result.payload.get('blank_ignored_count')}")
         print(f"Invalid status rows: {result.payload.get('invalid_status_count')}")
         print(f"Broker action: {result.payload.get('broker_action')}")
+        return 0
+
+    if args.command == "broker-statement":
+        key = _lock_key(
+            "broker-statement",
+            Path(args.input).resolve(),
+            Path(args.output_dir).resolve(),
+            args.encoding,
+        )
+        try:
+            with process_lock(_lock_dir(), key, _command_line()):
+                result = run_broker_statement_review(
+                    input_path=Path(args.input),
+                    output_dir=Path(args.output_dir),
+                    encoding=args.encoding,
+                )
+        except ProcessLockError as error:
+            return _duplicate_process_exit(error)
+        print(f"Broker statement review completed: {result.output_dir}")
+        print(f"Normalized trades CSV: {result.normalized_path}")
+        print(f"Realized trades CSV: {result.realized_path}")
+        print(f"Open positions CSV: {result.open_positions_path}")
+        print(f"Symbol summary CSV: {result.symbol_summary_path}")
+        print(f"Snapshot JSON: {result.snapshot_path}")
+        print(f"Report written: {result.report_path}")
+        print(f"Broker action: {result.snapshot.get('broker_action')}")
         return 0
 
     if args.command == "live-shadow":
@@ -3139,6 +3864,8 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.history_file).resolve(),
             args.history_review_output_dir or "auto-history-review",
             args.satellite_risk_budget_output_dir or "auto-satellite-risk-budget-review",
+            args.satellite_trial_replay_output_dir or "auto-satellite-trial-replay",
+            args.satellite_trial_replay_horizons,
             args.network_lab_snapshot or "auto-network-lab-snapshot",
             args.network_max_cluster_count_warning,
             args.network_residual_mi_warning,
@@ -3222,6 +3949,12 @@ def main(argv: list[str] | None = None) -> int:
                     satellite_risk_budget_output_dir=(
                         Path(args.satellite_risk_budget_output_dir) if args.satellite_risk_budget_output_dir else None
                     ),
+                    satellite_trial_replay_output_dir=(
+                        Path(args.satellite_trial_replay_output_dir)
+                        if args.satellite_trial_replay_output_dir
+                        else None
+                    ),
+                    satellite_trial_replay_horizons=args.satellite_trial_replay_horizons,
                     network_lab_snapshot=Path(args.network_lab_snapshot) if args.network_lab_snapshot else None,
                     network_max_cluster_count_warning=args.network_max_cluster_count_warning,
                     network_residual_mi_warning=args.network_residual_mi_warning,
@@ -3304,6 +4037,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"History alerts: {result.snapshot.get('history_review_alert_count')}")
         print(f"Satellite risk-budget review: {result.snapshot.get('satellite_risk_budget_report_path')}")
         print(f"Satellite risk-budget decision: {result.snapshot.get('satellite_risk_budget_decision')}")
+        print(f"Satellite trial replay: {result.snapshot.get('satellite_trial_replay_report_path')}")
+        print(f"Satellite trial replay status: {result.snapshot.get('satellite_trial_replay_status')}")
+        print(f"Satellite trial replay matched events: {result.snapshot.get('satellite_trial_replay_matched_event_count')}")
         print(f"Momentum focus: {result.snapshot.get('momentum_focus_report_path')}")
         print(f"Momentum focus status: {result.snapshot.get('momentum_focus_status')}")
         print(f"Momentum focus candidates: {result.snapshot.get('momentum_focus_candidate_count')}")
@@ -3338,6 +4074,44 @@ def main(argv: list[str] | None = None) -> int:
                 f"health={result.snapshot.get('history_review_health_state')} threshold={args.fail_on_history_health}"
             )
             return HISTORY_GATE_EXIT_CODE
+        if args.publish_fast_decision:
+            _publish_fast_decision_for_pipeline(args)
+        if args.publish_stock_outcome_gate:
+            try:
+                _publish_stock_outcome_gate_for_pipeline(args, result)
+            except ProcessLockError as error:
+                return _duplicate_process_exit(error)
+        return 0
+
+    if args.command == "daily-fast-decision":
+        key = _lock_key(
+            "daily-fast-decision",
+            Path(args.output_dir).resolve(),
+            Path(args.research_dir).resolve(),
+            args.top_candidates,
+            args.force,
+        )
+        try:
+            with process_lock(_lock_dir(), key, _command_line()):
+                result = run_daily_fast_decision(
+                    project_root=Path("."),
+                    output_dir=Path(args.output_dir),
+                    research_dir=Path(args.research_dir),
+                    top_candidates=args.top_candidates,
+                    force=args.force,
+                )
+        except ProcessLockError as error:
+            return _duplicate_process_exit(error)
+        print(f"Fast decision completed: {result.output_dir}")
+        print(f"Status: {result.snapshot.get('status')}")
+        print(f"As-of date: {result.snapshot.get('as_of_date')}")
+        print(f"Cache hit: {result.snapshot.get('cache_hit')}")
+        print(f"Observation targets: {result.snapshot.get('observation_target_count')}")
+        print(f"Momentum candidates: {result.snapshot.get('momentum_candidate_count')}")
+        print(f"Snapshot JSON: {result.snapshot_path}")
+        print(f"Report written: {result.report_path}")
+        if args.print_json:
+            print(json.dumps(result.snapshot, ensure_ascii=False, sort_keys=True))
         return 0
 
     if args.command == "daily-run-status":
@@ -3697,6 +4471,97 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Report written: {result.report_path}")
         return 0
 
+    if args.command == "satellite-trial-replay":
+        key = _lock_key(
+            "satellite-trial-replay",
+            Path(args.rules_path).resolve(),
+            Path(args.outcomes_history).resolve(),
+            Path(args.output_dir).resolve(),
+            args.horizons,
+        )
+        try:
+            with process_lock(_lock_dir(), key, _command_line()):
+                result = run_satellite_trial_replay(
+                    rules_path=Path(args.rules_path),
+                    outcomes_history_path=Path(args.outcomes_history),
+                    output_dir=Path(args.output_dir),
+                    horizons=args.horizons,
+                )
+        except ProcessLockError as error:
+            return _duplicate_process_exit(error)
+        print(f"Satellite trial replay completed: {result.output_dir}")
+        print(f"Rule count: {result.snapshot.get('rule_count')}")
+        print(f"Matched events: {result.snapshot.get('matched_event_count')}")
+        print(f"Best union horizon: {result.snapshot.get('union_best_horizon')}")
+        print(f"Summary CSV: {result.summary_path}")
+        print(f"Matches CSV: {result.matches_path}")
+        print(f"Snapshot JSON: {result.snapshot_path}")
+        print(f"Report written: {result.report_path}")
+        return 0
+
+    if args.command == "stock-outcome-gate":
+        key = _lock_key(
+            "stock-outcome-gate",
+            Path(args.outcome_analysis_path).resolve(),
+            Path(args.stock_target_review_path).resolve() if args.stock_target_review_path else "no-stock-target-review",
+            Path(args.output_dir).resolve(),
+            args.primary_horizon,
+            args.min_group_evaluable,
+            args.prefer_min_avg_return,
+            args.prefer_min_win_rate,
+            args.caution_max_avg_return,
+            args.caution_max_win_rate,
+            args.relaxed_caution_multiplier,
+            args.relaxed_prefer_trial_weight,
+            Path(args.pipeline_snapshot_path).resolve() if args.pipeline_snapshot_path else "optional-pipeline-snapshot",
+            Path(args.paper_ledger_path).resolve() if args.paper_ledger_path else "optional-paper-ledger",
+            Path(args.weak_sentiment_opportunity_output_dir).resolve()
+            if args.weak_sentiment_opportunity_output_dir
+            else "optional-weak-sentiment-output",
+            args.weak_sentiment_single_weight_cap,
+            args.weak_sentiment_total_weight_cap,
+        )
+        try:
+            with process_lock(_lock_dir(), key, _command_line()):
+                result = run_stock_outcome_gate(
+                    outcome_analysis_path=Path(args.outcome_analysis_path),
+                    stock_target_review_path=Path(args.stock_target_review_path) if args.stock_target_review_path else None,
+                    output_dir=Path(args.output_dir),
+                    primary_horizon=args.primary_horizon,
+                    min_group_evaluable=args.min_group_evaluable,
+                    prefer_min_avg_return=args.prefer_min_avg_return,
+                    prefer_min_win_rate=args.prefer_min_win_rate,
+                    caution_max_avg_return=args.caution_max_avg_return,
+                    caution_max_win_rate=args.caution_max_win_rate,
+                    relaxed_caution_multiplier=args.relaxed_caution_multiplier,
+                    relaxed_prefer_trial_weight=args.relaxed_prefer_trial_weight,
+                    pipeline_snapshot_path=Path(args.pipeline_snapshot_path) if args.pipeline_snapshot_path else None,
+                    paper_ledger_path=Path(args.paper_ledger_path) if args.paper_ledger_path else None,
+                    weak_sentiment_opportunity_output_dir=(
+                        Path(args.weak_sentiment_opportunity_output_dir)
+                        if args.weak_sentiment_opportunity_output_dir
+                        else None
+                    ),
+                    weak_sentiment_single_weight_cap=args.weak_sentiment_single_weight_cap,
+                    weak_sentiment_total_weight_cap=args.weak_sentiment_total_weight_cap,
+                )
+        except ProcessLockError as error:
+            return _duplicate_process_exit(error)
+        print(f"Stock outcome gate completed: {result.output_dir}")
+        print(f"Decision: {result.snapshot.get('decision')}")
+        print(f"Selected horizon: {result.snapshot.get('selected_horizon')}")
+        print(f"Prefer groups: {result.snapshot.get('prefer_group_count')}")
+        print(f"Caution groups: {result.snapshot.get('caution_group_count')}")
+        print(f"Gate CSV: {result.gate_path}")
+        print(f"Target overlay CSV: {result.target_overlay_path}")
+        print(f"Shadow selection CSV: {result.shadow_selection_path}")
+        print(f"Relaxed opportunity raw weight: {result.snapshot.get('shadow_relaxed_opportunity_raw_weight_total')}")
+        print(f"Weak sentiment trial CSV: {result.weak_sentiment_trial_csv_path}")
+        print(f"Weak sentiment trial report: {result.weak_sentiment_trial_report_path}")
+        print(f"Snapshot JSON: {result.snapshot_path}")
+        print(f"Report written: {result.report_path}")
+        return 0
+
     if args.command == "live-preflight":
         key = _lock_key(
             "live-preflight",
@@ -3845,6 +4710,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_switch_margin_by_source = _parse_source_switch_margin_by_source(
                     args.source_switch_margin_by_source
                 )
+                source_groups = _parse_source_groups(args.source_group)
             except ValueError as error:
                 print(f"Invalid source-specific option: {error}")
                 return 2
@@ -3867,6 +4733,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.source_stability_penalty,
                 args.max_satellite_weight if args.max_satellite_weight is not None else "no-max-satellite-weight",
                 json.dumps(source_max_satellite_weight, sort_keys=True),
+                json.dumps(source_groups, sort_keys=True),
             )
             try:
                 with process_lock(_lock_dir(), key, _command_line()):
@@ -3888,6 +4755,7 @@ def main(argv: list[str] | None = None) -> int:
                         source_stability_penalty=args.source_stability_penalty,
                         max_satellite_weight=args.max_satellite_weight,
                         source_max_satellite_weight=source_max_satellite_weight,
+                        source_groups=source_groups,
                         output_dir=Path(args.output_dir),
                         run_id_prefix=args.run_id_prefix,
                     )

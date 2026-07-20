@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from ._compat import read_text
 from .market_cap import DEFAULT_STOCK_MARKET_CAP_PATH
 
 
@@ -110,7 +111,7 @@ class StrategyConfig:
     factor_entry_min_momentum: float = -0.05
     momentum_focus_enabled: bool = False
     momentum_focus_board_scope: str = "main_chinext"
-    momentum_focus_threshold_pct: float = 7.0
+    momentum_focus_threshold_pct: float = 5.0
     momentum_focus_limit_up_boost: float = 0.0
     momentum_focus_strong_gain_boost: float = 0.0
     momentum_focus_only: bool = False
@@ -155,7 +156,7 @@ class LabConfig:
     universe_file: Path | None = None
     universe_source: UniverseSourceConfig | None = None
     stock_market_cap_path: Path | None = None
-    stock_tracking_max_market_cap_yi: float = 1500.0
+    stock_tracking_max_market_cap_yi: float = 0.0
     risk: RiskConfig = RiskConfig()
 
 
@@ -175,7 +176,7 @@ def _project_root_from_config(config_path: Path) -> Path:
 
 
 def _load_yaml_mapping(path: Path) -> dict[str, Any]:
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    raw = yaml.safe_load(read_text(path)) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"Config file must contain a YAML mapping: {path}")
     return raw
@@ -256,7 +257,7 @@ def parse_config(raw: dict[str, Any], project_root: Path) -> LabConfig:
     costs_raw = raw.get("costs", {})
     risk_raw = raw.get("risk", {})
     stock_cap_path_raw = raw.get("stock_market_cap_path")
-    stock_tracking_max_market_cap_yi = float(raw.get("stock_tracking_max_market_cap_yi", 1500.0))
+    stock_tracking_max_market_cap_yi = float(raw.get("stock_tracking_max_market_cap_yi", 0.0))
 
     project = ProjectConfig(
         name=str(project_raw.get("name", "etf_backtest")),
@@ -413,7 +414,7 @@ def parse_config(raw: dict[str, Any], project_root: Path) -> LabConfig:
         factor_entry_min_momentum=float(strategy_raw.get("factor_entry_min_momentum", -0.05)),
         momentum_focus_enabled=bool(strategy_raw.get("momentum_focus_enabled", False)),
         momentum_focus_board_scope=str(strategy_raw.get("momentum_focus_board_scope", "main_chinext")).lower(),
-        momentum_focus_threshold_pct=float(strategy_raw.get("momentum_focus_threshold_pct", 7.0)),
+        momentum_focus_threshold_pct=float(strategy_raw.get("momentum_focus_threshold_pct", 5.0)),
         momentum_focus_limit_up_boost=float(strategy_raw.get("momentum_focus_limit_up_boost", 0.0)),
         momentum_focus_strong_gain_boost=float(strategy_raw.get("momentum_focus_strong_gain_boost", 0.0)),
         momentum_focus_only=bool(strategy_raw.get("momentum_focus_only", False)),

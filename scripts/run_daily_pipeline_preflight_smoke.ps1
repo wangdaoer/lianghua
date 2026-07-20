@@ -69,7 +69,7 @@ function Resolve-SmokeAsOfDate {
 
     $CandidateDates = @()
     $RawProbe = Join-Path $ProjectRoot "data\raw\stocks\000001.csv"
-    $AllocatorCurve = Join-Path $ProjectRoot "outputs\portfolio_source_selection\main_chinext_portfolio_source_selection_validation6_v1\oos_equity_stitched.csv"
+    $AllocatorCurve = Join-Path $ProjectRoot "outputs\portfolio_source_selection\main_chinext_source_selection_highgain_pos8_dd50_cap30_activation_dd50_20260624\oos_equity_stitched.csv"
 
     $RawDate = Get-LatestCsvDate -Path $RawProbe
     if ($RawDate) {

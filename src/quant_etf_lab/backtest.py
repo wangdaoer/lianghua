@@ -7,11 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yaml
@@ -184,6 +179,14 @@ def _compute_metrics(
 
 
 def _plot_charts(equity: pd.DataFrame, benchmark: pd.DataFrame, run_dir: Path) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
     merged = equity.merge(benchmark, on="date", how="left")
     fig, ax = plt.subplots(figsize=(11, 6))
     ax.plot(merged["date"], merged["equity"], label="strategy")

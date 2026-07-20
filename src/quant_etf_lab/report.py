@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from ._compat import read_text
+
 
 def resolve_run_dir(output_dir: Path, run_id: str) -> Path:
     output_dir = output_dir.resolve()
@@ -74,7 +76,7 @@ def write_report(run_dir: Path) -> Path:
     metrics_path = run_dir / "metrics.json"
     if not metrics_path.exists():
         raise FileNotFoundError(f"Missing metrics file: {metrics_path}")
-    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics = json.loads(read_text(metrics_path))
     trades_path = run_dir / "trades.csv"
     trades = _read_csv_or_empty(trades_path)
     monthly_path = run_dir / "monthly_returns.csv"

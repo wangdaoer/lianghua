@@ -9,6 +9,14 @@ from .config import StrategyConfig
 from .indicators import moving_average, rsi
 
 
+def _filled_bool(series: pd.Series) -> pd.Series:
+    return series.astype("boolean").fillna(False).astype(bool)
+
+
+def _filled_float(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
+
+
 def _state_from_entry_exit(data: pd.DataFrame) -> list[int]:
     holding = False
     signals: list[int] = []
@@ -25,7 +33,7 @@ def _apply_volatility_stop_loss(data: pd.DataFrame, config: StrategyConfig) -> p
     if not config.volatility_stop_loss_enabled:
         return data
     frame = data.copy()
-    returns = pd.to_numeric(frame["close"], errors="coerce").pct_change()
+    returns = pd.to_numeric(frame["close"], errors="coerce").pct_change(fill_method=None)
     stop = returns.rolling(
         config.volatility_stop_window,
         min_periods=config.volatility_stop_window,
@@ -90,7 +98,7 @@ def thsdk_monitor_signals(frame: pd.DataFrame, config: StrategyConfig) -> pd.Dat
 
     data["pressure"] = recent_high
     data["support"] = recent_low
-    data["pct"] = data["close"].pct_change() * 100
+    data["pct"] = data["close"].pct_change(fill_method=None) * 100
     data["volume_ratio"] = data["amount"] / avg_amount.mask(avg_amount <= 0)
     data["recovered_from_low"] = (((data["close"] - data["low"]) / price_range) >= 0.45).fillna(False)
     data["breakout"] = (
@@ -142,7 +150,7 @@ def thsdk_monitor_signals(frame: pd.DataFrame, config: StrategyConfig) -> pd.Dat
 
     data["signal"] = _state_from_entry_exit(data)
     data["trade_signal"] = data["signal"].shift(1).fillna(0).astype(int)
-    data["trade_exit_risk"] = data["exit_risk"].shift(1).fillna(False).astype(int)
+    data["trade_exit_risk"] = _filled_bool(data["exit_risk"].shift(1)).astype(int)
     data["trade_score"] = data["score"].shift(1)
     data["market_breadth_ratio"] = 1.0
     data["market_breadth_count"] = 1
@@ -181,9 +189,9 @@ def _market_breadth_frame(histories: dict[str, pd.DataFrame], config: StrategyCo
         market_breadth_count=("available", "sum"),
         market_breadth_above=("above_ma", "sum"),
     )
-    grouped["market_breadth_ratio"] = (
-        grouped["market_breadth_above"] / grouped["market_breadth_count"].replace(0, pd.NA)
-    ).fillna(0.0)
+    grouped["market_breadth_ratio"] = _filled_float(
+        grouped["market_breadth_above"].astype(float) / grouped["market_breadth_count"].replace(0, np.nan).astype(float)
+    )
     grouped["market_breadth_ok"] = (
         (grouped["market_breadth_count"] >= config.market_breadth_min_count)
         & (grouped["market_breadth_ratio"] >= config.market_breadth_min_ratio)
@@ -206,8 +214,8 @@ def _apply_market_breadth_filter(
             errors="ignore",
         ).merge(breadth, on="date", how="left")
         data["market_breadth_count"] = data["market_breadth_count"].fillna(0).astype(int)
-        data["market_breadth_ratio"] = data["market_breadth_ratio"].fillna(0.0)
-        data["market_breadth_ok"] = data["market_breadth_ok"].fillna(False).astype(bool)
+        data["market_breadth_ratio"] = _filled_float(data["market_breadth_ratio"])
+        data["market_breadth_ok"] = _filled_bool(data["market_breadth_ok"])
         base_entry_allowed = data["trade_entry_allowed"].astype(bool) if "trade_entry_allowed" in data else True
         if config.market_breadth_enabled:
             if "entry_candidate" in data and "exit_risk" in data:
@@ -219,7 +227,7 @@ def _apply_market_breadth_filter(
                 data["entry_candidate"] = entry_candidate & data["market_breadth_ok"]
             data["trade_entry_allowed"] = (
                 pd.Series(base_entry_allowed, index=data.index).astype(bool)
-                & data["market_breadth_ok"].shift(1).fillna(False).astype(bool)
+                & _filled_bool(data["market_breadth_ok"].shift(1))
             ).astype(int)
         else:
             data["trade_entry_allowed"] = pd.Series(base_entry_allowed, index=data.index).astype(bool).astype(int)
@@ -229,9 +237,9 @@ def _apply_market_breadth_filter(
 
 def _factor_frame(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     data = frame.sort_values("date").copy()
-    returns = data["close"].pct_change()
-    data["factor_momentum"] = data["close"].pct_change(config.factor_momentum_window)
-    data["factor_reversal"] = -data["close"].pct_change(config.factor_reversal_window)
+    returns = data["close"].pct_change(fill_method=None)
+    data["factor_momentum"] = data["close"].pct_change(config.factor_momentum_window, fill_method=None)
+    data["factor_reversal"] = -data["close"].pct_change(config.factor_reversal_window, fill_method=None)
     data["factor_volatility"] = -returns.rolling(config.factor_volatility_window, min_periods=config.factor_volatility_window).std()
     liquidity = data["amount"].where(data["amount"] > 0, data["volume"] * data["close"])
     data["factor_liquidity"] = liquidity.rolling(
@@ -252,7 +260,7 @@ def _factor_frame(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
         config.factor_volume_price_window,
         min_periods=config.factor_volume_price_window,
     ).corr(volume)
-    volume_change = volume.pct_change().replace([np.inf, -np.inf], pd.NA)
+    volume_change = volume.pct_change(fill_method=None).replace([np.inf, -np.inf], pd.NA)
     intraday_return = (data["close"] / data["open"].where(data["open"] > 0) - 1).replace([np.inf, -np.inf], pd.NA)
     data["factor_volume_price_divergence"] = -volume_change.rolling(
         config.factor_volume_price_window,
@@ -287,7 +295,7 @@ def _factor_frame(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     data["factor_entry_trend"] = (
         data["close"] / moving_average(data["close"], config.factor_entry_trend_window)
     ) - 1
-    data["factor_entry_momentum"] = data["close"].pct_change(config.factor_entry_momentum_window)
+    data["factor_entry_momentum"] = data["close"].pct_change(config.factor_entry_momentum_window, fill_method=None)
     if config.factor_entry_filter_enabled:
         data["factor_entry_ok"] = (
             data["factor_entry_trend"].notna()
@@ -412,14 +420,6 @@ def _momentum_focus_in_scope(board: str, scope: str) -> bool:
     raise ValueError("momentum_focus_board_scope must be one of: main_chinext, all")
 
 
-def _momentum_focus_limit_up_threshold(board: str) -> float:
-    if board in {"chinext", "star"}:
-        return 19.5
-    if board == "bse":
-        return 29.0
-    return 9.8
-
-
 def _annotate_momentum_focus(
     frame: pd.DataFrame,
     code: str,
@@ -427,7 +427,7 @@ def _annotate_momentum_focus(
 ) -> pd.DataFrame:
     data = frame.copy()
     board = _momentum_focus_board(code)
-    data["momentum_change_pct"] = data["close"].pct_change() * 100
+    data["momentum_change_pct"] = data["close"].pct_change(fill_method=None) * 100
     data["momentum_focus_board"] = board
     if not _momentum_focus_in_scope(board, config.momentum_focus_board_scope):
         data["momentum_focus_flag"] = False
@@ -436,27 +436,18 @@ def _annotate_momentum_focus(
         return data
 
     threshold = float(config.momentum_focus_threshold_pct)
-    limit_up_threshold = _momentum_focus_limit_up_threshold(board)
     momentum_change_pct = pd.to_numeric(data["momentum_change_pct"], errors="coerce")
     momentum_focus_flag = momentum_change_pct >= threshold
     data["momentum_focus_flag"] = momentum_focus_flag
     data["momentum_focus_signal"] = np.where(
         momentum_focus_flag,
-        np.where(
-            momentum_change_pct >= limit_up_threshold,
-            "limit_up",
-            "strong_gain",
-        ),
+        "strong_gain",
         "normal",
     )
     data["momentum_focus_boost"] = np.where(
-        momentum_focus_flag & (momentum_change_pct >= limit_up_threshold),
-        float(config.momentum_focus_limit_up_boost),
-        np.where(
-            momentum_focus_flag,
-            float(config.momentum_focus_strong_gain_boost),
-            0.0,
-        ),
+        momentum_focus_flag,
+        float(config.momentum_focus_strong_gain_boost),
+        0.0,
     )
     return data
 
@@ -522,7 +513,7 @@ def multi_factor_signal_frames(histories: dict[str, pd.DataFrame], config: Strat
     for idx, date in enumerate(dates):
         daily = panel[(panel["date"] == date) & panel["factor_score"].notna()].copy()
         if config.factor_entry_filter_enabled:
-            daily = daily[daily["factor_entry_ok"].fillna(False)]
+            daily = daily[_filled_bool(daily["factor_entry_ok"])]
         if idx % rebalance_interval == 0 and not daily.empty:
             daily = daily.sort_values("factor_score", ascending=False)
             current_selection = set(daily.head(max(config.max_positions, 1))["code"].astype(str))
@@ -543,7 +534,7 @@ def multi_factor_signal_frames(histories: dict[str, pd.DataFrame], config: Strat
         out["trade_signal"] = out["signal"].shift(1).fillna(0).astype(int)
         out["trade_score"] = out["score"].shift(1)
         if config.factor_entry_filter_enabled:
-            out["trade_entry_allowed"] = out["factor_entry_ok"].shift(1).fillna(False).astype(int)
+            out["trade_entry_allowed"] = _filled_bool(out["factor_entry_ok"].shift(1)).astype(int)
         else:
             out["trade_entry_allowed"] = 1
         result[str(code)] = _apply_volatility_stop_loss(out.reset_index(drop=True), config)

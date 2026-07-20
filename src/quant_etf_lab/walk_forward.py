@@ -11,6 +11,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ._compat import read_text
+
 from .backtest import BacktestResult, run_backtest
 from .config import LabConfig
 from .data import filter_history_by_date, load_universe_history, parse_market_date
@@ -150,6 +152,9 @@ def build_parameter_grid(config: LabConfig, grid: str = "compact") -> tuple[Para
         "growth_momentum": {"momentum": 0.45, "trend": 0.30, "reversal": 0.05, "volatility": 0.10, "liquidity": 0.10},
         "trend_quality": {"momentum": 0.35, "trend": 0.35, "reversal": 0.05, "volatility": 0.15, "liquidity": 0.10},
         "pullback_growth": {"momentum": 0.35, "trend": 0.25, "reversal": 0.25, "volatility": 0.05, "liquidity": 0.10},
+        "breakout_momentum": {"momentum": 0.60, "trend": 0.25, "reversal": 0.00, "volatility": 0.08, "liquidity": 0.07},
+        "trend_accel": {"momentum": 0.50, "trend": 0.35, "reversal": 0.00, "volatility": 0.10, "liquidity": 0.05},
+        "strong_gain_quality": {"momentum": 0.52, "trend": 0.28, "reversal": 0.05, "volatility": 0.10, "liquidity": 0.05},
     }
     named_factor_sets = {
         name: _preserve_extra_factor_weights(weights, current_weights)
@@ -172,6 +177,16 @@ def build_parameter_grid(config: LabConfig, grid: str = "compact") -> tuple[Para
         ("current", 20),
         ("momentum_trend", 10),
         ("defensive_lowvol", 20),
+    )
+    opportunity_v2_specs = (
+        ("current", 8, 8),
+        ("current", 10, 10),
+        ("current", 20, 10),
+        ("breakout_momentum", 8, 8),
+        ("breakout_momentum", 10, 10),
+        ("trend_accel", 10, 10),
+        ("strong_gain_quality", 15, 12),
+        ("pullback_growth", 10, 10),
     )
     stable_specs = (
         ("broad_balanced", 20, 10),
@@ -253,6 +268,41 @@ def build_parameter_grid(config: LabConfig, grid: str = "compact") -> tuple[Para
                 "drawdown_levels": ((0.10, 0.75), (0.20, 0.55), (0.30, 0.25), (0.35, 0.0)),
                 "protection_drawdown": 0.35,
                 "recovery_drawdown": 0.16,
+            },
+        ),
+    ]
+    opportunity_v2_profiles = [
+        ("risk_current", {}),
+        (
+            "risk_loose",
+            {
+                "benchmark_off_exposure": 0.90,
+                "benchmark_crash_exposure": 0.30,
+                "drawdown_levels": ((0.10, 0.90), (0.20, 0.75), (0.40, 0.0)),
+                "protection_drawdown": 0.40,
+                "recovery_drawdown": 0.20,
+            },
+        ),
+        (
+            "risk_growth_dd40",
+            {
+                "benchmark_off_exposure": 0.70,
+                "benchmark_crash_exposure": 0.10,
+                "benchmark_drop_threshold": -0.07,
+                "drawdown_levels": ((0.12, 0.85), (0.24, 0.60), (0.35, 0.20), (0.40, 0.0)),
+                "protection_drawdown": 0.40,
+                "recovery_drawdown": 0.18,
+            },
+        ),
+        (
+            "risk_growth_on",
+            {
+                "benchmark_off_exposure": 0.90,
+                "benchmark_crash_exposure": 0.20,
+                "benchmark_drop_threshold": -0.08,
+                "drawdown_levels": ((0.15, 0.90), (0.30, 0.65), (0.40, 0.0)),
+                "protection_drawdown": 0.40,
+                "recovery_drawdown": 0.20,
             },
         ),
     ]
@@ -406,6 +456,8 @@ def build_parameter_grid(config: LabConfig, grid: str = "compact") -> tuple[Para
         risk_profiles = bear_profiles
     elif grid == "opportunity":
         risk_profiles = opportunity_profiles
+    elif grid == "opportunity_v2":
+        risk_profiles = opportunity_v2_profiles
     elif grid == "stable":
         risk_profiles = stable_profiles
     elif grid == "stable_v2":
@@ -418,7 +470,7 @@ def build_parameter_grid(config: LabConfig, grid: str = "compact") -> tuple[Para
         risk_profiles = satellite_v2_profiles
     elif grid != "compact":
         raise ValueError(
-            "grid must be 'compact', 'bear', 'opportunity', 'stable', 'stable_v2', 'reversal', 'satellite', 'satellite_v2', or 'risk'."
+            "grid must be 'compact', 'bear', 'opportunity', 'opportunity_v2', 'stable', 'stable_v2', 'reversal', 'satellite', 'satellite_v2', or 'risk'."
         )
 
     candidates: list[ParameterCandidate] = []
@@ -429,6 +481,8 @@ def build_parameter_grid(config: LabConfig, grid: str = "compact") -> tuple[Para
         factor_specs = bear_specs
     elif grid == "opportunity":
         factor_specs = opportunity_specs
+    elif grid == "opportunity_v2":
+        factor_specs = opportunity_v2_specs
     elif grid == "stable":
         factor_specs = stable_specs
     elif grid == "stable_v2":
@@ -664,6 +718,47 @@ def score_training_metrics(
             - drawdown_penalty * 5.0
             - loss_penalty * 0.8
         )
+    if objective == "opportunity_q_full":
+        monthly_win_rate = float((diagnostics or {}).get("monthly_win_rate", 0.0) or 0.0)
+        annual_return_std = float((diagnostics or {}).get("annual_return_std", 0.0) or 0.0)
+        return_concentration = float((diagnostics or {}).get("return_concentration", 0.0) or 0.0)
+        worst_month_return = abs(float((diagnostics or {}).get("worst_month_return", 0.0) or 0.0))
+        base = 0.62 * cagr + 0.46 * total_return + 0.06 * sharpe
+        execution_bonus = 0.15 * win_rate + 0.12 * monthly_win_rate + 0.08 * min(profit_factor, 3.0)
+        exposure_bonus = 0.20 * min(average_risk_exposure, 1.0)
+        utilization_penalty = max(0.0, 0.55 - average_risk_exposure) * 0.35
+        stability_penalty = (
+            annual_return_std * 0.35
+            + max(0.0, return_concentration - 0.72) * 0.60
+            + max(0.0, worst_month_return - 0.18) * 1.05
+        )
+        return (
+            base
+            + execution_bonus
+            + exposure_bonus
+            - drawdown_penalty * 5.2
+            - loss_penalty * 0.75
+            - utilization_penalty
+            - stability_penalty
+            - max(0.0, average_risk_exposure - 1.0) * 0.20
+            - max(0.0, -win_rate) * 0.10
+        )
+    if objective == "opportunity_growth":
+        monthly_win_rate = float((diagnostics or {}).get("monthly_win_rate", 0.0) or 0.0)
+        base = 0.40 * cagr + 0.35 * total_return + 0.20 * sharpe
+        execution_bonus = 0.12 * win_rate + 0.10 * monthly_win_rate + 0.10 * min(profit_factor, 2.5)
+        exposure_bonus = 0.20 * min(average_risk_exposure, 0.95)
+        utilization_penalty = max(0.0, 0.60 - average_risk_exposure) * 0.25
+        return (
+            base
+            + execution_bonus
+            + exposure_bonus
+            - drawdown_penalty * 5.5
+            - loss_penalty * 0.9
+            - utilization_penalty
+            - max(0.0, average_risk_exposure - 1.0) * 0.30
+            - max(0.0, -win_rate) * 0.10
+        )
     if objective == "opportunity_quality":
         monthly_win_rate = float((diagnostics or {}).get("monthly_win_rate", 0.0) or 0.0)
         base = 0.35 * sharpe + 0.40 * cagr + 0.22 * total_return
@@ -679,7 +774,9 @@ def score_training_metrics(
             - overuse_penalty
         )
     if objective not in {"robust", "stable", "satellite"}:
-        raise ValueError("objective must be 'balanced', 'robust', 'stable', 'satellite', 'capital', or 'opportunity_quality'.")
+        raise ValueError(
+            "objective must be 'balanced', 'robust', 'stable', 'satellite', 'capital', 'opportunity_quality', 'opportunity_growth', or 'opportunity_q_full'."
+        )
 
     diagnostics = diagnostics or {}
     worst_year_return = float(diagnostics.get("worst_year_return", 0.0) or 0.0)
@@ -805,17 +902,39 @@ def _candidate_params(candidate: ParameterCandidate) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
+def _candidate_selection_gate_reason(
+    candidate: ParameterCandidate,
+    validation_metrics: dict[str, Any] | None,
+    *,
+    grid: str,
+) -> str | None:
+    if grid != "opportunity_v2" or validation_metrics is None:
+        return None
+    if candidate.name.startswith("current_"):
+        return None
+
+    validation_return = float(validation_metrics.get("total_return", 0.0) or 0.0)
+    validation_sharpe = float(validation_metrics.get("sharpe", 0.0) or 0.0)
+    if validation_return < 0.0:
+        return "non_current_negative_validation_return"
+    if validation_sharpe < 0.0:
+        return "non_current_negative_validation_sharpe"
+    return None
+
+
 def _stitch_oos_equity(results: list[BacktestResult], initial_cash: float) -> pd.DataFrame:
     records: list[pd.DataFrame] = []
-    base_equity = float(initial_cash)
+    window_initial_cash = float(initial_cash)
+    base_equity = window_initial_cash
+    if window_initial_cash <= 0:
+        return pd.DataFrame(columns=["date", "window", "stitched_equity"])
     for result in results:
         equity = result.equity.copy()
         if equity.empty:
             continue
-        first = float(equity["equity"].iloc[0])
-        if first <= 0:
+        if float(equity["equity"].iloc[-1]) <= 0:
             continue
-        equity["stitched_equity"] = equity["equity"] / first * base_equity
+        equity["stitched_equity"] = equity["equity"] / window_initial_cash * base_equity
         equity["window"] = result.run_id
         base_equity = float(equity["stitched_equity"].iloc[-1])
         records.append(equity[["date", "window", "stitched_equity"]])
@@ -835,7 +954,7 @@ def _load_backtest_result(run_dir: Path) -> BacktestResult | None:
     equity_path = run_dir / "equity_curve.csv"
     if not metrics_path.exists() or not equity_path.exists():
         return None
-    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics = json.loads(read_text(metrics_path))
     return BacktestResult(
         run_id=run_dir.name,
         run_dir=run_dir,
@@ -1077,6 +1196,8 @@ This is research analysis only; it does not connect to brokers or provide invest
 - `stable` selection adds penalties for annual return instability, return concentration, deep monthly tail losses, and overly strong training-only statistics.
 - `satellite` selection rewards higher CAGR and participation while still penalizing drawdown breaches, losing years, return concentration, deep monthly tail losses, and too-good-to-trust training statistics.
 - `capital` selection emphasizes higher execution success probability and utilization with weights on win rate and average risk exposure, while still penalizing drawdowns and losses.
+- `opportunity_growth` selection emphasizes high CAGR and absolute return while still penalizing breaches above the drawdown floor, poor execution, and weak risk utilization.
+- `opportunity_q_full` selection emphasizes CAGR/absolute return with controlled tail-risk checks: it favors higher execution quality and participation, keeps a looser under-coverage penalty than conservative modes, and still punishes deep drawdowns and concentrated/unstable return patterns.
 - Signals are computed with prior history for indicator warm-up, then trimmed to the train, validation, or out-of-sample window before backtesting. This avoids future data while preventing short windows from being consumed by factor warm-up.
 - When selection validation months is greater than 0, the latest part of each training window is held out for candidate selection; `selection_train_*` records the fit segment and `validation_*` records the internal validation segment.
 - Each out-of-sample window starts from cash.
@@ -1156,8 +1277,19 @@ def run_walk_forward(
         windows = windows[:window_limit]
     candidates = build_parameter_grid(config, grid=grid)
     candidate_groups = _group_candidates_by_signal(candidates)
-    if objective not in {"balanced", "robust", "stable", "satellite", "capital", "opportunity_quality"}:
-        raise ValueError("objective must be 'balanced', 'robust', 'stable', 'satellite', 'capital', or 'opportunity_quality'.")
+    if objective not in {
+        "balanced",
+        "robust",
+        "stable",
+        "satellite",
+        "capital",
+        "opportunity_quality",
+        "opportunity_growth",
+        "opportunity_q_full",
+    }:
+        raise ValueError(
+            "objective must be 'balanced', 'robust', 'stable', 'satellite', 'capital', 'opportunity_quality', 'opportunity_growth', or 'opportunity_q_full'."
+        )
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     root = output_dir or (config.project_root / "outputs" / "walk_forward")
@@ -1200,6 +1332,7 @@ def run_walk_forward(
                 float | None,
                 BacktestResult | None,
                 dict[str, float],
+                str | None,
             ]
         ] = []
         train_warmup_start = _signal_warmup_start(config, selection_train_start)
@@ -1256,6 +1389,11 @@ def run_walk_forward(
                         objective=objective,
                     )
                     selection_score = validation_score
+                selection_gate_reason = _candidate_selection_gate_reason(
+                    candidate,
+                    validation_result.metrics if validation_result is not None else None,
+                    grid=grid,
+                )
                 train_results.append(
                     (
                         selection_score,
@@ -1265,6 +1403,7 @@ def run_walk_forward(
                         validation_score,
                         validation_result,
                         validation_diagnostics,
+                        selection_gate_reason,
                     )
                 )
                 candidate_row = {
@@ -1279,6 +1418,8 @@ def run_walk_forward(
                     "validation_start": validation_start,
                     "validation_end": validation_end,
                     "objective": objective,
+                    "selection_gate_passed": selection_gate_reason is None,
+                    "selection_gate_reason": selection_gate_reason,
                     "parameters": _candidate_params(candidate),
                     **{f"train_{name}": value for name, value in diagnostics.items()},
                     **_metrics_row("train", train_result.metrics),
@@ -1288,7 +1429,9 @@ def run_walk_forward(
                     candidate_row.update(_metrics_row("validation", validation_result.metrics))
                 candidate_rows.append(candidate_row)
 
-        train_results.sort(key=lambda item: item[0], reverse=True)
+        eligible_train_results = [item for item in train_results if item[7] is None]
+        selection_pool = eligible_train_results or train_results
+        selection_pool.sort(key=lambda item: item[0], reverse=True)
         (
             best_score,
             best_candidate,
@@ -1297,7 +1440,8 @@ def run_walk_forward(
             best_validation_score,
             best_validation_result,
             best_validation_diagnostics,
-        ) = train_results[0]
+            best_selection_gate_reason,
+        ) = selection_pool[0]
         test_config = _candidate_config(config, best_candidate, window.test_start, window.test_end)
         test_run_id = f"walk_forward_{stamp}_{window.name}_{best_candidate.name}_test"
         test_warmup_start = _signal_warmup_start(config, window.test_start)
@@ -1335,6 +1479,7 @@ def run_walk_forward(
                     diagnostics=best_diagnostics,
                 ),
                 "selected_validation_score": best_validation_score,
+                "selected_selection_gate_reason": best_selection_gate_reason,
                 "selection_validation_months": int(selection_validation_months),
                 "selection_train_start": selection_train_start,
                 "selection_train_end": selection_train_end,

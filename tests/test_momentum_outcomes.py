@@ -27,7 +27,7 @@ def test_build_momentum_events_labels_limit_up_and_forward_returns_without_futur
 
     by_date = events.set_index("date")
     assert "2026-01-02" in by_date.index
-    assert by_date.loc["2026-01-02", "signal_type"] == "limit_up"
+    assert by_date.loc["2026-01-02", "signal_type"] == "strong_gain_7"
     assert bool(by_date.loc["2026-01-02", "limit_up"]) is True
     assert round(float(by_date.loc["2026-01-02", "return_1d"]), 6) == 0.10
     assert round(float(by_date.loc["2026-01-02", "return_3d"]), 6) == round(12.2 / 11.0 - 1.0, 6)
@@ -92,5 +92,5 @@ def test_momentum_outcomes_cli_parser_defaults() -> None:
     assert args.data_dir == "data/processed/stocks"
     assert args.output_dir == "outputs/research/momentum_outcomes_latest"
     assert args.horizons == "1,3,5,10"
-    assert args.strong_gain_threshold_pct == 7.0
+    assert args.strong_gain_threshold_pct == 5.0
     assert args.board_scope == "main_chinext"

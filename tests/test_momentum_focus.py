@@ -47,7 +47,7 @@ def _write_fake_ingest(root: Path) -> None:
     (scripts / "market_data_utils.py").write_text(FAKE_MARKET_DATA_UTILS, encoding="utf-8")
 
 
-def test_build_momentum_focus_candidates_keeps_limit_up_and_7pct_main_chinext_only() -> None:
+def test_build_momentum_focus_candidates_keeps_5pct_strong_gainers_main_chinext_only() -> None:
     rows = [
         {"trade_date": "2026-06-15", "security_code": "000001", "security_name": "MainLimit", "change_ratio": 10.01, "close_price": 11.0, "turnover": 300_000_000},
         {"trade_date": "2026-06-15", "security_code": "300001", "security_name": "ChiLimit", "change_ratio": 20.02, "close_price": 24.0, "turnover": 800_000_000},
@@ -60,17 +60,39 @@ def test_build_momentum_focus_candidates_keeps_limit_up_and_7pct_main_chinext_on
 
     candidates, payload = build_momentum_focus_candidates(rows, as_of_date="2026-06-15")
 
-    assert candidates["code"].tolist() == ["300001", "000001", "002001"]
-    assert payload["candidate_count"] == 3
+    assert candidates["code"].tolist() == ["300001", "000001", "002001", "600001"]
+    assert payload["candidate_count"] == 4
     assert payload["limit_up_count"] == 2
-    assert payload["strong_gain_count"] == 3
+    assert payload["strong_gain_count"] == 4
     assert payload["excluded_non_main_chinext_count"] == 2
-    assert payload["below_threshold_count"] == 2
+    assert payload["below_threshold_count"] == 1
+    assert payload["volume_positive_count"] == 0
+    assert payload["turnover_positive_count"] == len(rows)
+    assert payload["volume_coverage_ratio"] == 0.0
+    assert payload["turnover_coverage_ratio"] == 1.0
+    assert payload["market_data_quality_status"] == "partial"
     by_code = candidates.set_index("code")
-    assert by_code.loc["300001", "signal_type"] == "limit_up"
-    assert by_code.loc["002001", "signal_type"] == "strong_gain_7pct"
+    assert by_code.loc["300001", "signal_type"] == "strong_gain_5"
+    assert by_code.loc["002001", "signal_type"] == "strong_gain_5"
     assert by_code.loc["002001", "name"] == "未知"
     assert bool(by_code.loc["002001", "limit_up"]) is False
+
+
+def test_build_momentum_focus_candidates_excludes_review_required_codes() -> None:
+    rows = [
+        {"trade_date": "2026-07-20", "security_code": "300001", "security_name": "Excluded", "change_ratio": 20.0, "turnover": 800_000_000},
+        {"trade_date": "2026-07-20", "security_code": "300002", "security_name": "Kept", "change_ratio": 10.0, "turnover": 500_000_000},
+    ]
+
+    candidates, payload = build_momentum_focus_candidates(
+        rows,
+        as_of_date="2026-07-20",
+        excluded_codes={"300001"},
+    )
+
+    assert candidates["code"].tolist() == ["300002"]
+    assert payload["excluded_by_review_required_count"] == 1
+    assert payload["excluded_by_review_required_codes"] == ["300001"]
 
 
 def test_build_momentum_focus_candidates_enriches_with_outcome_priors() -> None:
@@ -81,7 +103,7 @@ def test_build_momentum_focus_candidates_enriches_with_outcome_priors() -> None:
     outcome_summary = pd.DataFrame(
         [
             {
-                "signal_type": "limit_up",
+                "signal_type": "strong_gain_7",
                 "board": "chinext",
                 "amount_bucket": "lt_1y",
                 "horizon": 5,
@@ -92,7 +114,7 @@ def test_build_momentum_focus_candidates_enriches_with_outcome_priors() -> None:
                 "avg_amount_yi": 0.6,
             },
             {
-                "signal_type": "limit_up",
+                "signal_type": "strong_gain_7",
                 "board": "main",
                 "amount_bucket": "lt_1y",
                 "horizon": 5,
@@ -205,7 +227,7 @@ def test_run_momentum_focus_reads_daily_hub_after_ingest_status_check(tmp_path: 
 
     assert result.snapshot["status"] == "ok"
     assert result.snapshot["source_kind"] == "daily_market_data_csv"
-    assert result.snapshot["candidate_count"] == 2
+    assert result.snapshot["candidate_count"] == 3
     assert result.snapshot["limit_up_count"] == 2
     assert result.candidates_path.exists()
     assert result.report_path.exists()
@@ -285,7 +307,7 @@ def test_momentum_focus_cli_parser_defaults() -> None:
     assert args.data_cache_dir == "D:/codex/daily-market-data"
     assert args.ingest_project_dir == "D:/codex/2026-06-15-exchange-data-ingest"
     assert args.trade_date is None
-    assert args.strong_gain_threshold_pct == 7.0
+    assert args.strong_gain_threshold_pct == 5.0
     assert args.board_scope == "main_chinext"
     assert args.outcome_summary_path == "outputs/research/momentum_outcomes_latest/momentum_outcome_summary.csv"
     assert args.name_map_path == "data/processed/stock_name_map.csv"

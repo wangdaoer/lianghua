@@ -21,12 +21,17 @@ from .dashboard import DailyDashboardResult, run_daily_dashboard
 from .daily_alerts import DailyAlertsResult, write_daily_alerts
 from .daily_check import DailyModelCheckResult, run_daily_model_check
 from .live_shadow import LiveShadowPreflightResult, LiveShadowResult, run_live_shadow, run_live_shadow_preflight
-from .market_data_source import DEFAULT_DAILY_MARKET_DATA_DIR
+from .market_data_source import DEFAULT_DAILY_MARKET_DATA_DIR, load_market_snapshot_rows
 from .momentum_focus import DEFAULT_OUTPUT_DIR as DEFAULT_MOMENTUM_FOCUS_OUTPUT
 from .momentum_focus import DEFAULT_OUTCOME_SUMMARY_PATH, MomentumFocusResult, run_momentum_focus
 from .paper_account import PaperAccountResult, run_paper_account, write_stock_target_review_decision_template_xlsx
 from .pipeline_history import PipelineHistoryReviewResult, run_pipeline_history_review
 from .satellite_risk_budget import SatelliteRiskBudgetReviewResult, run_satellite_risk_budget_review
+from .satellite_trial_replay import (
+    DEFAULT_HORIZONS as DEFAULT_SATELLITE_TRIAL_REPLAY_HORIZONS,
+)
+from .satellite_trial_replay import DEFAULT_OUTPUT_DIR as DEFAULT_SATELLITE_TRIAL_REPLAY_OUTPUT
+from .satellite_trial_replay import SatelliteTrialReplayResult, run_satellite_trial_replay
 from .live_preflight import LivePreflightResult, run_live_preflight
 from .trading_gate import build_a_share_trading_gate
 
@@ -43,6 +48,7 @@ DEFAULT_HISTORY_REVIEW_OUTPUT = Path("outputs/research/pipeline_history_review_l
 DEFAULT_HISTORY_REVIEW_BASE = Path("outputs/research/pipeline_history_review")
 DEFAULT_SATELLITE_RISK_BUDGET_OUTPUT = Path("outputs/research/satellite_risk_budget_review_latest")
 DEFAULT_SATELLITE_RISK_BUDGET_BASE = Path("outputs/research/satellite_risk_budget_review")
+DEFAULT_SATELLITE_TRIAL_REPLAY_BASE = Path("outputs/research/satellite_trial_replay")
 DEFAULT_LIVE_SHADOW_OUTPUT = Path("outputs/research/live_shadow_latest")
 DEFAULT_LIVE_SHADOW_BASE = Path("outputs/research/live_shadow")
 DEFAULT_LIVE_PRE_FLIGHT_OUTPUT = Path("outputs/research/live_preflight_latest")
@@ -69,10 +75,14 @@ HISTORY_COLUMNS = [
     "sentiment_freshness_status",
     "trigger_freshness_status",
     "momentum_focus_status",
+    "momentum_focus_market_data_quality_status",
+    "momentum_focus_volume_coverage_ratio",
+    "momentum_focus_turnover_coverage_ratio",
     "momentum_focus_candidate_count",
     "momentum_focus_limit_up_count",
     "momentum_focus_strong_gain_count",
     "momentum_focus_excluded_special_treatment_count",
+    "momentum_focus_excluded_by_review_required_count",
     "momentum_focus_source_kind",
     "momentum_focus_trade_date",
     "momentum_focus_outcome_prior_rows",
@@ -229,6 +239,18 @@ HISTORY_COLUMNS = [
     "satellite_risk_budget_report_path",
     "satellite_risk_budget_snapshot_path",
     "satellite_risk_budget_checklist_path",
+    "satellite_trial_rule_count",
+    "satellite_trial_rules_path",
+    "satellite_trial_rules_json_path",
+    "satellite_trial_replay_status",
+    "satellite_trial_replay_matched_event_count",
+    "satellite_trial_replay_best_horizon",
+    "satellite_trial_replay_best_avg_return_edge",
+    "satellite_trial_replay_best_win_rate_edge",
+    "satellite_trial_replay_report_path",
+    "satellite_trial_replay_summary_path",
+    "satellite_trial_replay_matches_path",
+    "satellite_trial_replay_snapshot_path",
     "live_shadow_status",
     "live_shadow_error",
     "live_shadow_output_dir",
@@ -339,6 +361,7 @@ class DailyPipelineResult:
     history_path: Path | None
     history_review_result: PipelineHistoryReviewResult | None
     satellite_risk_budget_result: SatelliteRiskBudgetReviewResult | None
+    satellite_trial_replay_result: SatelliteTrialReplayResult | None
     live_shadow_result: LiveShadowResult | None
     live_shadow_preflight_result: LiveShadowPreflightResult | None
     live_preflight_result: LivePreflightResult | None
@@ -382,6 +405,11 @@ def _momentum_focus_context(result: MomentumFocusResult) -> dict[str, Any]:
     snapshot = result.snapshot
     return {
         "momentum_focus_status": snapshot.get("status"),
+        "momentum_focus_market_data_quality_status": snapshot.get("market_data_quality_status"),
+        "momentum_focus_volume_positive_count": snapshot.get("volume_positive_count"),
+        "momentum_focus_turnover_positive_count": snapshot.get("turnover_positive_count"),
+        "momentum_focus_volume_coverage_ratio": snapshot.get("volume_coverage_ratio"),
+        "momentum_focus_turnover_coverage_ratio": snapshot.get("turnover_coverage_ratio"),
         "momentum_focus_output_dir": str(result.output_dir),
         "momentum_focus_report_path": str(result.report_path),
         "momentum_focus_candidates_path": str(result.candidates_path),
@@ -390,6 +418,7 @@ def _momentum_focus_context(result: MomentumFocusResult) -> dict[str, Any]:
         "momentum_focus_limit_up_count": snapshot.get("limit_up_count"),
         "momentum_focus_strong_gain_count": snapshot.get("strong_gain_count"),
         "momentum_focus_excluded_special_treatment_count": snapshot.get("excluded_special_treatment_count"),
+        "momentum_focus_excluded_by_review_required_count": snapshot.get("excluded_by_review_required_count"),
         "momentum_focus_source_kind": snapshot.get("source_kind"),
         "momentum_focus_trade_date": snapshot.get("trade_date"),
         "momentum_focus_board_scope": snapshot.get("board_scope"),
@@ -603,8 +632,10 @@ def _failed_paper_account_result(output_dir: Path, as_of: date | None, error: st
     }
     stock_targets_payload = {
         "stock_target_count": 0,
+        "source_stock_target_count": 0,
         "active_stock_target_count": 0,
         "suppressed_stock_count": 0,
+        "review_required_excluded_count": 0,
         "stock_tracking_max_market_cap_yi": None,
         "stock_tracking_excluded_large_market_cap_count": 0,
         "stock_tracking_allowed_count": 0,
@@ -968,36 +999,53 @@ def _add_history_context(snapshot: dict[str, Any], previous: dict[str, Any] | No
     )
 
 
-def _append_history(snapshot: dict[str, Any], history_path: Path, as_of: date) -> None:
+def _append_history(snapshot: dict[str, Any], history_path: Path, as_of: date) -> pd.DataFrame:
     history = _read_history(history_path)
     previous = _previous_history_row(history, as_of)
     _add_history_context(snapshot, previous)
 
     row = {column: _history_cell_value(snapshot.get(column)) for column in HISTORY_COLUMNS}
-    combined = pd.concat([history[HISTORY_COLUMNS], pd.DataFrame([row])], ignore_index=True)
+    combined = history[HISTORY_COLUMNS].astype("object").copy()
+    records = combined.where(pd.notna(combined), None).to_dict(orient="records")
+    records.append(row)
+    combined = pd.DataFrame.from_records(records, columns=HISTORY_COLUMNS, coerce_float=False)
     history_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(history_path, index=False)
 
     snapshot["history_status"] = "appended"
     snapshot["history_path"] = str(history_path)
     snapshot["history_row_count"] = int(len(combined))
+    return combined
 
 
-def _update_latest_history_row(snapshot: dict[str, Any], history_path: Path) -> None:
-    if not history_path.exists():
-        return
-    history = _read_history(history_path)
+def _update_history_frame(snapshot: dict[str, Any], history: pd.DataFrame) -> pd.DataFrame:
     if history.empty:
-        return
+        return history
     mask = (
         (history["generated_at"].astype(str) == str(snapshot.get("generated_at")))
         & (history["as_of_date"].astype(str) == str(snapshot.get("as_of_date")))
     )
     if not mask.any():
         mask = history.index == history.index[-1]
-    history[HISTORY_COLUMNS] = history[HISTORY_COLUMNS].astype("object")
+    current = history.loc[mask].iloc[-1]
+    changed_columns: list[str] = []
+    changed_values: list[Any] = []
     for column in HISTORY_COLUMNS:
-        history.loc[mask, column] = _history_cell_value(snapshot.get(column))
+        value = _history_cell_value(snapshot.get(column))
+        existing = current.get(column)
+        existing_missing = bool(pd.isna(existing))
+        value_missing = value is None or bool(pd.isna(value))
+        if (existing_missing and value_missing) or (not existing_missing and not value_missing and existing == value):
+            continue
+        changed_columns.append(column)
+        changed_values.append(value)
+    if changed_columns:
+        history[changed_columns] = history[changed_columns].astype("object")
+        history.loc[mask, changed_columns] = [changed_values] * int(mask.sum())
+    return history
+
+
+def _write_history(history: pd.DataFrame, history_path: Path) -> None:
     history.to_csv(history_path, index=False)
 
 
@@ -1398,8 +1446,17 @@ This pipeline is a research-only after-close workflow. It does not connect to br
 | Recommended satellite budget | {_pct(snapshot.get("satellite_risk_budget_recommended_satellite_weight"))} |
 | Selected outcome horizon | `{snapshot.get("satellite_risk_budget_selected_horizon", "N/A")}` |
 | Ready outcome horizons | {snapshot.get("satellite_risk_budget_ready_horizon_count", "N/A")} |
+| Satellite trial rules | {snapshot.get("satellite_trial_rule_count", "N/A")} |
 | Review report | `{snapshot.get("satellite_risk_budget_report_path", "N/A")}` |
 | Checklist CSV | `{snapshot.get("satellite_risk_budget_checklist_path", "N/A")}` |
+| Trial rules CSV | `{snapshot.get("satellite_trial_rules_path", "N/A")}` |
+| Trial rules JSON | `{snapshot.get("satellite_trial_rules_json_path", "N/A")}` |
+| Trial replay status | `{snapshot.get("satellite_trial_replay_status", "N/A")}` |
+| Trial replay matched events | {snapshot.get("satellite_trial_replay_matched_event_count", "N/A")} |
+| Trial replay best horizon | `{snapshot.get("satellite_trial_replay_best_horizon", "N/A")}` |
+| Trial replay avg-return edge | {_signed_pct(snapshot.get("satellite_trial_replay_best_avg_return_edge"))} |
+| Trial replay win-rate edge | {_signed_pct(snapshot.get("satellite_trial_replay_best_win_rate_edge"))} |
+| Trial replay report | `{snapshot.get("satellite_trial_replay_report_path", "N/A")}` |
 
 ## 涨停与强势股研究池
 
@@ -1408,10 +1465,14 @@ This pipeline is a research-only after-close workflow. It does not connect to br
 | 状态 | `{snapshot.get("momentum_focus_status", "N/A")}` |
 | 行情日期 | {snapshot.get("momentum_focus_trade_date", "N/A")} |
 | 数据来源 | `{snapshot.get("momentum_focus_source_kind", "N/A")}` |
+| 量额数据质量 | `{snapshot.get("momentum_focus_market_data_quality_status", "N/A")}` |
+| 成交量有效行数/覆盖率 | {snapshot.get("momentum_focus_volume_positive_count", "N/A")} / {_pct(snapshot.get("momentum_focus_volume_coverage_ratio"))} |
+| 成交额有效行数/覆盖率 | {snapshot.get("momentum_focus_turnover_positive_count", "N/A")} / {_pct(snapshot.get("momentum_focus_turnover_coverage_ratio"))} |
 | 候选数量 | {snapshot.get("momentum_focus_candidate_count", "N/A")} |
 | 涨停数量 | {snapshot.get("momentum_focus_limit_up_count", "N/A")} |
 | 涨幅大于等于7%数量 | {snapshot.get("momentum_focus_strong_gain_count", "N/A")} |
 | ST/退市排除数量 | {snapshot.get("momentum_focus_excluded_special_treatment_count", "N/A")} |
+| 复核硬排除数量 | {snapshot.get("momentum_focus_excluded_by_review_required_count", "N/A")} |
 | 研究范围 | `{snapshot.get("momentum_focus_board_scope", "N/A")}` |
 | 涨幅阈值 | {_num(snapshot.get("momentum_focus_strong_gain_threshold_pct"), 2)}% |
 | 先验样本行数 | {snapshot.get("momentum_focus_outcome_prior_rows", "N/A")} |
@@ -1457,8 +1518,10 @@ This pipeline is a research-only after-close workflow. It does not connect to br
 | Stock targets report | `{snapshot.get("paper_stock_targets_report_path", "N/A")}` |
 | Stock targets CSV | `{snapshot.get("paper_stock_targets_path", "N/A")}` |
 | Stock target rows | {snapshot.get("paper_stock_target_count", "N/A")} |
+| Source rows before review exclusion | {snapshot.get("paper_stock_target_source_count", "N/A")} |
 | Active stock targets | {snapshot.get("paper_active_stock_target_count", "N/A")} |
 | Suppressed stock rows | {snapshot.get("paper_suppressed_stock_target_count", "N/A")} |
+| Review-required rows excluded | {snapshot.get("paper_stock_target_review_excluded_count", "N/A")} |
 | Large-cap tracking exclusions | {snapshot.get("paper_stock_tracking_excluded_large_market_cap_count", "N/A")} |
 | Max tracking market cap | {snapshot.get("paper_stock_tracking_max_market_cap_yi", "N/A")} Yi Yuan |
 | Market-cap missing rows | {snapshot.get("paper_stock_tracking_market_cap_missing_count", "N/A")} |
@@ -1647,6 +1710,7 @@ This pipeline is a research-only after-close workflow. It does not connect to br
 - Model build audit: `{snapshot.get("model_audit_report_path")}`
 - Allocator promotion review: `{snapshot.get("promotion_report_path")}`
 - Satellite risk-budget review: `{snapshot.get("satellite_risk_budget_report_path")}`
+- Satellite trial replay: `{snapshot.get("satellite_trial_replay_report_path")}`
 - Momentum focus pool: `{snapshot.get("momentum_focus_report_path")}`
 - Chip-reversal candidate outcomes: `{snapshot.get("chip_reversal_candidate_outcomes_report_path")}`
 - Live shadow plan: `{snapshot.get("live_shadow_report_path")}`
@@ -1675,6 +1739,8 @@ def run_daily_pipeline(
     history_path: str | Path | None = DEFAULT_PIPELINE_HISTORY,
     history_review_output_dir: str | Path | None = None,
     satellite_risk_budget_output_dir: str | Path | None = None,
+    satellite_trial_replay_output_dir: str | Path | None = None,
+    satellite_trial_replay_horizons: str | Iterable[str] = DEFAULT_SATELLITE_TRIAL_REPLAY_HORIZONS,
     network_lab_snapshot: str | Path | None = None,
     network_max_cluster_count_warning: int = 1,
     network_residual_mi_warning: float = 0.20,
@@ -1694,7 +1760,7 @@ def run_daily_pipeline(
     min_cache_fresh_ratio: float = 0.90,
     rebalance_cost_rate: float = 0.0,
     stock_market_cap_path: str | Path | None = None,
-    stock_tracking_max_market_cap_yi: float = 1500.0,
+    stock_tracking_max_market_cap_yi: float = 0.0,
     stock_review_notes_path: str | Path | None = None,
     stock_review_outcomes_history_path: str | Path | None = None,
     stock_review_drawdown_threshold: float = -0.10,
@@ -1714,7 +1780,7 @@ def run_daily_pipeline(
     as_of_date: str | date | None = None,
     date_stamp: bool = True,
     momentum_focus_board_scope: str = "main_chinext",
-    momentum_focus_strong_gain_threshold_pct: float = 7.0,
+    momentum_focus_strong_gain_threshold_pct: float = 5.0,
     momentum_focus_outcome_summary_path: str | Path | None = None,
     momentum_focus_target_horizon: int = 5,
     chip_reversal_candidate_outcomes: bool = False,
@@ -1790,6 +1856,14 @@ def run_daily_pipeline(
         as_of,
         date_stamp,
     )
+    resolved_satellite_trial_replay_output = _resolve_dated_output(
+        root,
+        satellite_trial_replay_output_dir,
+        DEFAULT_SATELLITE_TRIAL_REPLAY_OUTPUT,
+        DEFAULT_SATELLITE_TRIAL_REPLAY_BASE,
+        as_of,
+        date_stamp,
+    )
     resolved_live_shadow_output = _resolve_dated_output(
         root,
         live_shadow_output_dir,
@@ -1836,6 +1910,16 @@ def run_daily_pipeline(
         as_of_date=as_of,
         date_stamp=False,
     )
+    dashboard_summary_cache: dict[str, dict[str, Any]] = {}
+    shared_market_snapshot = None
+    if _should_run_momentum_focus(data_cache_dir):
+        try:
+            shared_market_snapshot = load_market_snapshot_rows(
+                daily_data_dir=data_cache_dir,
+                require_success=True,
+            )
+        except (FileNotFoundError, ImportError, RuntimeError, ValueError):
+            shared_market_snapshot = None
     try:
         paper_result = run_paper_account(
             project_root=root,
@@ -1854,6 +1938,7 @@ def run_daily_pipeline(
             stock_review_watch_score_threshold=stock_review_watch_score_threshold,
             stock_review_outcome_min_evaluable=stock_review_outcome_min_evaluable,
             stock_review_outcome_min_group_evaluable=stock_review_outcome_min_group_evaluable,
+            market_snapshot=shared_market_snapshot,
         )
         paper_account_status = "ok"
         paper_account_error = None
@@ -1861,6 +1946,8 @@ def run_daily_pipeline(
         paper_account_status = "failed"
         paper_account_error = str(error)
         paper_result = _failed_paper_account_result(resolved_paper_output, as_of, paper_account_error)
+    dashboard_artifacts_published = not run_history_review
+    dashboard_publish_attempted = dashboard_artifacts_published
     dashboard_result = run_daily_dashboard(
         project_root=root,
         output_dir=resolved_dashboard_output,
@@ -1875,6 +1962,9 @@ def run_daily_pipeline(
         max_staleness_days=max_staleness_days,
         min_cache_fresh_ratio=min_cache_fresh_ratio,
         date_stamp=False,
+        summary_cache=dashboard_summary_cache,
+        market_snapshot=shared_market_snapshot,
+        publish_artifacts=dashboard_artifacts_published,
     )
 
     momentum_focus_result: MomentumFocusResult | None = None
@@ -1891,6 +1981,16 @@ def run_daily_pipeline(
                 strong_gain_threshold_pct=momentum_focus_strong_gain_threshold_pct,
                 outcome_summary_path=resolved_momentum_focus_summary_path,
                 target_horizon=momentum_focus_target_horizon,
+                excluded_codes=set(
+                    paper_result.stock_target_review.loc[
+                        paper_result.stock_target_review.get("observation_excluded", False).astype(bool),
+                        "code",
+                    ].astype(str)
+                )
+                if not paper_result.stock_target_review.empty
+                and "observation_excluded" in paper_result.stock_target_review.columns
+                else set(),
+                market_snapshot=shared_market_snapshot,
             )
             momentum_focus_snapshot = _momentum_focus_context(momentum_focus_result)
         except Exception as error:  # Momentum focus is research context and should not block the core daily report.
@@ -1901,9 +2001,15 @@ def run_daily_pipeline(
                 "momentum_focus_candidates_path": str(resolved_momentum_focus_output / "momentum_focus_candidates.csv"),
                 "momentum_focus_snapshot_path": str(resolved_momentum_focus_output / "momentum_focus_snapshot.json"),
                 "momentum_focus_candidate_count": 0,
+                "momentum_focus_market_data_quality_status": "error",
+                "momentum_focus_volume_positive_count": 0,
+                "momentum_focus_turnover_positive_count": 0,
+                "momentum_focus_volume_coverage_ratio": 0.0,
+                "momentum_focus_turnover_coverage_ratio": 0.0,
                 "momentum_focus_limit_up_count": 0,
                 "momentum_focus_strong_gain_count": 0,
                 "momentum_focus_excluded_special_treatment_count": 0,
+                "momentum_focus_excluded_by_review_required_count": 0,
                 "momentum_focus_source_kind": None,
                 "momentum_focus_trade_date": None,
                 "momentum_focus_board_scope": momentum_focus_board_scope,
@@ -1928,9 +2034,15 @@ def run_daily_pipeline(
             "momentum_focus_candidates_path": str(resolved_momentum_focus_output / "momentum_focus_candidates.csv"),
             "momentum_focus_snapshot_path": str(resolved_momentum_focus_output / "momentum_focus_snapshot.json"),
             "momentum_focus_candidate_count": 0,
+            "momentum_focus_market_data_quality_status": "not_run",
+            "momentum_focus_volume_positive_count": 0,
+            "momentum_focus_turnover_positive_count": 0,
+            "momentum_focus_volume_coverage_ratio": 0.0,
+            "momentum_focus_turnover_coverage_ratio": 0.0,
             "momentum_focus_limit_up_count": 0,
             "momentum_focus_strong_gain_count": 0,
             "momentum_focus_excluded_special_treatment_count": 0,
+            "momentum_focus_excluded_by_review_required_count": 0,
             "momentum_focus_source_kind": None,
             "momentum_focus_trade_date": None,
             "momentum_focus_board_scope": momentum_focus_board_scope,
@@ -2074,8 +2186,10 @@ def run_daily_pipeline(
         "paper_stock_targets_json_path": str(paper_result.stock_targets_json_path),
         "paper_stock_targets_report_path": str(paper_result.stock_targets_report_path),
         "paper_stock_target_count": paper_result.stock_targets_payload.get("stock_target_count"),
+        "paper_stock_target_source_count": paper_result.stock_targets_payload.get("source_stock_target_count"),
         "paper_active_stock_target_count": paper_result.stock_targets_payload.get("active_stock_target_count"),
         "paper_suppressed_stock_target_count": paper_result.stock_targets_payload.get("suppressed_stock_count"),
+        "paper_stock_target_review_excluded_count": paper_result.stock_targets_payload.get("review_required_excluded_count"),
         "paper_stock_tracking_max_market_cap_yi": paper_result.stock_targets_payload.get("stock_tracking_max_market_cap_yi"),
         "paper_stock_tracking_excluded_large_market_cap_count": paper_result.stock_targets_payload.get("stock_tracking_excluded_large_market_cap_count"),
         "paper_stock_tracking_allowed_count": paper_result.stock_targets_payload.get("stock_tracking_allowed_count"),
@@ -2403,6 +2517,7 @@ def run_daily_pipeline(
     snapshot["pipeline_report_path"] = str(report_path)
 
     satellite_risk_budget_result: SatelliteRiskBudgetReviewResult | None = None
+    satellite_trial_replay_result: SatelliteTrialReplayResult | None = None
     try:
         snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
         satellite_risk_budget_result = run_satellite_risk_budget_review(
@@ -2430,6 +2545,11 @@ def run_daily_pipeline(
                 "satellite_risk_budget_ready_horizon_count": satellite_risk_budget_result.snapshot.get(
                     "outcome_ready_horizon_count"
                 ),
+                "satellite_trial_rule_count": satellite_risk_budget_result.snapshot.get("satellite_trial_rule_count"),
+                "satellite_trial_rules_path": satellite_risk_budget_result.snapshot.get("satellite_trial_rules_path"),
+                "satellite_trial_rules_json_path": satellite_risk_budget_result.snapshot.get(
+                    "satellite_trial_rules_json_path"
+                ),
             }
         )
     except Exception as error:  # Keep the main daily report available if optional budget review fails.
@@ -2447,13 +2567,81 @@ def run_daily_pipeline(
                 "satellite_risk_budget_report_path": None,
                 "satellite_risk_budget_snapshot_path": None,
                 "satellite_risk_budget_checklist_path": None,
+                "satellite_trial_rule_count": 0,
+                "satellite_trial_rules_path": None,
+                "satellite_trial_rules_json_path": None,
+            }
+        )
+
+    if satellite_risk_budget_result is not None:
+        try:
+            satellite_trial_replay_result = run_satellite_trial_replay(
+                rules_path=Path(str(satellite_risk_budget_result.snapshot.get("satellite_trial_rules_path"))),
+                outcomes_history_path=paper_result.stock_target_review_outcomes_history_path,
+                output_dir=resolved_satellite_trial_replay_output,
+                horizons=satellite_trial_replay_horizons,
+            )
+            snapshot.update(
+                {
+                    "satellite_trial_replay_status": satellite_trial_replay_result.snapshot.get("status"),
+                    "satellite_trial_replay_output_dir": str(satellite_trial_replay_result.output_dir),
+                    "satellite_trial_replay_matched_event_count": satellite_trial_replay_result.snapshot.get(
+                        "matched_event_count"
+                    ),
+                    "satellite_trial_replay_best_horizon": satellite_trial_replay_result.snapshot.get(
+                        "union_best_horizon"
+                    ),
+                    "satellite_trial_replay_best_avg_return_edge": satellite_trial_replay_result.snapshot.get(
+                        "union_best_avg_return_edge"
+                    ),
+                    "satellite_trial_replay_best_win_rate_edge": satellite_trial_replay_result.snapshot.get(
+                        "union_best_win_rate_edge"
+                    ),
+                    "satellite_trial_replay_report_path": str(satellite_trial_replay_result.report_path),
+                    "satellite_trial_replay_summary_path": str(satellite_trial_replay_result.summary_path),
+                    "satellite_trial_replay_matches_path": str(satellite_trial_replay_result.matches_path),
+                    "satellite_trial_replay_snapshot_path": str(satellite_trial_replay_result.snapshot_path),
+                    "satellite_trial_replay_error": None,
+                }
+            )
+        except Exception as error:  # Optional replay evidence must not block the daily research report.
+            snapshot.update(
+                {
+                    "satellite_trial_replay_status": "failed",
+                    "satellite_trial_replay_output_dir": str(resolved_satellite_trial_replay_output),
+                    "satellite_trial_replay_matched_event_count": 0,
+                    "satellite_trial_replay_best_horizon": None,
+                    "satellite_trial_replay_best_avg_return_edge": None,
+                    "satellite_trial_replay_best_win_rate_edge": None,
+                    "satellite_trial_replay_report_path": None,
+                    "satellite_trial_replay_summary_path": None,
+                    "satellite_trial_replay_matches_path": None,
+                    "satellite_trial_replay_snapshot_path": None,
+                    "satellite_trial_replay_error": str(error),
+                }
+            )
+    else:
+        snapshot.update(
+            {
+                "satellite_trial_replay_status": "skipped_risk_budget_failed",
+                "satellite_trial_replay_output_dir": str(resolved_satellite_trial_replay_output),
+                "satellite_trial_replay_matched_event_count": 0,
+                "satellite_trial_replay_best_horizon": None,
+                "satellite_trial_replay_best_avg_return_edge": None,
+                "satellite_trial_replay_best_win_rate_edge": None,
+                "satellite_trial_replay_report_path": None,
+                "satellite_trial_replay_summary_path": None,
+                "satellite_trial_replay_matches_path": None,
+                "satellite_trial_replay_snapshot_path": None,
+                "satellite_trial_replay_error": "satellite_risk_budget_review_failed",
             }
         )
 
     resolved_history_path = _resolve(root, history_path, DEFAULT_PIPELINE_HISTORY) if history_path is not None else None
+    history_frame: pd.DataFrame | None = None
     if resolved_history_path is not None:
         try:
-            _append_history(snapshot, resolved_history_path, as_of)
+            history_frame = _append_history(snapshot, resolved_history_path, as_of)
         except OSError as error:
             _add_history_context(snapshot, None)
             snapshot["history_status"] = "failed"
@@ -2487,6 +2675,7 @@ def run_daily_pipeline(
                 max_staleness_days=max_staleness_days,
                 drawdown_watch_threshold=history_review_drawdown_watch_threshold,
                 min_sharpe_watch=history_review_min_sharpe_watch,
+                history_frame=history_frame,
             )
             snapshot.update(_history_review_context(history_review_result))
         except Exception as error:  # Keep the main daily report available if optional review fails.
@@ -2536,6 +2725,9 @@ def run_daily_pipeline(
                 max_staleness_days=max_staleness_days,
                 min_cache_fresh_ratio=min_cache_fresh_ratio,
                 date_stamp=False,
+                summary_cache=dashboard_summary_cache,
+                market_snapshot=shared_market_snapshot,
+                publish_artifacts=False,
             )
             snapshot.update(_dashboard_history_context(dashboard_result))
         except Exception as error:  # Dashboard history context is useful but should not block the daily report.
@@ -2565,11 +2757,13 @@ def run_daily_pipeline(
         snapshot,
         resolved_output,
         stock_target_review_warning_only_after_close=stock_review_warning_only_after_close,
+        publish_artifacts=False,
     )
     snapshot.update(_alerts_context(alerts_result))
     snapshot.update(_next_step_context(snapshot))
     if resolved_history_path is not None and snapshot.get("history_status") == "appended":
-        _update_latest_history_row(snapshot, resolved_history_path)
+        if history_frame is not None:
+            history_frame = _update_history_frame(snapshot, history_frame)
         if run_history_review and history_review_result is not None and resolved_history_review_output is not None:
             try:
                 history_review_result = run_pipeline_history_review(
@@ -2581,6 +2775,7 @@ def run_daily_pipeline(
                     max_staleness_days=max_staleness_days,
                     drawdown_watch_threshold=history_review_drawdown_watch_threshold,
                     min_sharpe_watch=history_review_min_sharpe_watch,
+                    history_frame=history_frame,
                 )
                 snapshot.update(_history_review_context(history_review_result))
                 snapshot["history_review_alert_refresh_status"] = "completed"
@@ -2592,6 +2787,7 @@ def run_daily_pipeline(
                 snapshot["dashboard_alert_refresh_error"] = None
             else:
                 try:
+                    dashboard_publish_attempted = True
                     dashboard_result = run_daily_dashboard(
                         project_root=root,
                         output_dir=resolved_dashboard_output,
@@ -2607,7 +2803,11 @@ def run_daily_pipeline(
                         max_staleness_days=max_staleness_days,
                         min_cache_fresh_ratio=min_cache_fresh_ratio,
                         date_stamp=False,
+                        summary_cache=dashboard_summary_cache,
+                        market_snapshot=shared_market_snapshot,
+                        publish_artifacts=True,
                     )
+                    dashboard_artifacts_published = True
                     snapshot.update(_dashboard_history_context(dashboard_result))
                 except Exception as error:  # Keep the final history review even if dashboard rewrite fails.
                     snapshot["dashboard_alert_refresh_status"] = "failed"
@@ -2616,7 +2816,8 @@ def run_daily_pipeline(
                     snapshot["dashboard_history_refresh_error"] = str(error)
                     snapshot["dashboard_pipeline_history_health_state"] = "unknown"
             snapshot.update(_next_step_context(snapshot))
-            _update_latest_history_row(snapshot, resolved_history_path)
+            if history_frame is not None:
+                history_frame = _update_history_frame(snapshot, history_frame)
         elif run_history_review:
             snapshot["history_review_alert_refresh_status"] = "skipped_no_completed_history_review"
             snapshot["dashboard_alert_refresh_status"] = "skipped_no_completed_history_review"
@@ -2626,6 +2827,36 @@ def run_daily_pipeline(
     else:
         snapshot["history_review_alert_refresh_status"] = "disabled"
         snapshot["dashboard_alert_refresh_status"] = "disabled"
+
+    if not dashboard_artifacts_published and not dashboard_publish_attempted:
+        dashboard_publish_attempted = True
+        try:
+            dashboard_result = run_daily_dashboard(
+                project_root=root,
+                output_dir=resolved_dashboard_output,
+                daily_check_dir=daily_result.output_dir,
+                paper_account_dir=paper_result.output_dir,
+                sentiment_dir=sentiment_dir,
+                data_cache_dir=data_cache_dir,
+                allocator_dir=allocator_dir,
+                trigger_report=trigger_report,
+                model_audit_dir=model_audit_dir,
+                pipeline_history_dir=(history_review_result.output_dir if history_review_result is not None else None),
+                as_of_date=as_of,
+                max_staleness_days=max_staleness_days,
+                min_cache_fresh_ratio=min_cache_fresh_ratio,
+                date_stamp=False,
+                summary_cache=dashboard_summary_cache,
+                market_snapshot=shared_market_snapshot,
+                publish_artifacts=True,
+            )
+            dashboard_artifacts_published = True
+            if history_review_result is not None:
+                snapshot.update(_dashboard_history_context(dashboard_result))
+        except Exception as error:
+            snapshot["dashboard_history_refresh_status"] = "failed"
+            snapshot["dashboard_history_refresh_error"] = str(error)
+            snapshot["dashboard_pipeline_history_health_state"] = "unknown"
 
     preflight_result: LivePreflightResult | None = None
     snapshot["live_preflight_output_dir"] = str(resolved_live_preflight_output)
@@ -2676,7 +2907,9 @@ def run_daily_pipeline(
     snapshot.update(_alerts_context(alerts_result))
     snapshot.update(_next_step_context(snapshot))
     if resolved_history_path is not None and snapshot.get("history_status") == "appended":
-        _update_latest_history_row(snapshot, resolved_history_path)
+        if history_frame is not None:
+            history_frame = _update_history_frame(snapshot, history_frame)
+            _write_history(history_frame, resolved_history_path)
 
     snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
     report_path.write_text(_render_report(snapshot), encoding="utf-8")
@@ -2688,6 +2921,7 @@ def run_daily_pipeline(
         history_path=resolved_history_path,
         history_review_result=history_review_result,
         satellite_risk_budget_result=satellite_risk_budget_result,
+        satellite_trial_replay_result=satellite_trial_replay_result,
         live_shadow_result=live_shadow_result,
         live_shadow_preflight_result=live_shadow_preflight_result,
         live_preflight_result=preflight_result,

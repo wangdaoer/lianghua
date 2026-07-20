@@ -11,6 +11,9 @@ from typing import Any
 import pandas as pd
 
 
+from ._compat import read_text
+
+
 @dataclass(frozen=True)
 class AllocatorObservationResult:
     output_dir: Path
@@ -27,7 +30,7 @@ def _load_snapshot(path: str | Path) -> dict[str, Any]:
     resolved = Path(path)
     if not resolved.exists():
         raise FileNotFoundError(f"Missing daily-pipeline snapshot: {resolved}")
-    return json.loads(resolved.read_text(encoding="utf-8"))
+    return json.loads(read_text(resolved))
 
 
 def _as_float(value: Any) -> float | None:

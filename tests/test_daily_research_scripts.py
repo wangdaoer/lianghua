@@ -141,6 +141,215 @@ def test_daily_research_refresh_uses_existing_market_cap_cache_when_update_fails
     assert "daily-pipeline" in calls
 
 
+def test_daily_research_refresh_checks_market_data_preflight_before_market_cap_update() -> None:
+    text = (ROOT / "scripts" / "run_daily_research_refresh.ps1").read_text(encoding="utf-8")
+
+    preflight_index = text.index("check_daily_market_data_preflight.py")
+    market_cap_index = text.index("& python -m quant_etf_lab data update-market-cap")
+
+    assert preflight_index < market_cap_index
+    assert "--skip-market-data-preflight" in text
+    assert "daily_market_data_preflight_" in text
+
+
+def test_daily_research_refresh_writes_daily_pipeline_latest_dir() -> None:
+    text = (ROOT / "scripts" / "run_daily_research_refresh.ps1").read_text(encoding="utf-8")
+
+    assert "--output-dir\", \"outputs/research/daily_pipeline_latest" in text
+    assert "--no-date-stamp" in text
+
+
+def test_daily_research_refresh_publishes_fast_decision_in_pipeline_process() -> None:
+    text = (ROOT / "scripts" / "run_daily_research_refresh.ps1").read_text(encoding="utf-8")
+
+    assert '"--publish-fast-decision"' in text
+    assert "& python -m quant_etf_lab daily-fast-decision" not in text
+
+
+def test_daily_research_refresh_uses_fixed_v1_allocator_inputs() -> None:
+    text = (ROOT / "scripts" / "run_daily_research_refresh.ps1").read_text(encoding="utf-8")
+
+    assert "main_chinext_source_selection_highyield_group_dd40_stock_only_cap30_pos8margin10_fixed_v1" in text
+    assert "allocator_promotion_stock_only_highyield_group_pos8margin10_fixed_strict_20260627" in text
+
+
+def test_daily_research_refresh_syncs_trigger_monitor_against_market_date() -> None:
+    text = (ROOT / "scripts" / "run_daily_research_refresh.ps1").read_text(encoding="utf-8")
+
+    assert '"trigger-sync"' in text
+    assert '"--expected-trade-date"' in text
+    assert '"--report-path"' in text
+    assert '"--journal-path"' in text
+    assert "2026-06-18-investment-strategy" in text
+    assert "trade_date_matches_expected" in text
+
+
+def test_daily_research_refresh_runs_stock_outcome_gate_in_pipeline_process() -> None:
+    text = (ROOT / "scripts" / "run_daily_research_refresh.ps1").read_text(encoding="utf-8")
+
+    assert '"--publish-stock-outcome-gate"' in text
+    assert "& python @StockOutcomeGateArgs" not in text
+    assert "outputs/research/stock_outcome_gate_latest" in text
+    assert "weak_sentiment_opportunity_trial_$WeakSentimentTrialDateStamp" in text
+
+
+def test_daily_research_refresh_pins_relaxed_stock_outcome_gate_parameters() -> None:
+    text = (ROOT / "scripts" / "run_daily_research_refresh.ps1").read_text(encoding="utf-8")
+
+    assert '"--stock-outcome-gate-relaxed-caution-multiplier", "0.5"' in text
+    assert '"--stock-outcome-gate-relaxed-prefer-trial-weight", "0.20"' in text
+    assert '"--stock-outcome-gate-weak-single-weight-cap", "0.05"' in text
+    assert '"--stock-outcome-gate-weak-total-weight-cap", "0.20"' in text
+
+
+def test_daily_research_refresh_skips_stock_outcome_gate_when_pipeline_fails(tmp_path: Path) -> None:
+    if os.name != "nt":
+        return
+
+    fake_python = tmp_path / "python.cmd"
+    fake_log = tmp_path / "python_calls.log"
+    fake_python.write_text(
+        "\n".join(
+            [
+                "@echo off",
+                "echo %*>>\"%FAKE_PYTHON_LOG%\"",
+                "echo %* | findstr /C:\"daily-pipeline\" >nul",
+                "if %errorlevel%==0 exit /b 3",
+                "echo %* | findstr /C:\"stock-outcome-gate\" >nul",
+                "if %errorlevel%==0 exit /b 0",
+                "exit /b 0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PATH"] = f"{tmp_path}{os.pathsep}{env.get('PATH', '')}"
+    env["FAKE_PYTHON_LOG"] = str(fake_log)
+
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(ROOT / "scripts" / "run_daily_research_refresh.ps1"),
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    calls = fake_log.read_text(encoding="utf-8")
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "daily-pipeline" in calls
+    assert "quant_etf_lab stock-outcome-gate" not in calls
+
+
+def test_daily_research_refresh_preflight_fail_blocks_pipeline(tmp_path: Path) -> None:
+    if os.name != "nt":
+        return
+
+    fake_python = tmp_path / "python.cmd"
+    fake_log = tmp_path / "python_calls.log"
+    fake_python.write_text(
+        "\n".join(
+            [
+                "@echo off",
+                "echo %*>>\"%FAKE_PYTHON_LOG%\"",
+                "echo %* | findstr /C:\"check_daily_market_data_preflight.py\" >nul",
+                "if %errorlevel%==0 exit /b 2",
+                "echo %* | findstr /C:\"data update-market-cap\" >nul",
+                "if %errorlevel%==0 exit /b 0",
+                "echo %* | findstr /C:\"daily-pipeline\" >nul",
+                "if %errorlevel%==0 exit /b 0",
+                "exit /b 0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PATH"] = f"{tmp_path}{os.pathsep}{env.get('PATH', '')}"
+    env["FAKE_PYTHON_LOG"] = str(fake_log)
+
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(ROOT / "scripts" / "run_daily_research_refresh.ps1"),
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    calls = fake_log.read_text(encoding="utf-8")
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "check_daily_market_data_preflight.py" in calls
+    assert "data update-market-cap" not in calls
+    assert "daily-pipeline" not in calls
+
+
+def test_daily_research_refresh_allows_skip_market_data_preflight_flag(tmp_path: Path) -> None:
+    if os.name != "nt":
+        return
+
+    fake_python = tmp_path / "python.cmd"
+    fake_log = tmp_path / "python_calls.log"
+    fake_python.write_text(
+        "\n".join(
+            [
+                "@echo off",
+                "echo %*>>\"%FAKE_PYTHON_LOG%\"",
+                "echo %* | findstr /C:\"check_daily_market_data_preflight.py\" >nul",
+                "if %errorlevel%==0 exit /b 2",
+                "echo %* | findstr /C:\"data update-market-cap\" >nul",
+                "if %errorlevel%==0 exit /b 0",
+                "echo %* | findstr /C:\"daily-pipeline\" >nul",
+                "if %errorlevel%==0 exit /b 0",
+                "exit /b 0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PATH"] = f"{tmp_path}{os.pathsep}{env.get('PATH', '')}"
+    env["FAKE_PYTHON_LOG"] = str(fake_log)
+
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(ROOT / "scripts" / "run_daily_research_refresh.ps1"),
+            "--skip-market-data-preflight",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    calls = fake_log.read_text(encoding="utf-8")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "check_daily_market_data_preflight.py" not in calls
+    assert "data update-market-cap" in calls
+    assert "daily-pipeline" in calls
+
+
 def test_daily_research_refresh_logged_allows_market_cap_stderr_when_cache_exists(tmp_path: Path) -> None:
     if os.name != "nt":
         return
@@ -356,7 +565,10 @@ def test_daily_pipeline_preflight_smoke_caps_as_of_date_to_allocator_curve() -> 
 
     assert "function Resolve-SmokeAsOfDate" in text
     assert "data\\raw\\stocks\\000001.csv" in text
-    assert "outputs\\portfolio_source_selection\\main_chinext_portfolio_source_selection_validation6_v1\\oos_equity_stitched.csv" in text
+    assert (
+        "outputs\\portfolio_source_selection\\main_chinext_source_selection_highgain_pos8_dd50_cap30_activation_dd50_20260624\\oos_equity_stitched.csv"
+        in text
+    )
     assert "Sort-Object | Select-Object -First 1" in text
 
 

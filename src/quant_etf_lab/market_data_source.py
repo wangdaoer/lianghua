@@ -68,6 +68,36 @@ def _filter_market(rows: list[dict[str, Any]], market: str) -> list[dict[str, An
     return [row for row in rows if str(row.get("market", "")).lower() == market]
 
 
+def _clean_security_code(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not digits:
+        return ""
+    return digits.zfill(6)[-6:]
+
+
+def _infer_market_from_code(code: str) -> str:
+    normalized = _clean_security_code(code)
+    if normalized.startswith(("5", "6", "9")):
+        return "sse"
+    if normalized.startswith(("0", "2", "3")):
+        return "szse"
+    if normalized.startswith(("4", "8")):
+        return "bse"
+    return ""
+
+
+def _first_existing(row: dict[str, Any], names: tuple[str, ...]) -> Any:
+    for name in names:
+        if name in row and row.get(name) not in (None, ""):
+            return row.get(name)
+    return None
+
+
 def _read_snapshot_csv(path: Path, market: str) -> list[dict[str, Any]]:
     try:
         frame = pd.read_csv(path, dtype={"security_code": str, "trade_date": str, "market": str})
@@ -76,6 +106,57 @@ def _read_snapshot_csv(path: Path, market: str) -> list[dict[str, Any]]:
     if "market" not in frame.columns or "trade_date" not in frame.columns:
         return []
     rows = frame.to_dict(orient="records")
+    return _filter_market(rows, market)
+
+
+def _read_ths_export_csv(path: Path, market: str) -> list[dict[str, Any]]:
+    try:
+        frame = pd.read_csv(
+            path,
+            dtype={
+                "security_code": str,
+                "code": str,
+                "trade_date": str,
+                "date": str,
+                "market": str,
+            },
+        )
+    except (OSError, pd.errors.EmptyDataError):
+        return []
+    if frame.empty:
+        return []
+
+    code_column = "security_code" if "security_code" in frame.columns else "code" if "code" in frame.columns else None
+    date_column = "trade_date" if "trade_date" in frame.columns else "date" if "date" in frame.columns else None
+    if code_column is None or date_column is None:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for raw in frame.to_dict(orient="records"):
+        code = _clean_security_code(raw.get(code_column))
+        trade_date = _normalize_trade_date(raw.get(date_column))
+        if not code or not trade_date:
+            continue
+        market_value = str(raw.get("market") or "").strip().lower() if "market" in raw else ""
+        if not market_value:
+            market_value = _infer_market_from_code(code)
+        record = dict(raw)
+        record.update(
+            {
+                "market": market_value,
+                "trade_date": trade_date,
+                "security_code": code,
+                "security_name": _first_existing(raw, ("security_name", "name", "证券简称", "股票简称")) or "",
+                "open_price": _first_existing(raw, ("open_price", "open")),
+                "high_price": _first_existing(raw, ("high_price", "high")),
+                "low_price": _first_existing(raw, ("low_price", "low")),
+                "close_price": _first_existing(raw, ("close_price", "close", "last_price")),
+                "last_price": _first_existing(raw, ("last_price", "close_price", "close")),
+                "turnover": _first_existing(raw, ("turnover", "amount")),
+                "source": _first_existing(raw, ("source",)) or "ths_hs_a_share_export",
+            }
+        )
+        rows.append(record)
     return _filter_market(rows, market)
 
 
@@ -95,6 +176,18 @@ def _daily_snapshot_csv_candidates(daily_data_dir: Path, trade_date: str | None)
         candidates.extend(sorted(base.glob("*_market_snapshot.csv"), reverse=True))
         candidates.extend(sorted(base.glob("snapshot_all_*.csv"), reverse=True))
     return candidates
+
+
+def _daily_ths_csv_candidates(daily_data_dir: Path, trade_date: str | None) -> list[Path]:
+    normalized_dir = daily_data_dir / "ths_exports" / "normalized"
+    if trade_date:
+        compact = _compact_trade_date(trade_date)
+        names = [
+            f"ths_hs_a_share_{trade_date}.csv",
+            f"ths_hs_a_share_{compact}.csv",
+        ]
+        return [normalized_dir / name for name in names]
+    return sorted(normalized_dir.glob("ths_hs_a_share_*.csv"), reverse=True)
 
 
 def _parse_trade_date(value: Any) -> datetime.date | None:
@@ -145,6 +238,15 @@ def _latest_trade_date_from_daily_dir(daily_data_dir: Path) -> str | None:
                 latest = parsed if latest is None or parsed > latest else latest
         for path in root.glob("snapshot_all_*.csv"):
             stem = path.stem.removeprefix("snapshot_all_")
+            parsed = _parse_trade_date(stem)
+            if parsed is None:
+                continue
+            latest = parsed if latest is None or parsed > latest else latest
+
+    ths_root = daily_data_dir / "ths_exports" / "normalized"
+    if ths_root.exists():
+        for path in ths_root.glob("ths_hs_a_share_*.csv"):
+            stem = path.stem.removeprefix("ths_hs_a_share_")
             parsed = _parse_trade_date(stem)
             if parsed is None:
                 continue
@@ -221,6 +323,12 @@ def _read_daily_hub(
     sqlite_rows, sqlite_path = _read_daily_sqlite(daily_data_dir, trade_date, market)
     if sqlite_rows:
         return sqlite_rows, "daily_market_data_sqlite", sqlite_path
+    for path in _daily_ths_csv_candidates(daily_data_dir, trade_date):
+        if not path.exists():
+            continue
+        rows = _read_ths_export_csv(path, market)
+        if rows:
+            return rows, "daily_market_data_csv", path
     for path in _daily_snapshot_csv_candidates(daily_data_dir, trade_date):
         if not path.exists():
             continue

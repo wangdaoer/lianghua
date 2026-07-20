@@ -17,11 +17,15 @@ $StartedAt = Get-Date
 $CommandArgs = @("-ExecutionPolicy", "Bypass", "-File", $RefreshScript) + $args
 
 try {
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & powershell @CommandArgs 1> $OutLog 2> $ErrLog
     $ExitCode = $LASTEXITCODE
 } catch {
     $_ | Out-String | Set-Content -Path $ErrLog -Encoding UTF8
     $ExitCode = 1
+} finally {
+    $ErrorActionPreference = $PreviousErrorActionPreference
 }
 
 $FinishedAt = Get-Date

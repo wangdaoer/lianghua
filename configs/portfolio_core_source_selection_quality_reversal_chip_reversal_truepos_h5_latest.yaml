@@ -1,0 +1,30 @@
+extends: portfolio_core_source_selection_quality_reversal_v1.yaml
+
+project:
+  name: main_chinext_core_source_selection_quality_reversal_chip_reversal_truepos_h5_latest
+
+satellite_sources:
+  quality:
+    path: outputs/walk_forward/main_chinext_satellite_quality_v2_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  reversal:
+    path: outputs/walk_forward/main_chinext_reversal_v1_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  blend_q70_r30:
+    path: outputs/research/ensemble_curves_20260614/quality70_reversal30.csv
+    equity_column: stitched_equity
+  blend_q50_r50:
+    path: outputs/research/ensemble_curves_20260614/quality50_reversal50.csv
+    equity_column: stitched_equity
+  blend_q30_r70:
+    path: outputs/research/ensemble_curves_20260614/quality30_reversal70.csv
+    equity_column: stitched_equity
+  chip_reversal_truepos_h5:
+    path: outputs/research/gain_gt5_chip_confirm_2018_2026_20260618/true_position_h5_new5_total25_exp50/equity_curve.csv
+    equity_column: equity
+
+notes: >
+  Adds the latest rebuilt chip-reversal true-position H5 research curve as a
+  research-only satellite source. This curve uses next-open entry, fifth-day
+  close exit, max 5 new positions per day, max 25 concurrent positions, 50%
+  target exposure, and broker_action=none.

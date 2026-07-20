@@ -10,6 +10,8 @@ from typing import Any
 
 import pandas as pd
 
+from ._compat import read_text
+
 
 @dataclass(frozen=True)
 class AllocatorSwitchReadinessResult:
@@ -27,14 +29,14 @@ def _load_snapshot(path: str | Path) -> dict[str, Any]:
     resolved = Path(path)
     if not resolved.exists():
         raise FileNotFoundError(f"Missing pipeline snapshot: {resolved}")
-    return json.loads(resolved.read_text(encoding="utf-8"))
+    return json.loads(read_text(resolved))
 
 
 def _load_outcome_analysis(path: str | Path) -> dict[str, Any]:
     resolved = Path(path)
     if not resolved.exists():
         raise FileNotFoundError(f"Missing outcome analysis JSON: {resolved}")
-    return json.loads(resolved.read_text(encoding="utf-8"))
+    return json.loads(read_text(resolved))
 
 
 def _candidate_outcome_analysis_path(candidate: dict[str, Any]) -> Path | None:

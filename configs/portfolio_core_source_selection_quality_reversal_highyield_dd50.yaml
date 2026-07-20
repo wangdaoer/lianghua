@@ -1,0 +1,24 @@
+extends: portfolio_core_source_selection_quality_reversal_highgain_pos8_dd50.yaml
+
+project:
+  name: main_chinext_core_source_selection_quality_reversal_highyield_dd50
+
+satellite_sources:
+  highyield_capital_roll:
+    path: outputs/walk_forward/wf_iter_h_breadth_soft_capital_rolling/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  highyield_capital_guarded:
+    path: outputs/walk_forward/wf_iter_h_breadth_soft_capital_guarded_rolling/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  highyield_pos10_3y6m6:
+    path: outputs/walk_forward/wf_iter_h_breadth_soft_focus_boost_pos10_nofilter_risk_lean_3y6m6_rolling/oos_equity_stitched.csv
+    equity_column: stitched_equity
+  highyield_qfull_dd30:
+    path: outputs/walk_forward/wf_continue_q_full_aggr_train5_dd30_val6/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+notes: >
+  Research-only dd50 source-selection config that adds the strongest existing
+  high-return OOS satellite curves as candidates. These sources must be tested
+  with source-specific satellite caps and source-switch margins before any
+  allocator promotion review.

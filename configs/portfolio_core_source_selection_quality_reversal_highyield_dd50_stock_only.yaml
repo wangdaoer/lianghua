@@ -1,0 +1,19 @@
+extends: portfolio_core_source_selection_quality_reversal_highyield_dd50.yaml
+
+project:
+  name: main_chinext_core_source_selection_quality_reversal_highyield_dd50_stock_only
+
+regime:
+  benchmark_path: outputs/walk_forward/main_chinext_stable_v2_capital_full_20260626/oos_equity_stitched.csv
+  benchmark_close_column: stitched_equity
+  ma_window: 60
+  drop_window: 20
+  risk_on_drop_threshold: -0.03
+  crash_drop_threshold: -0.07
+  default_regime: risk_off
+
+notes: >
+  Stock-only source-selection variant. It keeps the same A-share strategy
+  source pool, but removes the CSI300 ETF benchmark dependency from the
+  portfolio regime gate. The regime gate reads the stock-only defensive core
+  walk-forward equity curve instead.

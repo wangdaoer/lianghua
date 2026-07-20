@@ -15,3 +15,5 @@ data/raw/
 data/processed/
 data/meta/
 outputs/backtests/
+FAKE_PYTHON_LOG
+test_write_perm.txt

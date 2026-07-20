@@ -1,0 +1,42 @@
+{
+  "note": "Schema example only. Copy to D:/codex/daily-market-data/ths_exports/automation.json after calibrating the real Tonghuashun menu/key sequence.",
+  "app_path": "",
+  "window_title": "同花顺",
+  "pre_export_delay_seconds": 3,
+  "wait_for_file_seconds": 300,
+  "steps": [
+    {
+      "click": { "x": 65, "y": 669, "button": "left" },
+      "sleep_seconds": 1
+    },
+    {
+      "click": { "x": 520, "y": 190, "button": "right" },
+      "sleep_seconds": 1
+    },
+    {
+      "click": { "x": 790, "y": 610, "button": "left" },
+      "sleep_seconds": 1
+    },
+    {
+      "click": { "x": 885, "y": 610, "button": "left" },
+      "sleep_seconds": 2
+    },
+    {
+      "set_clipboard": "{raw_file}",
+      "send_keys": "^a^v",
+      "sleep_seconds": 1
+    },
+    {
+      "click": { "x": 880, "y": 635, "button": "left" },
+      "sleep_seconds": 2
+    },
+    {
+      "click": { "x": 880, "y": 635, "button": "left" },
+      "sleep_seconds": 8
+    },
+    {
+      "click": { "x": 880, "y": 635, "button": "left" },
+      "sleep_seconds": 1
+    }
+  ]
+}

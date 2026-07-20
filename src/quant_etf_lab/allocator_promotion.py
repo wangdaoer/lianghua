@@ -11,6 +11,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ._compat import read_text
+
 
 @dataclass(frozen=True)
 class AllocatorPromotionReviewResult:
@@ -98,7 +100,7 @@ def _evidence_supports_candidate(payload: dict[str, Any]) -> bool:
 
 
 def _read_evidence_snapshot(snapshot_path: Path, label: str, group: str) -> dict[str, Any]:
-    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    payload = json.loads(read_text(snapshot_path))
     supports_candidate = _evidence_supports_candidate(payload)
     return {
         "label": label,

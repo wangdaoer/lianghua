@@ -1,0 +1,21 @@
+extends: base/portfolio_core_satellite_guarded_base.yaml
+
+project:
+  name: main_chinext_core_chip_reversal_dd37_h2_chip24_guarded
+
+curves:
+  satellite:
+    path: outputs/research/gain_gt5_chip_confirm_2018_2026_20260618/runs/chip24_exclude_gain_9_11/equity_curve.csv
+    equity_column: equity
+
+weights:
+  risk_on:
+    core: 0.90
+    satellite: 0.10
+
+notes: >
+  Research-only allocator test using the dd37-selected H2 chip-reversal
+  satellite curve. The satellite requires chip_score >= 0.24 and excludes
+  signal-day gains in [9%, 11%). The referenced curve is rebuilt through the
+  latest local 2026 cache. It is intended for fixed-source walk-forward
+  validation before any promotion to daily observation or paper allocation.

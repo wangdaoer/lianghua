@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
+from ._compat import read_text
+
 
 class ProcessLockError(RuntimeError):
     """Raised when an equivalent command is already running."""
@@ -79,7 +81,7 @@ def _is_pid_running(pid: int) -> bool:
 
 def _read_payload(path: Path) -> LockPayload | None:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_text(path))
     except (OSError, json.JSONDecodeError):
         return None
     try:

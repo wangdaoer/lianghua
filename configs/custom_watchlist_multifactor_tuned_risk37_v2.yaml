@@ -1,0 +1,18 @@
+﻿extends: custom_watchlist_multifactor_tuned.yaml
+
+project:
+  name: custom_watchlist_multifactor_tuned_risk37_v2
+
+risk:
+  enabled: true
+  drawdown_levels:
+    - drawdown: 0.10
+      exposure: 0.80
+    - drawdown: 0.20
+      exposure: 0.60
+    - drawdown: 0.35
+      exposure: 0.30
+    - drawdown: 0.37
+      exposure: 0.0
+  protection_drawdown: 0.37
+  recovery_drawdown: 0.18

@@ -1,0 +1,20 @@
+extends: base/portfolio_core_satellite_guarded_base.yaml
+
+project:
+  name: main_chinext_core_chip_reversal_true_h5_exp80_sat30_guarded
+
+curves:
+  satellite:
+    path: outputs/research/gain_gt5_chip_confirm_2018_2025_20260618/true_position_h5_new5_total25_exp80/equity_curve.csv
+    equity_column: equity
+
+weights:
+  risk_on:
+    core: 0.70
+    satellite: 0.30
+
+notes: >
+  Research-only allocator test using the true-position chip-reversal
+  satellite curve. Satellite signal is gain >5% plus chip-reversal deep
+  same-day confirmation, next-open entry, 5-trading-day close exit, and
+  broker_action=none.

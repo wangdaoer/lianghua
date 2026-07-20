@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import io
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +16,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from ._compat import read_text
+from .artifact_io import publish_json_if_semantically_changed, write_bytes_if_changed, write_text_if_changed
 from .portfolio import (
     CurveConfig,
     PortfolioConfig,
@@ -22,6 +27,7 @@ from .portfolio import (
     run_portfolio_combine,
 )
 from .market_cap import DEFAULT_STOCK_MARKET_CAP_PATH, load_stock_market_cap_cache
+from .market_data_source import MarketSnapshotLoadResult
 from .paper_formatting import (
     _as_float,
     _format_date,
@@ -39,11 +45,13 @@ from .paper_formatting import (
 
 
 DEFAULT_PAPER_CONFIG = Path("configs/portfolio_core_satellite_quality_v2_guarded.yaml")
-DEFAULT_ALLOCATOR_DIR = Path("outputs/portfolio_source_selection/main_chinext_portfolio_source_selection_validation6_v1")
+DEFAULT_ALLOCATOR_DIR = Path(
+    "outputs/portfolio_source_selection/main_chinext_source_selection_highgain_pos8_dd50_cap30_activation_dd50_20260624"
+)
 DEFAULT_TRIGGER_SIGNAL_PATH = Path("D:/codex/outputs/signal_history/signals_latest.csv")
 DEFAULT_STOCK_REVIEW_NOTES_PATH = Path("outputs/research/stock_target_review_notes.csv")
 DEFAULT_STOCK_REVIEW_OUTCOMES_HISTORY_PATH = Path("outputs/research/stock_target_review_outcomes_history.csv")
-DEFAULT_STOCK_TRACKING_MAX_MARKET_CAP_YI = 1500.0
+DEFAULT_STOCK_TRACKING_MAX_MARKET_CAP_YI = 0.0
 DEFAULT_STOCK_REVIEW_OUTCOME_MIN_EVALUABLE = 20
 DEFAULT_STOCK_REVIEW_OUTCOME_MIN_GROUP_EVALUABLE = 5
 
@@ -256,6 +264,8 @@ STOCK_TARGET_COLUMNS = [
     "trigger_monitor_status",
     "trigger_summary",
     "trigger_run_time",
+    "trigger_signal_age_days",
+    "trigger_signal_validity_status",
     "trigger_signal_type",
     "trigger_action",
     "trigger_reason",
@@ -265,6 +275,7 @@ STOCK_TARGET_COLUMNS = [
     "trigger_last",
     "source_backtest_dir",
     "source_trades_path",
+    "execution_gate_action",
 ]
 STOCK_TARGET_REVIEW_OUTCOME_HORIZONS = (1, 5, 10, 20)
 STOCK_TARGET_REVIEW_OUTCOME_COLUMNS = [
@@ -285,7 +296,15 @@ STOCK_TARGET_REVIEW_OUTCOME_COLUMNS = [
     "outcome_status",
     "broker_action",
     "research_only",
+    "price_source_size",
+    "price_source_mtime_ns",
+    "price_source_fingerprint",
 ]
+STOCK_TARGET_REVIEW_OUTCOME_SOURCE_METADATA_COLUMNS = (
+    "price_source_size",
+    "price_source_mtime_ns",
+    "price_source_fingerprint",
+)
 for _horizon in STOCK_TARGET_REVIEW_OUTCOME_HORIZONS:
     STOCK_TARGET_REVIEW_OUTCOME_COLUMNS.extend(
         [
@@ -335,6 +354,7 @@ STOCK_TARGET_REVIEW_OUTCOME_CALENDAR_COLUMNS = [
     "readiness_status",
     "maturity_state",
     "pending_count",
+    "due_pending_count",
     "evaluable_count",
     "remaining_to_min_evaluable",
     "estimated_next_evaluable_date",
@@ -445,14 +465,14 @@ def _resolve(project_root: Path, path: str | Path | None, default: Path) -> Path
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(read_text(path))
     except (OSError, json.JSONDecodeError):
         return {}
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = yaml.safe_load(read_text(path))
     except (OSError, yaml.YAMLError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -561,8 +581,85 @@ def _load_allocator_windows(project_root: Path, allocator_dir: Path) -> pd.DataF
     return data
 
 
-def _window_equity_frame(base_config: PortfolioConfig, allocator_dir: Path) -> pd.DataFrame:
+PAPER_EQUITY_CACHE_VERSION = 3
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _window_equity_fingerprint(
+    base_config: PortfolioConfig,
+    allocator_dir: Path,
+    config_path: Path,
+) -> tuple[str, pd.DataFrame]:
     windows = _load_allocator_windows(base_config.project_root, allocator_dir)
+    dependencies = [
+        config_path,
+        allocator_dir / "portfolio_walk_forward_summary.csv",
+        Path(base_config.core.path),
+        Path(base_config.satellite.path),
+        Path(base_config.benchmark_path),
+    ]
+    for raw_path in windows["selected_params_resolved"].astype(str):
+        params_path = Path(raw_path)
+        dependencies.append(params_path)
+        payload = _read_json(params_path)
+        source_path = payload.get("source_path") if payload else None
+        if source_path:
+            resolved_source = Path(str(source_path))
+            if not resolved_source.is_absolute():
+                resolved_source = base_config.project_root / resolved_source
+            dependencies.append(resolved_source)
+
+    records = []
+    for path in sorted({item.resolve() for item in dependencies}, key=str):
+        records.append(
+            {
+                "path": str(path),
+                "sha256": _file_sha256(path) if path.is_file() else "missing",
+            }
+        )
+    encoded = json.dumps(
+        {"version": PAPER_EQUITY_CACHE_VERSION, "dependencies": records},
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), windows
+
+
+def _window_equity_frame(
+    base_config: PortfolioConfig,
+    allocator_dir: Path,
+    *,
+    config_path: Path | None = None,
+    cache_dir: Path | None = None,
+) -> pd.DataFrame:
+    windows: pd.DataFrame | None = None
+    fingerprint: str | None = None
+    cache_path = cache_dir / "window_equity.csv" if cache_dir is not None else None
+    metadata_path = cache_dir / "window_equity_cache.json" if cache_dir is not None else None
+    if config_path is not None and cache_path is not None and metadata_path is not None:
+        fingerprint, windows = _window_equity_fingerprint(base_config, allocator_dir, config_path)
+        if cache_path.exists() and metadata_path.exists():
+            metadata = _read_json(metadata_path)
+            if metadata.get("fingerprint") == fingerprint:
+                try:
+                    cached = pd.read_csv(cache_path, float_precision="round_trip")
+                except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                    cached = pd.DataFrame()
+                if not cached.empty and "date" in cached.columns:
+                    cached["date"] = pd.to_datetime(cached["date"], errors="coerce")
+                    cached = cached.dropna(subset=["date"])
+                    if not cached.empty:
+                        return cached.reset_index(drop=True)
+
+    if windows is None:
+        windows = _load_allocator_windows(base_config.project_root, allocator_dir)
     frames: list[pd.DataFrame] = []
     for row in windows.to_dict("records"):
         params_path = Path(str(row["selected_params_resolved"]))
@@ -591,7 +688,18 @@ def _window_equity_frame(base_config: PortfolioConfig, allocator_dir: Path) -> p
     combined = pd.concat(frames, ignore_index=True)
     combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
     combined = combined.dropna(subset=["date"]).sort_values(["date", "window"]).drop_duplicates(subset=["date"], keep="last")
-    return combined.reset_index(drop=True)
+    combined = combined.reset_index(drop=True)
+    if cache_path is not None and metadata_path is not None and fingerprint is not None:
+        write_text_if_changed(cache_path, combined.to_csv(index=False, float_format="%.17g"))
+        write_text_if_changed(
+            metadata_path,
+            json.dumps(
+                {"version": PAPER_EQUITY_CACHE_VERSION, "fingerprint": fingerprint},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    return combined
 
 
 def _target_change_turnover(previous: tuple[float, float, float] | None, current: tuple[float, float, float]) -> float:
@@ -1033,6 +1141,31 @@ def _latest_stock_close(project_root: Path, code: str, as_of_date: Any) -> tuple
     return None, None, "missing_local_close"
 
 
+def _market_snapshot_close_lookup(
+    market_snapshot: MarketSnapshotLoadResult | None,
+    as_of_date: Any,
+) -> dict[str, tuple[float, str, str]]:
+    if market_snapshot is None or not market_snapshot.rows or not market_snapshot.trade_date:
+        return {}
+    snapshot_date = pd.to_datetime(market_snapshot.trade_date, errors="coerce")
+    target_date = pd.to_datetime(as_of_date, errors="coerce")
+    if pd.isna(snapshot_date) or pd.isna(target_date) or pd.Timestamp(snapshot_date).normalize() != pd.Timestamp(target_date).normalize():
+        return {}
+    date_text = pd.Timestamp(snapshot_date).strftime("%Y-%m-%d")
+    source = f"market_snapshot:{market_snapshot.source_kind}"
+    lookup: dict[str, tuple[float, str, str]] = {}
+    for row in market_snapshot.rows:
+        code = _clean_code(row.get("security_code") or row.get("code") or row.get("symbol"))
+        close = None
+        for field in ("close_price", "close", "last_price"):
+            close = _optional_float(row.get(field))
+            if close is not None:
+                break
+        if code and close is not None and close > 0:
+            lookup[code] = (float(close), date_text, source)
+    return lookup
+
+
 def _clean_code(value: Any) -> str:
     if value is None:
         return ""
@@ -1184,6 +1317,7 @@ def _read_latest_trigger_signals(signal_path: str | Path | None) -> tuple[dict[s
         if run_time:
             run_times.append(run_time)
         latest[code] = {
+            "trigger_name": _safe_text(row.get("name"), code),
             "trigger_run_time": run_time or None,
             "trigger_signal_type": _safe_text(row.get(signal_type_col), "N/A") if signal_type_col else "N/A",
             "trigger_action": _safe_text(row.get(action_col), "N/A") if action_col else "N/A",
@@ -1205,6 +1339,21 @@ def _trigger_summary(trigger: dict[str, Any] | None) -> str:
     score = trigger.get("trigger_score")
     score_text = f"{score:.0f}" if score is not None else "N/A"
     return f"{trigger.get('trigger_signal_type', 'N/A')}/{trigger.get('trigger_action', 'N/A')}/score={score_text}"
+
+
+def _trigger_signal_validity(trigger: dict[str, Any] | None, latest_date: Any, valid_days: int = 3) -> dict[str, Any]:
+    if not trigger:
+        return {"trigger_signal_age_days": pd.NA, "trigger_signal_validity_status": "no_current_trigger"}
+    run_time = trigger.get("trigger_run_time")
+    signal_date = pd.to_datetime(str(run_time).split("_")[0], errors="coerce") if run_time else pd.NaT
+    as_of = pd.to_datetime(latest_date, errors="coerce")
+    if pd.isna(signal_date) or pd.isna(as_of):
+        return {"trigger_signal_age_days": pd.NA, "trigger_signal_validity_status": "trigger_date_unknown"}
+    age_days = int((pd.Timestamp(as_of).normalize() - pd.Timestamp(signal_date).normalize()).days)
+    return {
+        "trigger_signal_age_days": age_days,
+        "trigger_signal_validity_status": "fresh_trigger_signal" if age_days <= valid_days else "stale_trigger_signal",
+    }
 
 
 def _open_positions_from_trades(trades_path: Path, as_of_date: Any) -> pd.DataFrame:
@@ -1302,7 +1451,8 @@ def apply_stock_market_cap_tracking_rule(
     market_cap_cache_payload: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Mark stock targets that should not enter the temporary tracking queue."""
-    threshold = float(max_market_cap_yi)
+    threshold = None if max_market_cap_yi is None else float(max_market_cap_yi)
+    limit_enabled = threshold is not None and threshold > 0
     market_cap_lookup: dict[str, dict[str, Any]] = {}
     if not market_cap_frame.empty and {"code", "market_cap_yi"}.issubset(market_cap_frame.columns):
         clean_caps = market_cap_frame.copy()
@@ -1344,7 +1494,7 @@ def apply_stock_market_cap_tracking_rule(
                 tracking_reasons.append("market cap snapshot is missing; keep row visible and do not guess")
                 continue
 
-            excluded = market_cap_yi > threshold
+            excluded = bool(limit_enabled and market_cap_yi > threshold)
             market_caps.append(float(market_cap_yi))
             snapshot_dates.append(_safe_text(record.get("snapshot_date")))
             sources.append(_safe_text(record.get("source")))
@@ -1370,7 +1520,8 @@ def apply_stock_market_cap_tracking_rule(
     payload = dict(market_cap_cache_payload or {})
     payload.update(
         {
-            "stock_tracking_max_market_cap_yi": threshold,
+            "stock_tracking_max_market_cap_yi": threshold if limit_enabled else None,
+            "stock_tracking_requested_max_market_cap_yi": threshold,
             "stock_tracking_excluded_large_market_cap_count": excluded_count,
             "stock_tracking_allowed_count": int(len(frame) - excluded_count),
             "stock_tracking_market_cap_missing_count": missing_count,
@@ -1388,6 +1539,7 @@ def build_stock_targets(
     trigger_signal_path: str | Path | None = None,
     stock_market_cap_path: str | Path | None = None,
     stock_tracking_max_market_cap_yi: float = DEFAULT_STOCK_TRACKING_MAX_MARKET_CAP_YI,
+    market_snapshot: MarketSnapshotLoadResult | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     source_layers: list[dict[str, Any]] = []
@@ -1396,6 +1548,7 @@ def build_stock_targets(
     trigger_signals, trigger_meta = _read_latest_trigger_signals(trigger_signal_path)
     resolved_market_cap_path = _resolve(project_root, stock_market_cap_path, DEFAULT_STOCK_MARKET_CAP_PATH)
     market_cap_frame, market_cap_payload = _load_market_cap_cache_payload(resolved_market_cap_path)
+    snapshot_closes = _market_snapshot_close_lookup(market_snapshot, latest_date)
 
     for layer, curve_path in curve_by_layer.items():
         layer_target = target_by_layer.get(layer, {})
@@ -1429,7 +1582,10 @@ def build_stock_targets(
             continue
         valued_rows: list[dict[str, Any]] = []
         for position in positions.to_dict(orient="records"):
-            close_price, close_date, price_source = _latest_stock_close(project_root, str(position["code"]), latest_date)
+            code = _clean_code(position.get("code"))
+            close_price, close_date, price_source = snapshot_closes.get(code, (None, None, ""))
+            if close_price is None:
+                close_price, close_date, price_source = _latest_stock_close(project_root, code, latest_date)
             if close_price is None:
                 close_price = _as_float(position.get("last_trade_price"), 0.0)
                 close_date = position.get("last_trade_date")
@@ -1468,6 +1624,7 @@ def build_stock_targets(
                 risk_filter_status = "active_without_source_risk_model"
                 target_explanation = "Portfolio target equals current layer weight multiplied by source-model internal position weight."
             trigger = trigger_signals.get(code)
+            trigger_validity = _trigger_signal_validity(trigger, latest_date)
             rows.append(
                 {
                     "date": _format_date(latest_date),
@@ -1503,6 +1660,8 @@ def build_stock_targets(
                     "trigger_monitor_status": "matched_latest_trigger" if trigger else "not_in_latest_trigger_report",
                     "trigger_summary": _trigger_summary(trigger),
                     "trigger_run_time": trigger.get("trigger_run_time") if trigger else None,
+                    "trigger_signal_age_days": trigger_validity["trigger_signal_age_days"],
+                    "trigger_signal_validity_status": trigger_validity["trigger_signal_validity_status"],
                     "trigger_signal_type": trigger.get("trigger_signal_type") if trigger else None,
                     "trigger_action": trigger.get("trigger_action") if trigger else None,
                     "trigger_reason": trigger.get("trigger_reason") if trigger else None,
@@ -1512,8 +1671,69 @@ def build_stock_targets(
                     "trigger_last": trigger.get("trigger_last") if trigger else np.nan,
                     "source_backtest_dir": str(backtest_dir) if backtest_dir is not None else None,
                     "source_trades_path": str(trades_path) if trades_path is not None else None,
+                    "execution_gate_action": "manual_review_only",
                 }
             )
+
+    external_fresh_trigger_count = 0
+    existing_codes = {_clean_code(row.get("code")) for row in rows}
+    for code, trigger in sorted(trigger_signals.items()):
+        clean_code = _clean_code(code)
+        if not clean_code or clean_code in existing_codes:
+            continue
+        trigger_validity = _trigger_signal_validity(trigger, latest_date)
+        if trigger_validity["trigger_signal_validity_status"] != "fresh_trigger_signal":
+            continue
+        external_fresh_trigger_count += 1
+        rows.append(
+            {
+                "date": _format_date(latest_date),
+                "layer": "trigger",
+                "code": clean_code,
+                "name": trigger.get("trigger_name") or clean_code,
+                "layer_target_weight": 0.0,
+                "layer_internal_weight": 0.0,
+                "portfolio_target_weight": 0.0,
+                "portfolio_target_value": 0.0,
+                "model_quantity": 0.0,
+                "model_market_value": 0.0,
+                "close_price": trigger.get("trigger_last") if trigger.get("trigger_last") is not None else np.nan,
+                "price_date": None,
+                "price_source": "latest_trigger_signal",
+                "avg_cost": np.nan,
+                "unrealized_return": np.nan,
+                "holding_days": np.nan,
+                "last_trade_price": np.nan,
+                "last_trade_date": None,
+                "target_action": "trigger_watch_candidate",
+                "target_explanation": "Fresh trigger-monitor candidate is not in the current model portfolio; listed for research review only.",
+                "risk_filter_status": "not_in_current_portfolio_target",
+                "selection_explanation": "External trigger-monitor candidate added with zero portfolio weight.",
+                "source_filter_explanation": "Not selected by current portfolio source.",
+                "source_risk_explanation": "No broker action; candidate-review row only.",
+                "source_strategy_profile": "trigger_monitor_candidate",
+                "source_strategy_name": "trigger_monitor",
+                "source_project_name": "trigger_monitor",
+                "factor_weights": "{}",
+                "factor_weights_text": "",
+                "source_config_path": None,
+                "trigger_monitor_status": "matched_latest_trigger",
+                "trigger_summary": _trigger_summary(trigger),
+                "trigger_run_time": trigger.get("trigger_run_time"),
+                "trigger_signal_age_days": trigger_validity["trigger_signal_age_days"],
+                "trigger_signal_validity_status": trigger_validity["trigger_signal_validity_status"],
+                "trigger_signal_type": trigger.get("trigger_signal_type"),
+                "trigger_action": trigger.get("trigger_action"),
+                "trigger_reason": trigger.get("trigger_reason"),
+                "trigger_score": trigger.get("trigger_score"),
+                "trigger_score_level": trigger.get("trigger_score_level"),
+                "trigger_pct": trigger.get("trigger_pct"),
+                "trigger_last": trigger.get("trigger_last"),
+                "source_backtest_dir": None,
+                "source_trades_path": None,
+                "execution_gate_action": "usable_for_candidate_review",
+            }
+        )
 
     frame = pd.DataFrame(rows, columns=STOCK_TARGET_COLUMNS)
     if not frame.empty:
@@ -1541,6 +1761,7 @@ def build_stock_targets(
         "trigger_signal_count": trigger_meta["trigger_signal_count"],
         "latest_trigger_run_time": trigger_meta["latest_trigger_run_time"],
         "trigger_match_count": trigger_match_count,
+        "external_fresh_trigger_candidate_count": external_fresh_trigger_count,
         **tracking_payload,
         "stock_targets": _json_records(frame),
         "research_only": True,
@@ -1754,6 +1975,131 @@ def build_stock_target_review(
         "note": "Review priority panel derived from stock_targets; it does not change model targets or generate broker orders.",
     }
     return frame, payload
+
+
+def apply_review_required_observation_exclusion(
+    stock_targets: pd.DataFrame,
+    stock_targets_payload: dict[str, Any],
+    review: pd.DataFrame,
+    review_payload: dict[str, Any],
+) -> tuple[pd.DataFrame, dict[str, Any], pd.DataFrame, dict[str, Any]]:
+    """Remove review-required rows from observation targets while retaining audit evidence."""
+    targets = stock_targets.copy()
+    reviews = review.copy()
+    target_payload = dict(stock_targets_payload)
+    updated_review_payload = dict(review_payload)
+
+    if reviews.empty or "review_stage" not in reviews.columns:
+        target_payload.update(
+            {
+                "source_stock_target_count": int(len(targets)),
+                "review_required_excluded_count": 0,
+                "review_required_excluded_codes": [],
+                "stock_targets": _json_records(targets),
+            }
+        )
+        updated_review_payload["excluded_review_required_count"] = 0
+        return targets, target_payload, reviews, updated_review_payload
+
+    reviews["original_review_stage"] = reviews["review_stage"]
+    reviews["observation_excluded"] = False
+    reviews["observation_exclusion_reason"] = ""
+    required_mask = reviews["review_stage"].astype(str).eq("review_required")
+    excluded_keys = {
+        (_safe_text(row.get("layer")), _clean_code(row.get("code")))
+        for row in reviews.loc[required_mask].to_dict(orient="records")
+    }
+    excluded_codes = sorted({code for _, code in excluded_keys if code})
+
+    if targets.empty:
+        target_mask = pd.Series(False, index=targets.index, dtype=bool)
+    else:
+        target_mask = pd.Series(
+            [
+                (_safe_text(row.get("layer")), _clean_code(row.get("code"))) in excluded_keys
+                for row in targets.to_dict(orient="records")
+            ],
+            index=targets.index,
+            dtype=bool,
+        )
+    observation_targets = targets.loc[~target_mask].copy().reset_index(drop=True)
+
+    reviews.loc[required_mask, "review_stage"] = "excluded"
+    reviews.loc[required_mask, "observation_excluded"] = True
+    reviews.loc[required_mask, "observation_exclusion_reason"] = (
+        "Hard rule: review_required rows are excluded from all observation targets."
+    )
+    reviews.loc[required_mask, "recommended_review"] = (
+        "Automatically excluded from observation targets; retained only for audit history."
+    )
+
+    active_count = (
+        int((pd.to_numeric(observation_targets.get("portfolio_target_weight", 0), errors="coerce") > 0).sum())
+        if not observation_targets.empty
+        else 0
+    )
+    suppressed_count = (
+        int((observation_targets.get("target_action") == "suppressed_by_layer_weight").sum())
+        if not observation_targets.empty
+        else 0
+    )
+    trigger_match_count = (
+        int((observation_targets.get("trigger_monitor_status") == "matched_latest_trigger").sum())
+        if not observation_targets.empty
+        else 0
+    )
+    tracking_allowed_count = (
+        int((~observation_targets.get("tracking_excluded", pd.Series(False, index=observation_targets.index)).map(_boolish)).sum())
+        if not observation_targets.empty
+        else 0
+    )
+    target_payload.update(
+        {
+            "source_stock_target_count": int(len(targets)),
+            "stock_target_count": int(len(observation_targets)),
+            "active_stock_target_count": active_count,
+            "suppressed_stock_count": suppressed_count,
+            "total_portfolio_target_weight": (
+                float(pd.to_numeric(observation_targets.get("portfolio_target_weight", 0), errors="coerce").sum())
+                if not observation_targets.empty
+                else 0.0
+            ),
+            "trigger_match_count": trigger_match_count,
+            "external_fresh_trigger_candidate_count": int(
+                (observation_targets.get("layer") == "trigger").sum()
+            )
+            if not observation_targets.empty
+            else 0,
+            "stock_tracking_allowed_count": tracking_allowed_count,
+            "review_required_excluded_count": int(required_mask.sum()),
+            "review_required_excluded_codes": excluded_codes,
+            "review_required_exclusion_rule": "exclude_all_review_required_from_observation_targets",
+            "stock_targets": _json_records(observation_targets),
+            "note": "Review-required rows are removed from observation targets and retained only in the review audit.",
+        }
+    )
+
+    stage_counts = reviews["review_stage"].value_counts().to_dict()
+    active_reviews = reviews.loc[~reviews["observation_excluded"].map(_boolish)]
+    active_bucket_counts = active_reviews["review_bucket"].value_counts().to_dict() if "review_bucket" in active_reviews else {}
+    updated_review_payload.update(
+        {
+            "review_required_count": int(stage_counts.get("review_required", 0)),
+            "monitor_count": int(stage_counts.get("monitor", 0)),
+            "routine_count": int(stage_counts.get("routine", 0)),
+            "excluded_count": int(stage_counts.get("excluded", 0)),
+            "original_trigger_review_count": int(updated_review_payload.get("trigger_review_count", 0)),
+            "original_drawdown_review_count": int(updated_review_payload.get("drawdown_review_count", 0)),
+            "trigger_review_count": int(active_bucket_counts.get("trigger_review", 0)),
+            "drawdown_review_count": int(active_bucket_counts.get("drawdown_review", 0)),
+            "original_review_required_count": int(required_mask.sum()),
+            "excluded_review_required_count": int(required_mask.sum()),
+            "excluded_review_required_codes": excluded_codes,
+            "top_review_items": _json_records(reviews.head(5)),
+            "note": "Review-required rows are automatically excluded from observation targets; audit rows remain visible.",
+        }
+    )
+    return observation_targets, target_payload, reviews, updated_review_payload
 
 
 def _stock_review_note_columns(frame: pd.DataFrame) -> list[str]:
@@ -2116,8 +2462,15 @@ This is a research-only manual action queue. It does not connect to brokers, pla
 """
 
 
-def _stock_price_history(project_root: Path, code: str) -> tuple[pd.DataFrame, str]:
+def _stock_price_history(
+    project_root: Path,
+    code: str,
+    cache: dict[str, tuple[pd.DataFrame, str]] | None = None,
+    persistent_cache_dir: Path | None = None,
+) -> tuple[pd.DataFrame, str]:
     clean_code = _clean_code(code)
+    if cache is not None and clean_code in cache:
+        return cache[clean_code]
     candidates = [
         project_root / "data" / "processed" / "stocks" / f"{clean_code}.csv",
         project_root / "data" / "processed" / f"{clean_code}.csv",
@@ -2125,6 +2478,30 @@ def _stock_price_history(project_root: Path, code: str) -> tuple[pd.DataFrame, s
     for path in candidates:
         if not path.exists():
             continue
+        source_stat = path.stat()
+        source_fingerprint = f"1:{path.resolve()}:{source_stat.st_size}:{source_stat.st_mtime_ns}"
+        persistent_path = persistent_cache_dir / f"{clean_code}.npz" if persistent_cache_dir is not None else None
+        if persistent_path is not None and persistent_path.exists():
+            try:
+                with np.load(persistent_path, allow_pickle=False) as stored:
+                    if str(stored["source_fingerprint"].item()) == source_fingerprint:
+                        data = pd.DataFrame(
+                            {
+                                "date": pd.to_datetime(stored["date_ns"], unit="ns"),
+                                "close": stored["close"],
+                                "high": stored["high"],
+                                "low": stored["low"],
+                            }
+                        )
+                    else:
+                        data = pd.DataFrame()
+            except (OSError, ValueError, KeyError):
+                data = pd.DataFrame()
+            if not data.empty:
+                result = (data, str(path))
+                if cache is not None:
+                    cache[clean_code] = result
+                return result
         try:
             frame = pd.read_csv(path)
         except (OSError, pd.errors.EmptyDataError):
@@ -2141,8 +2518,25 @@ def _stock_price_history(project_root: Path, code: str) -> tuple[pd.DataFrame, s
         data = data.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
         if data.empty:
             continue
-        return data.reset_index(drop=True), str(path)
-    return pd.DataFrame(columns=["date", "close", "high", "low"]), "missing_local_price_history"
+        result = (data.reset_index(drop=True), str(path))
+        if persistent_path is not None:
+            buffer = io.BytesIO()
+            np.savez(
+                buffer,
+                source_fingerprint=np.asarray(source_fingerprint),
+                date_ns=result[0]["date"].astype("int64").to_numpy(),
+                close=result[0]["close"].to_numpy(dtype=float),
+                high=result[0]["high"].to_numpy(dtype=float),
+                low=result[0]["low"].to_numpy(dtype=float),
+            )
+            write_bytes_if_changed(persistent_path, buffer.getvalue())
+        if cache is not None:
+            cache[clean_code] = result
+        return result
+    result = (pd.DataFrame(columns=["date", "close", "high", "low"]), "missing_local_price_history")
+    if cache is not None:
+        cache[clean_code] = result
+    return result
 
 
 def _review_condition_text(
@@ -2174,8 +2568,10 @@ def _stock_review_price_context(
     review_date: Any,
     review_bucket: Any = None,
     unrealized_return: Any = None,
+    price_history_cache: dict[str, tuple[pd.DataFrame, str]] | None = None,
+    price_history_cache_dir: Path | None = None,
 ) -> dict[str, Any]:
-    history, path = _stock_price_history(project_root, code)
+    history, path = _stock_price_history(project_root, code, price_history_cache, price_history_cache_dir)
     fields: dict[str, Any] = {
         "latest_price_date": None,
         "latest_close": None,
@@ -2262,6 +2658,8 @@ def build_stock_target_review_assistant(
     review: pd.DataFrame,
     actions: pd.DataFrame,
     review_payload: dict[str, Any],
+    price_history_cache: dict[str, tuple[pd.DataFrame, str]] | None = None,
+    price_history_cache_dir: Path | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Build a research-only assistant sheet for rows that need human review."""
     root = Path(project_root)
@@ -2280,6 +2678,8 @@ def build_stock_target_review_assistant(
             source.get("date"),
             review_bucket=source.get("review_bucket"),
             unrealized_return=source.get("unrealized_return"),
+            price_history_cache=price_history_cache,
+            price_history_cache_dir=price_history_cache_dir,
         )
         evidence = [
             "review model reason",
@@ -2677,6 +3077,32 @@ def write_stock_target_review_decision_template_xlsx(
     return resolved
 
 
+def _publish_stock_target_review_decision_template(
+    template: pd.DataFrame,
+    payload: dict[str, Any],
+    *,
+    output_dir: Path,
+    csv_path: Path,
+    json_path: Path,
+    report_path: Path,
+    xlsx_path: Path,
+) -> bool:
+    """Publish the template and rebuild Excel only when its source changed."""
+
+    csv_changed = write_text_if_changed(csv_path, template.to_csv(index=False))
+    published_payload, payload_changed = publish_json_if_semantically_changed(json_path, payload)
+    sources_changed = csv_changed or payload_changed
+    if sources_changed or not report_path.exists():
+        write_text_if_changed(
+            report_path,
+            _render_stock_target_review_decision_template_report(template, published_payload, output_dir),
+        )
+    if sources_changed or not xlsx_path.exists():
+        write_stock_target_review_decision_template_xlsx(template, published_payload, xlsx_path)
+        return True
+    return False
+
+
 def _load_stock_target_review_decision_template(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Decision template CSV does not exist: {path}")
@@ -3037,6 +3463,8 @@ def build_stock_target_review_outcomes(
     review: pd.DataFrame,
     actions: pd.DataFrame,
     review_payload: dict[str, Any],
+    price_history_cache: dict[str, tuple[pd.DataFrame, str]] | None = None,
+    price_history_cache_dir: Path | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     root = Path(project_root)
     action_lookup: dict[tuple[str, str], str] = {}
@@ -3048,7 +3476,7 @@ def build_stock_target_review_outcomes(
     for raw in review.to_dict(orient="records"):
         code = _clean_code(raw.get("code"))
         layer = _safe_text(raw.get("layer"))
-        history, price_source = _stock_price_history(root, code)
+        history, price_source = _stock_price_history(root, code, price_history_cache, price_history_cache_dir)
         fields = _future_return_fields(history, raw.get("date"))
         rows.append(
             {
@@ -3100,6 +3528,12 @@ def _stock_review_outcome_columns(frame: pd.DataFrame) -> list[str]:
 
 
 def _review_date_text(value: Any) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T].*)?", text):
+            return text[:10]
+        if re.fullmatch(r"\d{8}", text):
+            return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
     parsed = pd.to_datetime(value, errors="coerce")
     if pd.isna(parsed):
         return _safe_text(value)
@@ -3114,7 +3548,7 @@ def _load_stock_target_review_outcomes_history(path: Path) -> pd.DataFrame:
     if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame(columns=STOCK_TARGET_REVIEW_OUTCOME_COLUMNS)
     try:
-        frame = pd.read_csv(path, dtype={"code": str})
+        frame = pd.read_csv(path, dtype={"code": str, "price_source_fingerprint": str})
     except (OSError, pd.errors.EmptyDataError):
         return pd.DataFrame(columns=STOCK_TARGET_REVIEW_OUTCOME_COLUMNS)
     for column in STOCK_TARGET_REVIEW_OUTCOME_COLUMNS:
@@ -3144,13 +3578,21 @@ def _load_stock_review_outcome_price_source(path: Path) -> pd.DataFrame:
     return data.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
 
 
+def _price_source_fingerprint(path: Path) -> tuple[str, Any]:
+    source_stat = path.stat()
+    return f"{source_stat.st_size}:{source_stat.st_mtime_ns}", source_stat
+
+
 def _stock_review_outcome_has_open_horizon(record: dict[str, Any]) -> bool:
     if _safe_text(record.get("outcome_status")) == "complete":
         return False
     return any(_safe_text(record.get(f"outcome_status_{horizon}d")) != "available" for horizon in STOCK_TARGET_REVIEW_OUTCOME_HORIZONS)
 
 
-def _refresh_stock_review_outcome_record_from_price_source(record: dict[str, Any]) -> bool:
+def _refresh_stock_review_outcome_record_from_price_source(
+    record: dict[str, Any],
+    price_history_cache: dict[Path, pd.DataFrame] | None = None,
+) -> bool:
     if not _stock_review_outcome_has_open_horizon(record):
         return False
     source = _safe_text(record.get("price_source"))
@@ -3159,15 +3601,27 @@ def _refresh_stock_review_outcome_record_from_price_source(record: dict[str, Any
     source_path = Path(source)
     if not source_path.exists() or not source_path.is_file():
         return False
+    source_fingerprint, source_stat = _price_source_fingerprint(source_path)
+    if _safe_text(record.get("price_source_fingerprint")) == source_fingerprint:
+        return False
 
     before_statuses = {
         horizon: _safe_text(record.get(f"outcome_status_{horizon}d"))
         for horizon in STOCK_TARGET_REVIEW_OUTCOME_HORIZONS
     }
-    history = _load_stock_review_outcome_price_source(source_path)
+    cache_key = source_path.resolve()
+    if price_history_cache is not None and cache_key in price_history_cache:
+        history = price_history_cache[cache_key]
+    else:
+        history = _load_stock_review_outcome_price_source(source_path)
+        if price_history_cache is not None:
+            price_history_cache[cache_key] = history
     fields = _future_return_fields(history, record.get("date"))
     for key, value in fields.items():
         record[key] = value
+    record["price_source_size"] = source_stat.st_size
+    record["price_source_mtime_ns"] = source_stat.st_mtime_ns
+    record["price_source_fingerprint"] = source_fingerprint
 
     return any(
         before_statuses[horizon] != "available"
@@ -3220,7 +3674,11 @@ def sync_stock_target_review_outcomes_history(
         record = _normalize_stock_review_outcome_record(raw, combined_columns)
         key = _stock_review_outcome_key(record)
         if key[0] and key[2] and key in index_by_key:
-            records[index_by_key[key]].update(record)
+            existing_record = records[index_by_key[key]]
+            for column, value in record.items():
+                if column in STOCK_TARGET_REVIEW_OUTCOME_SOURCE_METADATA_COLUMNS and pd.isna(value):
+                    continue
+                existing_record[column] = value
             updated_count += 1
         else:
             records.append(record)
@@ -3229,8 +3687,28 @@ def sync_stock_target_review_outcomes_history(
             inserted_count += 1
 
     matured_count = 0
+    source_paths_to_load: set[Path] = set()
     for record in records:
-        if _refresh_stock_review_outcome_record_from_price_source(record):
+        if not _stock_review_outcome_has_open_horizon(record):
+            continue
+        source = _safe_text(record.get("price_source"))
+        if not source or source == "missing_local_price_history":
+            continue
+        source_path = Path(source)
+        if not source_path.exists() or not source_path.is_file():
+            continue
+        source_fingerprint, _ = _price_source_fingerprint(source_path)
+        if _safe_text(record.get("price_source_fingerprint")) != source_fingerprint:
+            source_paths_to_load.add(source_path.resolve())
+    source_paths = sorted(source_paths_to_load, key=str)
+    price_history_cache: dict[Path, pd.DataFrame] = {}
+    if source_paths:
+        worker_count = min(8, len(source_paths))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="outcome-price") as executor:
+            loaded_histories = executor.map(_load_stock_review_outcome_price_source, source_paths)
+            price_history_cache.update(zip(source_paths, loaded_histories))
+    for record in records:
+        if _refresh_stock_review_outcome_record_from_price_source(record, price_history_cache):
             matured_count += 1
 
     history = pd.DataFrame(records, columns=combined_columns)
@@ -3263,6 +3741,8 @@ def sync_stock_target_review_outcomes_history(
         "history_matured_row_count": int(matured_count),
         "history_replaced_row_count": int(updated_count),
         "history_inserted_row_count": int(inserted_count),
+        "history_price_source_count": int(len(source_paths)),
+        "history_price_source_workers": int(min(8, len(source_paths))) if source_paths else 0,
         "history_complete_count": int(status_counts.get("complete", 0)),
         "history_partial_count": int(status_counts.get("partial", 0)),
         "history_pending_count": int(status_counts.get("pending", 0)),
@@ -3505,6 +3985,14 @@ def _estimated_weekday_horizon_date(value: Any, horizon: int) -> str | None:
     return current.strftime("%Y-%m-%d")
 
 
+def _resolve_outcome_maturity_date(row: dict[str, Any], horizon: int) -> str | None:
+    future_date = row.get(f"future_date_{horizon}d")
+    parsed_future = pd.to_datetime(future_date, errors="coerce")
+    if not pd.isna(parsed_future):
+        return pd.Timestamp(parsed_future).strftime("%Y-%m-%d")
+    return _estimated_weekday_horizon_date(row.get("entry_date") or row.get("date"), horizon)
+
+
 def _outcome_maturity_forecast(history: pd.DataFrame, min_evaluable: int) -> dict[str, dict[str, Any]]:
     forecast: dict[str, dict[str, Any]] = {}
     for horizon in STOCK_TARGET_REVIEW_OUTCOME_HORIZONS:
@@ -3521,16 +4009,13 @@ def _outcome_maturity_forecast(history: pd.DataFrame, min_evaluable: int) -> dic
             pending = pd.DataFrame()
         else:
             pending = history[history[status_column].astype(str) == "pending"].copy()
-        estimated_dates = [
-            estimated
-            for estimated in (
-                _estimated_weekday_horizon_date(row.get("entry_date") or row.get("date"), horizon)
-                for row in pending.to_dict(orient="records")
-            )
-            if estimated
-        ]
+        pending_records = pending.to_dict(orient="records")
+        pending_dates = [_resolve_outcome_maturity_date(row, horizon) for row in pending_records]
+        estimated_dates = [item for item in pending_dates if item]
         forecast[key] = {
             "pending_count": int(len(pending)),
+            "due_pending_count": 0,
+            "pending_maturity_dates": pending_dates,
             "evaluable_count": evaluable_count,
             "remaining_to_min_evaluable": max(int(min_evaluable) - evaluable_count, 0),
             "estimated_next_evaluable_date": min(estimated_dates) if estimated_dates else None,
@@ -3645,6 +4130,53 @@ def build_stock_target_review_outcome_analysis(
     return analysis, payload
 
 
+def _cached_stock_target_review_outcome_analysis(
+    history: pd.DataFrame,
+    history_payload: dict[str, Any],
+    *,
+    min_evaluable: int,
+    min_group_evaluable: int,
+    cache_dir: Path,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    history_text = history.to_csv(index=False, float_format="%.17g")
+    fingerprint_payload = {
+        "version": 1,
+        "history_sha256": hashlib.sha256(history_text.encode("utf-8")).hexdigest(),
+        "min_evaluable": int(min_evaluable),
+        "min_group_evaluable": int(min_group_evaluable),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    analysis_path = cache_dir / "outcome_analysis.csv"
+    payload_path = cache_dir / "outcome_analysis.json"
+    metadata_path = cache_dir / "outcome_analysis_cache.json"
+    if analysis_path.exists() and payload_path.exists() and metadata_path.exists():
+        metadata = _read_json(metadata_path)
+        cached_payload = _read_json(payload_path)
+        if metadata.get("fingerprint") == fingerprint and cached_payload:
+            try:
+                cached_analysis = pd.read_csv(analysis_path, float_precision="round_trip")
+            except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                cached_analysis = None
+            if cached_analysis is not None:
+                return cached_analysis, cached_payload
+
+    analysis, payload = build_stock_target_review_outcome_analysis(
+        history,
+        history_payload,
+        min_evaluable=min_evaluable,
+        min_group_evaluable=min_group_evaluable,
+    )
+    write_text_if_changed(analysis_path, analysis.to_csv(index=False, float_format="%.17g"))
+    write_text_if_changed(payload_path, json.dumps(payload, ensure_ascii=False, indent=2))
+    write_text_if_changed(
+        metadata_path,
+        json.dumps({"version": 1, "fingerprint": fingerprint}, ensure_ascii=False, indent=2),
+    )
+    return analysis, payload
+
+
 def _calendar_reference_date(value: Any) -> str | None:
     parsed = pd.to_datetime(value, errors="coerce")
     if pd.isna(parsed):
@@ -3671,20 +4203,42 @@ def build_stock_target_review_outcome_calendar(
         forecast_item = forecast.get(key, {}) or {}
         readiness_item = readiness.get(key, {}) or {}
         pending_count = int(_as_float(forecast_item.get("pending_count"), 0.0))
+        due_pending_count = int(_as_float(forecast_item.get("due_pending_count"), 0.0))
         evaluable_count = int(_as_float(forecast_item.get("evaluable_count"), 0.0))
         remaining = int(_as_float(forecast_item.get("remaining_to_min_evaluable"), 0.0))
         next_date = forecast_item.get("estimated_next_evaluable_date")
         all_by = forecast_item.get("estimated_all_pending_mature_by")
         total_after_pending = int(_as_float(forecast_item.get("estimated_total_after_pending_mature"), evaluable_count))
         readiness_status = str(readiness_item.get("status") or "unknown")
+        maturity_dates = [
+            pd.to_datetime(item, errors="coerce") for item in (forecast_item.get("pending_maturity_dates") or [])
+        ]
+        mature_dates = [
+            item
+            for item in maturity_dates
+            if pd.notna(item) and pd.Timestamp(item).normalize() <= pd.Timestamp(reference_ts).normalize()
+        ] if pd.notna(reference_ts) else []
+        if due_pending_count <= 0 and mature_dates:
+            due_pending_count = int(len(mature_dates))
+
         next_ts = pd.to_datetime(next_date, errors="coerce")
         days_until_next = None
         if pd.notna(reference_ts) and pd.notna(next_ts):
             days_until_next = int((pd.Timestamp(next_ts).normalize() - pd.Timestamp(reference_ts).normalize()).days)
+
+        maturity_state = "pending_maturity"
+        if due_pending_count > 0:
+            maturity_state = "due_for_recheck"
+            if mature_dates:
+                earliest_due = pd.Timestamp(min(mature_dates))
+                days_until_next = int((earliest_due.normalize() - pd.Timestamp(reference_ts).normalize()).days)
+                next_ts = earliest_due
         if pending_count <= 0:
             maturity_state = "no_pending"
         elif days_until_next is None:
             maturity_state = "pending_date_unknown"
+        elif due_pending_count > 0:
+            maturity_state = "due_for_recheck"
         elif days_until_next <= 0:
             maturity_state = "due_for_recheck"
         else:
@@ -3696,6 +4250,7 @@ def build_stock_target_review_outcome_calendar(
             "readiness_status": readiness_status,
             "maturity_state": maturity_state,
             "pending_count": pending_count,
+            "due_pending_count": due_pending_count,
             "evaluable_count": evaluable_count,
             "remaining_to_min_evaluable": remaining,
             "estimated_next_evaluable_date": next_date,
@@ -3742,7 +4297,9 @@ def build_stock_target_review_outcome_calendar(
     calendar_ready_count = int((calendar["readiness_status"] == "ready_for_group_review").sum()) if not calendar.empty else 0
     calendar_pending_count = int(calendar["pending_count"].sum()) if not calendar.empty else 0
     calendar_due_count = int((calendar["maturity_state"] == "due_for_recheck").sum()) if not calendar.empty else 0
-    calendar_due_pending_count = int(calendar.loc[calendar["maturity_state"] == "due_for_recheck", "pending_count"].sum()) if calendar_due_count else 0
+    calendar_due_pending_count = int(
+        calendar.loc[calendar["maturity_state"] == "due_for_recheck", "due_pending_count"].sum()
+    ) if calendar_due_count else 0
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "as_of_date": reference_date,
@@ -3805,7 +4362,7 @@ def build_stock_target_review_outcome_due_queue(
         next_due_date = due["estimated_next_evaluable_date"].iloc[0]
         next_due_horizon = due["horizon"].iloc[0]
 
-    due_pending_count = int(due["pending_count"].sum()) if not due.empty else 0
+    due_pending_count = int(due["due_pending_count"].sum()) if not due.empty else 0
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "as_of_date": calendar_payload.get("as_of_date"),
@@ -3930,7 +4487,7 @@ def _render_stock_target_review_outcome_due_report(due: pd.DataFrame, payload: d
             "| {rank} | `{horizon}` | {pending} | {next_date} | {days} | {action} |".format(
                 rank=int(_as_float(row.get("due_rank"), 0.0)),
                 horizon=_md_text(row.get("horizon"), 20),
-                pending=int(_as_float(row.get("pending_count"), 0.0)),
+                pending=int(_as_float(row.get("due_pending_count"), _as_float(row.get("pending_count"), 0.0))),
                 next_date=row.get("estimated_next_evaluable_date") or "N/A",
                 days=row.get("days_until_next_evaluable") if pd.notna(row.get("days_until_next_evaluable")) else "N/A",
                 action="refresh_local_ohlcv_and_rerun_outcomes",
@@ -4214,8 +4771,10 @@ This is a research-only stock-level target decomposition from local backtest tra
 | Status | `{payload.get("status")}` |
 | Latest date | {payload.get("latest_date", "N/A")} |
 | Stock target rows | {payload.get("stock_target_count", 0)} |
+| Source rows before review exclusion | {payload.get("source_stock_target_count", payload.get("stock_target_count", 0))} |
 | Active stock targets | {payload.get("active_stock_target_count", 0)} |
 | Suppressed stock rows | {payload.get("suppressed_stock_count", 0)} |
+| Review-required rows excluded | {payload.get("review_required_excluded_count", 0)} |
 | Large-cap rows excluded from tracking | {payload.get("stock_tracking_excluded_large_market_cap_count", 0)} |
 | Max tracking market cap | {payload.get("stock_tracking_max_market_cap_yi", "N/A")} Yi Yuan |
 | Market-cap missing rows | {payload.get("stock_tracking_market_cap_missing_count", 0)} |
@@ -4347,6 +4906,7 @@ def run_paper_account(
     stock_review_watch_score_threshold: float = 30.0,
     stock_review_outcome_min_evaluable: int = DEFAULT_STOCK_REVIEW_OUTCOME_MIN_EVALUABLE,
     stock_review_outcome_min_group_evaluable: int = DEFAULT_STOCK_REVIEW_OUTCOME_MIN_GROUP_EVALUABLE,
+    market_snapshot: MarketSnapshotLoadResult | None = None,
 ) -> PaperAccountResult:
     root = Path(project_root).resolve()
     resolved_config = _resolve(root, config_path, DEFAULT_PAPER_CONFIG)
@@ -4360,7 +4920,12 @@ def run_paper_account(
     )
 
     base_config = load_portfolio_config(resolved_config)
-    base_equity = _window_equity_frame(base_config, resolved_allocator)
+    base_equity = _window_equity_frame(
+        base_config,
+        resolved_allocator,
+        config_path=resolved_config,
+        cache_dir=resolved_output / ".cache",
+    )
     ledger, audit, metrics, monthly = build_paper_account_ledger(
         base_equity,
         initial_cash=base_config.initial_cash,
@@ -4375,6 +4940,7 @@ def run_paper_account(
         trigger_signal_path=trigger_signal_path,
         stock_market_cap_path=stock_market_cap_path,
         stock_tracking_max_market_cap_yi=stock_tracking_max_market_cap_yi,
+        market_snapshot=market_snapshot,
     )
     stock_target_review, stock_target_review_payload = build_stock_target_review(
         stock_targets,
@@ -4384,6 +4950,14 @@ def run_paper_account(
         loss_attention_threshold=stock_review_loss_attention_threshold,
         gain_attention_threshold=stock_review_gain_attention_threshold,
         watch_score_threshold=stock_review_watch_score_threshold,
+    )
+    stock_targets, stock_targets_payload, stock_target_review, stock_target_review_payload = (
+        apply_review_required_observation_exclusion(
+            stock_targets,
+            stock_targets_payload,
+            stock_target_review,
+            stock_target_review_payload,
+        )
     )
     stock_target_review_notes_snapshot_path = resolved_output / "stock_target_review_notes.csv"
     stock_target_review, notes_payload = sync_stock_target_review_notes(
@@ -4396,11 +4970,15 @@ def run_paper_account(
         stock_target_review,
         stock_target_review_payload,
     )
+    price_history_cache: dict[str, tuple[pd.DataFrame, str]] = {}
+    price_history_cache_dir = resolved_output / ".cache" / "stock_price_history"
     stock_target_review_assistant, stock_target_review_assistant_payload = build_stock_target_review_assistant(
         root,
         stock_target_review,
         stock_target_review_actions,
         stock_target_review_payload,
+        price_history_cache=price_history_cache,
+        price_history_cache_dir=price_history_cache_dir,
     )
     stock_target_review_decision_template, stock_target_review_decision_template_payload = build_stock_target_review_decision_template(
         stock_target_review_assistant,
@@ -4411,6 +4989,8 @@ def run_paper_account(
         stock_target_review,
         stock_target_review_actions,
         stock_target_review_payload,
+        price_history_cache=price_history_cache,
+        price_history_cache_dir=price_history_cache_dir,
     )
     stock_target_review_outcomes_history_snapshot_path = resolved_output / "stock_target_review_outcomes_history.csv"
     stock_target_review_outcomes_history, stock_target_review_outcomes_history_payload = sync_stock_target_review_outcomes_history(
@@ -4418,11 +4998,12 @@ def run_paper_account(
         resolved_stock_review_outcomes_history,
         stock_target_review_outcomes_history_snapshot_path,
     )
-    stock_target_review_outcome_analysis, stock_target_review_outcome_analysis_payload = build_stock_target_review_outcome_analysis(
+    stock_target_review_outcome_analysis, stock_target_review_outcome_analysis_payload = _cached_stock_target_review_outcome_analysis(
         stock_target_review_outcomes_history,
         stock_target_review_outcomes_history_payload,
         min_evaluable=stock_review_outcome_min_evaluable,
         min_group_evaluable=stock_review_outcome_min_group_evaluable,
+        cache_dir=resolved_output / ".cache" / "outcome_analysis",
     )
     stock_target_review_outcome_calendar, stock_target_review_outcome_calendar_payload = build_stock_target_review_outcome_calendar(
         stock_target_review_outcome_analysis_payload,
@@ -4487,6 +5068,7 @@ def run_paper_account(
             "stock_market_cap_cache_latest_snapshot_date": stock_targets_payload.get("stock_market_cap_cache_latest_snapshot_date"),
             "stock_market_cap_cache_updated_at": stock_targets_payload.get("stock_market_cap_cache_updated_at"),
             "stock_target_review_required_count": stock_target_review_payload.get("review_required_count"),
+            "stock_target_review_excluded_count": stock_target_review_payload.get("excluded_review_required_count"),
             "stock_target_review_monitor_count": stock_target_review_payload.get("monitor_count"),
             "stock_target_review_drawdown_count": stock_target_review_payload.get("drawdown_review_count"),
             "stock_target_review_manual_note_count": stock_target_review_payload.get("manual_note_count"),
@@ -4748,27 +5330,14 @@ def run_paper_account(
         ),
         encoding="utf-8",
     )
-    stock_target_review_decision_template.to_csv(
-        stock_target_review_decision_template_path,
-        index=False,
-        encoding="utf-8",
-    )
-    stock_target_review_decision_template_json_path.write_text(
-        json.dumps(stock_target_review_decision_template_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    stock_target_review_decision_template_report_path.write_text(
-        _render_stock_target_review_decision_template_report(
-            stock_target_review_decision_template,
-            stock_target_review_decision_template_payload,
-            resolved_output,
-        ),
-        encoding="utf-8",
-    )
-    write_stock_target_review_decision_template_xlsx(
+    _publish_stock_target_review_decision_template(
         stock_target_review_decision_template,
         stock_target_review_decision_template_payload,
-        stock_target_review_decision_template_xlsx_path,
+        output_dir=resolved_output,
+        csv_path=stock_target_review_decision_template_path,
+        json_path=stock_target_review_decision_template_json_path,
+        report_path=stock_target_review_decision_template_report_path,
+        xlsx_path=stock_target_review_decision_template_xlsx_path,
     )
     stock_target_review_outcomes.to_csv(stock_target_review_outcomes_path, index=False, encoding="utf-8")
     stock_target_review_outcomes_json_path.write_text(

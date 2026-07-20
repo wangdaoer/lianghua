@@ -1,0 +1,15 @@
+extends: portfolio_core_source_selection_quality_reversal_highyield_dd50.yaml
+
+project:
+  name: main_chinext_core_source_selection_quality_reversal_highyield_dd50_highgain_dd40
+
+satellite_sources:
+  highgain_dd40_protected:
+    path: outputs/walk_forward/wf_next_highgain_only_entry_highgain_dd40_grid_v2_capital_gate_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+notes: >
+  Research-only source-selection config that adds the protected highgain-dd40
+  walk-forward curve as a high-risk satellite candidate. The curve comes from
+  the opportunity_v2 grid with validation-gated candidate selection, capital
+  objective, and 40% drawdown tolerance.

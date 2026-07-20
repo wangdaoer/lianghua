@@ -82,6 +82,7 @@ from quant_etf_lab.portfolio import (
     PortfolioResult,
     PortfolioSourceCandidate,
     SatelliteFilterConfig,
+    _apply_source_group_preselection,
     _select_source_candidate,
     build_portfolio_source_candidate_grid,
     build_portfolio_candidate_grid,
@@ -100,6 +101,7 @@ from quant_etf_lab.strategies import build_signal_frames
 from quant_etf_lab.trading_gate import build_a_share_trading_gate
 from quant_etf_lab.walk_forward import (
     ParameterCandidate,
+    _candidate_selection_gate_reason,
     _walk_forward_validation_dates,
     _signal_warmup_start,
     _trim_signal_frames,
@@ -1851,7 +1853,7 @@ strategy:
         momentum_tuned = load_config(root / "configs" / "custom_watchlist_multifactor_momentum_tuned.yaml")
         self.assertTrue(momentum_tuned.strategy.momentum_focus_enabled)
         self.assertTrue(momentum_tuned.strategy.momentum_focus_only)
-        self.assertAlmostEqual(momentum_tuned.strategy.momentum_focus_threshold_pct, 7.0)
+        self.assertAlmostEqual(momentum_tuned.strategy.momentum_focus_threshold_pct, 5.0)
         self.assertAlmostEqual(momentum_tuned.strategy.momentum_focus_limit_up_boost, 0.20)
         self.assertAlmostEqual(momentum_tuned.strategy.momentum_focus_strong_gain_boost, 0.05)
         self.assertEqual(momentum_tuned.strategy.score_allocation_method, "tilt")
@@ -2331,8 +2333,8 @@ strategy:
         strong = frames["300001"]
         weak = frames["600001"]
 
-        self.assertEqual(strong.loc[3, "momentum_focus_signal"], "limit_up")
-        self.assertAlmostEqual(float(strong.loc[3, "momentum_focus_boost"]), 0.2)
+        self.assertEqual(strong.loc[3, "momentum_focus_signal"], "strong_gain")
+        self.assertAlmostEqual(float(strong.loc[3, "momentum_focus_boost"]), 0.05)
         self.assertFalse(bool(strong.loc[0, "momentum_focus_flag"]))
         self.assertTrue(bool(strong.loc[3, "momentum_focus_flag"]))
         self.assertFalse(bool(weak.loc[2, "momentum_focus_flag"]))
@@ -2777,6 +2779,53 @@ strategy:
         self.assertEqual(options["train_years"], 4)
         self.assertEqual(options["max_train_drawdown"], 0.25)
 
+    def test_walk_forward_opportunity_v2_growthfull_preset(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["walk-forward", "--preset", "opportunity-v2-growthfull"])
+        options = resolve_walk_forward_options(args)
+        self.assertEqual(options["grid"], "stable_v2")
+        self.assertEqual(options["objective"], "opportunity_growth")
+        self.assertEqual(options["train_years"], 4)
+        self.assertEqual(options["max_train_drawdown"], 0.28)
+        self.assertEqual(options["test_months"], 12)
+        self.assertEqual(options["step_months"], 6)
+
+    def test_walk_forward_highgain_dd40_preset(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["walk-forward", "--preset", "highgain-dd40"])
+        options = resolve_walk_forward_options(args)
+        self.assertEqual(options["grid"], "opportunity_v2")
+        self.assertEqual(options["objective"], "capital")
+        self.assertEqual(options["train_years"], 4)
+        self.assertEqual(options["test_months"], 6)
+        self.assertEqual(options["step_months"], 6)
+        self.assertEqual(options["max_train_drawdown"], 0.40)
+        self.assertEqual(options["selection_validation_months"], 6)
+
+    def test_walk_forward_opportunity_v2_q_full_preset(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["walk-forward", "--preset", "opportunity-v2-q-full"])
+        options = resolve_walk_forward_options(args)
+        self.assertEqual(options["grid"], "stable_v2")
+        self.assertEqual(options["objective"], "opportunity_q_full")
+        self.assertEqual(options["train_years"], 4)
+        self.assertEqual(options["max_train_drawdown"], 0.25)
+        self.assertEqual(options["test_months"], 12)
+        self.assertEqual(options["step_months"], 6)
+        self.assertEqual(options["selection_validation_months"], 6)
+
+    def test_walk_forward_opportunity_v2_q_full_aggressive_preset(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["walk-forward", "--preset", "opportunity-v2-q-full-aggressive"])
+        options = resolve_walk_forward_options(args)
+        self.assertEqual(options["grid"], "stable_v2")
+        self.assertEqual(options["objective"], "opportunity_q_full")
+        self.assertEqual(options["train_years"], 4)
+        self.assertEqual(options["max_train_drawdown"], 0.28)
+        self.assertEqual(options["test_months"], 12)
+        self.assertEqual(options["step_months"], 6)
+        self.assertEqual(options["selection_validation_months"], 0)
+
     def test_walk_forward_main_chinext_stable_preset(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["walk-forward", "--preset", "main-chinext-stable"])
@@ -2862,6 +2911,20 @@ strategy:
         options = resolve_walk_forward_options(args)
         self.assertEqual(args.objective, "opportunity_quality")
         self.assertEqual(options["objective"], "opportunity_quality")
+
+    def test_walk_forward_opportunity_growth_objective_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["walk-forward", "--objective", "opportunity_growth"])
+        options = resolve_walk_forward_options(args)
+        self.assertEqual(args.objective, "opportunity_growth")
+        self.assertEqual(options["objective"], "opportunity_growth")
+
+    def test_walk_forward_opportunity_q_full_objective_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["walk-forward", "--objective", "opportunity_q_full"])
+        options = resolve_walk_forward_options(args)
+        self.assertEqual(args.objective, "opportunity_q_full")
+        self.assertEqual(options["objective"], "opportunity_q_full")
 
     def test_walk_forward_selection_validation_chooses_validation_winner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2970,6 +3033,113 @@ strategy:
             self.assertEqual(str(summary.iloc[0]["validation_start"]), "20210701")
             self.assertIn("selected_validation_score", summary.columns)
 
+    def test_walk_forward_opportunity_v2_gate_keeps_current_when_new_candidate_validation_loses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = make_config(root)
+            config = config.__class__(
+                project_root=config.project_root,
+                project=config.project,
+                data=config.data.__class__(start_date="20180101", end_date="20220630", period="daily", adjust="qfq"),
+                universe=config.universe,
+                strategy=config.strategy,
+                costs=config.costs,
+                universe_file=config.universe_file,
+                universe_source=config.universe_source,
+                risk=config.risk,
+            )
+            dates = pd.date_range("2018-01-01", "2022-06-30", freq="D")
+            histories = {
+                "TEST": pd.DataFrame(
+                    {
+                        "date": dates,
+                        "open": np.full(len(dates), 10.0),
+                        "high": np.full(len(dates), 10.5),
+                        "low": np.full(len(dates), 9.5),
+                        "close": np.full(len(dates), 10.0),
+                        "volume": np.full(len(dates), 1000.0),
+                    }
+                )
+            }
+            candidates = (
+                ParameterCandidate("current_reb10_risk_loose", {"momentum": 1.0}, 10, 10, {}),
+                ParameterCandidate("strong_gain_quality_reb15_risk_growth_dd40", {"momentum": 0.8, "trend": 0.2}, 15, 12, {}),
+            )
+
+            def fake_result(run_id: str, run_dir: Path, start_date: str, rebalance: int) -> BacktestResult:
+                is_validation = start_date == "20210701"
+                if is_validation and rebalance == 15:
+                    total_return, cagr, sharpe = -0.01, -0.02, 0.8
+                elif is_validation:
+                    total_return, cagr, sharpe = -0.15, -0.20, -0.8
+                elif rebalance == 15:
+                    total_return, cagr, sharpe = 0.40, 0.12, 0.9
+                else:
+                    total_return, cagr, sharpe = -0.05, -0.02, -0.2
+                equity = pd.DataFrame(
+                    {
+                        "date": pd.to_datetime([start_date, pd.Timestamp(start_date) + pd.Timedelta(days=1)]),
+                        "equity": [100000.0, 100000.0 * (1.0 + total_return)],
+                    }
+                )
+                metrics = {
+                    "final_equity": float(equity["equity"].iloc[-1]),
+                    "total_return": total_return,
+                    "benchmark_return": 0.0,
+                    "excess_return": total_return,
+                    "cagr": cagr,
+                    "max_drawdown": -0.05,
+                    "sharpe": sharpe,
+                    "trade_count": 10,
+                    "win_rate": 0.6,
+                    "payoff_ratio": 1.2,
+                    "profit_factor": 1.3,
+                    "average_position_exposure": 0.5,
+                    "average_risk_exposure": 0.5,
+                }
+                return BacktestResult(
+                    run_id=run_id,
+                    run_dir=run_dir,
+                    equity=equity,
+                    trades=pd.DataFrame(),
+                    benchmark=pd.DataFrame(),
+                    monthly_returns=pd.DataFrame(),
+                    metrics=metrics,
+                    risk_curve=pd.DataFrame(),
+                    risk_events=pd.DataFrame(),
+                    cooldown_events=pd.DataFrame(),
+                )
+
+            def fake_run_backtest(backtest_config, histories, signal_frames, run_id, write_outputs):
+                return fake_result(
+                    run_id,
+                    root / "outputs" / "backtests" / run_id,
+                    backtest_config.data.start_date,
+                    int(backtest_config.strategy.factor_rebalance_interval),
+                )
+
+            with (
+                patch("quant_etf_lab.walk_forward.load_universe_history", return_value=histories),
+                patch("quant_etf_lab.walk_forward.build_parameter_grid", return_value=candidates),
+                patch("quant_etf_lab.walk_forward.build_signal_frames", return_value={}),
+                patch("quant_etf_lab.walk_forward.run_backtest", side_effect=fake_run_backtest),
+                patch("quant_etf_lab.walk_forward.write_report", return_value=root / "report.html"),
+            ):
+                _, summary = run_walk_forward(
+                    config,
+                    train_years=4,
+                    test_months=6,
+                    step_months=6,
+                    grid="opportunity_v2",
+                    objective="capital",
+                    selection_validation_months=6,
+                    output_dir=root / "wf",
+                    run_id_prefix="selection_gate",
+                    window_limit=1,
+                )
+
+            self.assertEqual(summary.iloc[0]["selected_candidate"], "current_reb10_risk_loose")
+
     def test_data_update_continue_on_error_flag(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["data", "update", "--continue-on-error"])
@@ -2993,6 +3163,10 @@ strategy:
                 "2024-04-02",
                 "--lookback-days",
                 "5",
+                "--daily-data-dir",
+                "D:/codex/daily-market-data",
+                "--ingest-project-dir",
+                "D:/codex/2026-06-15-exchange-data-ingest",
             ]
         )
         self.assertEqual(args.data_command, "update-market-cap")
@@ -3002,6 +3176,9 @@ strategy:
         self.assertEqual(args.symbols_file, "outputs/research/paper/stock_targets.csv")
         self.assertEqual(args.as_of_date, "2024-04-02")
         self.assertEqual(args.lookback_days, 5)
+        self.assertEqual(args.daily_data_dir, "D:/codex/daily-market-data")
+        self.assertEqual(args.ingest_project_dir, "D:/codex/2026-06-15-exchange-data-ingest")
+        self.assertFalse(args.no_local_daily)
 
     def test_backtest_skip_missing_flag(self) -> None:
         parser = build_parser()
@@ -3170,7 +3347,9 @@ strategy:
 
     def test_research_allocator_cli_defaults_use_promoted_candidate(self) -> None:
         parser = build_parser()
-        expected = "outputs/portfolio_source_selection/main_chinext_portfolio_source_selection_validation6_v1"
+        expected = (
+            "outputs/portfolio_source_selection/main_chinext_source_selection_highgain_pos8_dd50_cap30_activation_dd50_20260624"
+        )
         expected_components = "outputs/research/phase2_model_status_source_selection_default_20260614/phase2_components.csv"
         expected_market_data = "D:/codex/daily-market-data"
 
@@ -3579,6 +3758,10 @@ strategy:
                 "outputs/research/history_review",
                 "--satellite-risk-budget-output-dir",
                 "outputs/research/satellite_risk_budget",
+                "--satellite-trial-replay-output-dir",
+                "outputs/research/satellite_trial_replay",
+                "--satellite-trial-replay-horizons",
+                "1d,5d,10d",
                 "--live-shadow-output-dir",
                 "outputs/research/live_shadow",
                 "--live-shadow-preflight",
@@ -3676,6 +3859,8 @@ strategy:
         self.assertEqual(args.history_file, "outputs/research/history.csv")
         self.assertEqual(args.history_review_output_dir, "outputs/research/history_review")
         self.assertEqual(args.satellite_risk_budget_output_dir, "outputs/research/satellite_risk_budget")
+        self.assertEqual(args.satellite_trial_replay_output_dir, "outputs/research/satellite_trial_replay")
+        self.assertEqual(args.satellite_trial_replay_horizons, "1d,5d,10d")
         self.assertEqual(args.live_shadow_output_dir, "outputs/research/live_shadow")
         self.assertTrue(args.live_shadow_preflight)
         self.assertTrue(args.live_shadow_preflight_fail_on_blocked)
@@ -3693,7 +3878,7 @@ strategy:
         self.assertAlmostEqual(args.min_cache_fresh_ratio, 0.8)
         self.assertAlmostEqual(args.rebalance_cost_rate, 0.0003)
         self.assertEqual(args.stock_market_cap_path, "data/processed/stock_market_cap_yi.csv")
-        self.assertAlmostEqual(args.stock_tracking_max_market_cap_yi, 1500)
+        self.assertAlmostEqual(args.stock_tracking_max_market_cap_yi, 1500.0)
         self.assertEqual(args.stock_review_notes_path, "outputs/research/stock_target_review_notes.csv")
         self.assertEqual(args.stock_review_outcomes_history_path, "outputs/research/stock_target_review_outcomes_history.csv")
         self.assertAlmostEqual(args.stock_review_drawdown_threshold, -0.08)
@@ -4137,7 +4322,7 @@ strategy:
         self.assertAlmostEqual(args.rebalance_cost_rate, 0.001)
         self.assertEqual(args.trigger_signal_path, "outputs/signal_history/signals_latest.csv")
         self.assertEqual(args.stock_market_cap_path, "data/processed/stock_market_cap_yi.csv")
-        self.assertAlmostEqual(args.stock_tracking_max_market_cap_yi, 1500)
+        self.assertAlmostEqual(args.stock_tracking_max_market_cap_yi, 1500.0)
         self.assertEqual(args.stock_review_notes_path, "outputs/research/stock_target_review_notes.csv")
         self.assertEqual(args.stock_review_outcomes_history_path, "outputs/research/stock_target_review_outcomes_history.csv")
         self.assertAlmostEqual(args.stock_review_drawdown_threshold, -0.08)
@@ -5300,25 +5485,28 @@ weights:
             self.assertTrue(result.report_path.exists())
             self.assertEqual(len(result.ledger), 8)
             self.assertEqual(len(result.target_holdings), 3)
-            self.assertEqual(len(result.stock_targets), 3)
+            self.assertEqual(len(result.stock_targets), 2)
             self.assertEqual(len(result.stock_target_review), 3)
             self.assertEqual(set(result.target_holdings["layer"]), {"core", "satellite", "cash"})
             self.assertAlmostEqual(float(result.target_holdings["target_weight"].sum()), 1.0)
-            self.assertAlmostEqual(float(result.stock_targets["portfolio_target_weight"].sum()), 1.0)
-            self.assertEqual(int(result.stock_targets_payload["active_stock_target_count"]), 2)
+            self.assertLess(float(result.stock_targets["portfolio_target_weight"].sum()), 1.0)
+            self.assertEqual(int(result.stock_targets_payload["active_stock_target_count"]), 1)
             self.assertEqual(int(result.stock_targets_payload["suppressed_stock_count"]), 1)
             self.assertEqual(result.stock_targets_payload["trigger_signal_status"], "ok")
-            self.assertEqual(int(result.stock_targets_payload["trigger_match_count"]), 1)
-            self.assertEqual(int(result.stock_target_review_payload["review_required_count"]), 1)
+            self.assertEqual(int(result.stock_targets_payload["trigger_match_count"]), 0)
+            self.assertEqual(int(result.stock_targets_payload["review_required_excluded_count"]), 1)
+            self.assertEqual(result.stock_targets_payload["review_required_excluded_codes"], ["000001"])
+            self.assertEqual(int(result.stock_target_review_payload["review_required_count"]), 0)
+            self.assertEqual(int(result.stock_target_review_payload["excluded_review_required_count"]), 1)
             self.assertGreaterEqual(int(result.stock_target_review_payload["monitor_count"]), 1)
             self.assertEqual(int(result.stock_target_review_payload["manual_note_count"]), 0)
-            self.assertEqual(int(result.stock_target_review_payload["review_required_unreviewed_count"]), 1)
+            self.assertEqual(int(result.stock_target_review_payload["review_required_unreviewed_count"]), 0)
             self.assertEqual(int(result.stock_target_review_payload["manual_pending_count"]), 3)
             self.assertEqual(int(result.stock_target_review_payload["manual_watch_count"]), 0)
-            self.assertEqual(int(result.stock_target_review_actions_payload["action_count"]), 1)
-            self.assertEqual(int(result.stock_target_review_actions_payload["review_required_pending_count"]), 1)
+            self.assertEqual(int(result.stock_target_review_actions_payload["action_count"]), 0)
+            self.assertEqual(int(result.stock_target_review_actions_payload["review_required_pending_count"]), 0)
             self.assertEqual(int(result.stock_target_review_assistant_payload["assistant_row_count"]), 3)
-            self.assertEqual(int(result.stock_target_review_assistant_payload["review_required_pending_count"]), 1)
+            self.assertEqual(int(result.stock_target_review_assistant_payload["review_required_pending_count"]), 0)
             self.assertEqual(int(result.stock_target_review_decision_template_payload["decision_template_row_count"]), 3)
             self.assertEqual(int(result.stock_target_review_decision_template_payload["blank_manual_status_count"]), 3)
             self.assertEqual(int(result.stock_target_review_outcomes_payload["outcome_row_count"]), 3)
@@ -5347,10 +5535,10 @@ weights:
             self.assertIn("trigger_monitor_status", result.stock_targets.columns)
             self.assertIn("unrealized_return", result.stock_targets.columns)
             self.assertIn("multi_factor", ";".join(result.stock_targets["source_strategy_profile"].astype(str)))
-            matched_stock = result.stock_targets[result.stock_targets["code"] == "000001"].iloc[0]
-            self.assertEqual(matched_stock["trigger_monitor_status"], "matched_latest_trigger")
-            self.assertEqual(matched_stock["trigger_signal_type"], "观察")
-            self.assertAlmostEqual(float(matched_stock["unrealized_return"]), 0.2)
+            self.assertNotIn("000001", set(result.stock_targets["code"]))
+            matched_review = result.stock_target_review[result.stock_target_review["code"] == "000001"].iloc[0]
+            self.assertEqual(matched_review["review_stage"], "excluded")
+            self.assertTrue(bool(matched_review["observation_excluded"]))
             suppressed_stock = result.stock_targets[result.stock_targets["target_action"] == "suppressed_by_layer_weight"].iloc[0]
             self.assertEqual(suppressed_stock["risk_filter_status"], "blocked_by_layer_weight")
             self.assertEqual(result.target_holdings_payload["broker_action"], "none")
@@ -5359,11 +5547,12 @@ weights:
             self.assertEqual(result.metrics["latest_candidate"], "core_only")
             self.assertEqual(result.metrics["target_holdings_path"], str(root / "paper" / "target_holdings.csv"))
             self.assertEqual(result.metrics["stock_targets_path"], str(root / "paper" / "stock_targets.csv"))
-            self.assertEqual(result.metrics["stock_target_trigger_match_count"], 1)
-            self.assertEqual(result.metrics["stock_target_review_required_count"], 1)
-            self.assertEqual(result.metrics["stock_target_review_required_unreviewed_count"], 1)
+            self.assertEqual(result.metrics["stock_target_trigger_match_count"], 0)
+            self.assertEqual(result.metrics["stock_target_review_required_count"], 0)
+            self.assertEqual(result.metrics["stock_target_review_excluded_count"], 1)
+            self.assertEqual(result.metrics["stock_target_review_required_unreviewed_count"], 0)
             self.assertEqual(result.metrics["stock_target_review_manual_pending_count"], 3)
-            self.assertEqual(result.metrics["stock_target_review_action_count"], 1)
+            self.assertEqual(result.metrics["stock_target_review_action_count"], 0)
             self.assertEqual(result.metrics["stock_target_review_assistant_count"], 3)
             self.assertEqual(result.metrics["stock_target_review_decision_template_count"], 3)
             self.assertEqual(result.metrics["stock_target_review_decision_template_blank_status_count"], 3)
@@ -5400,7 +5589,7 @@ weights:
             self.assertIn("Persistent notes CSV", review_report_text)
             action_report_text = result.stock_target_review_actions_report_path.read_text(encoding="utf-8")
             self.assertIn("Paper Stock Target Review Actions", action_report_text)
-            self.assertIn("review_required_pending", action_report_text)
+            self.assertIn("No open stock-target review actions", action_report_text)
             assistant_report_text = result.stock_target_review_assistant_report_path.read_text(encoding="utf-8")
             self.assertIn("Paper Stock Target Review Assistant", assistant_report_text)
             self.assertIn("Manual Status Guide", assistant_report_text)
@@ -7331,6 +7520,73 @@ weights:
         self.assertEqual(strict_payload["analysis_status"], "sample_insufficient")
         self.assertEqual(strict_payload["horizon_readiness"]["1d"]["status"], "insufficient_overall_sample")
 
+    def test_stock_target_review_outcome_calendar_due_counts_only_due_rows(self) -> None:
+        history = pd.DataFrame(
+            [
+                {
+                    "date": "2024-04-01",
+                    "layer": "core",
+                    "code": "000001",
+                    "name": "One",
+                    "review_bucket": "trigger_review",
+                    "review_stage": "review_required",
+                    "action_code": "review_required_pending",
+                    "manual_status_normalized": "unreviewed",
+                    "outcome_status": "pending",
+                    "entry_date": "2024-04-01",
+                    "return_1d": 0.01,
+                    "outcome_status_1d": "available",
+                    "return_5d": pd.NA,
+                    "outcome_status_5d": "pending",
+                    "return_10d": pd.NA,
+                    "outcome_status_10d": "pending",
+                    "return_20d": pd.NA,
+                    "outcome_status_20d": "pending",
+                    "broker_action": "none",
+                    "research_only": True,
+                },
+                {
+                    "date": "2024-04-04",
+                    "layer": "core",
+                    "code": "000002",
+                    "name": "Two",
+                    "review_bucket": "trigger_review",
+                    "review_stage": "review_required",
+                    "action_code": "review_required_pending",
+                    "manual_status_normalized": "unreviewed",
+                    "outcome_status": "pending",
+                    "entry_date": "2024-04-04",
+                    "return_1d": -0.01,
+                    "outcome_status_1d": "available",
+                    "return_5d": pd.NA,
+                    "outcome_status_5d": "pending",
+                    "return_10d": pd.NA,
+                    "outcome_status_10d": "pending",
+                    "return_20d": pd.NA,
+                    "outcome_status_20d": "pending",
+                    "broker_action": "none",
+                    "research_only": True,
+                },
+            ]
+        )
+
+        analysis, payload = build_stock_target_review_outcome_analysis(
+            history,
+            {"history_path": "history.csv", "history_row_count": 2, "history_latest_review_date": "2024-04-04"},
+            min_evaluable=1,
+            min_group_evaluable=1,
+        )
+        calendar, calendar_payload = build_stock_target_review_outcome_calendar(payload, as_of_date="2024-04-09")
+        five_day_row = calendar[calendar["horizon"] == "5d"].iloc[0]
+        self.assertEqual(int(five_day_row["pending_count"]), 2)
+        self.assertEqual(int(five_day_row["due_pending_count"]), 1)
+        self.assertEqual(calendar_payload["calendar_pending_count"], 6)
+        self.assertEqual(calendar_payload["calendar_due_count"], 1)
+        self.assertEqual(calendar_payload["calendar_due_pending_count"], 1)
+        due, due_payload = build_stock_target_review_outcome_due_queue(calendar, calendar_payload)
+        self.assertEqual(int(due_payload["due_row_count"]), 1)
+        self.assertEqual(int(due_payload["due_pending_count"]), 1)
+
     def test_dashboard_writes_unified_local_overview(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -8151,6 +8407,23 @@ weights:
                     "recommended_satellite_budget": 0.0,
                     "selected_horizon": "",
                     "outcome_ready_horizon_count": 0,
+                    "satellite_trial_rule_count": 2,
+                    "satellite_trial_rules_path": str(root / "risk" / "satellite_trial_rules.csv"),
+                    "satellite_trial_rules_json_path": str(root / "risk" / "satellite_trial_rules.json"),
+                },
+            )
+            fake_trial_replay_result = SimpleNamespace(
+                output_dir=root / "trial_replay",
+                summary_path=root / "trial_replay" / "satellite_trial_replay_summary.csv",
+                matches_path=root / "trial_replay" / "satellite_trial_replay_matches.csv",
+                snapshot_path=root / "trial_replay" / "satellite_trial_replay_snapshot.json",
+                report_path=root / "trial_replay" / "satellite_trial_replay.md",
+                snapshot={
+                    "status": "completed",
+                    "matched_event_count": 8,
+                    "union_best_horizon": "5d",
+                    "union_best_avg_return_edge": 0.04,
+                    "union_best_win_rate_edge": 0.20,
                 },
             )
 
@@ -8203,6 +8476,9 @@ weights:
                 "quant_etf_lab.daily_pipeline.run_satellite_risk_budget_review",
                 return_value=fake_risk_budget_result,
             ), patch(
+                "quant_etf_lab.daily_pipeline.run_satellite_trial_replay",
+                return_value=fake_trial_replay_result,
+            ), patch(
                 "quant_etf_lab.daily_pipeline.run_live_preflight", return_value=fake_live_preflight
             ), patch(
                 "quant_etf_lab.daily_pipeline.write_daily_alerts", return_value=fake_alerts
@@ -8222,6 +8498,16 @@ weights:
             self.assertEqual(result.snapshot["pipeline_next_step_stage"], "retry_paper_account")
             self.assertEqual(result.snapshot["pipeline_blocker"], "paper_account_step_failed")
             self.assertTrue(result.snapshot["pipeline_user_intervention_required"])
+            self.assertEqual(result.snapshot["satellite_trial_rule_count"], 2)
+            self.assertTrue(str(result.snapshot["satellite_trial_rules_path"]).endswith("satellite_trial_rules.csv"))
+            self.assertTrue(str(result.snapshot["satellite_trial_rules_json_path"]).endswith("satellite_trial_rules.json"))
+            self.assertEqual(result.snapshot["satellite_trial_replay_status"], "completed")
+            self.assertEqual(result.snapshot["satellite_trial_replay_matched_event_count"], 8)
+            self.assertEqual(result.snapshot["satellite_trial_replay_best_horizon"], "5d")
+            self.assertAlmostEqual(result.snapshot["satellite_trial_replay_best_avg_return_edge"], 0.04)
+            self.assertTrue(str(result.snapshot["satellite_trial_replay_report_path"]).endswith("satellite_trial_replay.md"))
+            self.assertIn("Satellite trial rules", result.report_path.read_text(encoding="utf-8"))
+            self.assertIn("Trial replay status", result.report_path.read_text(encoding="utf-8"))
             self.assertTrue(result.paper_account_result.report_path.exists())
             self.assertTrue(result.paper_account_result.stock_target_review_decision_template_path.exists())
             self.assertTrue(result.paper_account_result.stock_target_review_decision_template_json_path.exists())
@@ -8961,6 +9247,37 @@ weights:
         self.assertNotIn("model_audit_needs_attention", codes)
         self.assertNotIn("review_model_build_audit", action_codes)
         self.assertIn("model_audit_resolved_future_dated", codes)
+
+    def test_daily_alerts_downgrade_resolved_model_audit_attention(self) -> None:
+        payload = build_daily_alert_payload(
+            {
+                "as_of_date": "2026-06-27",
+                "data_freshness_status": "fresh_enough",
+                "market_cache_status": "fresh_enough",
+                "allocator_input_status": "fresh_enough",
+                "paper_freshness_status": "fresh_enough",
+                "sentiment_freshness_status": "fresh_enough",
+                "trigger_freshness_status": "fresh_enough",
+                "dashboard_posture": "core_base_watch_allocator_gate",
+                "trading_day_gate_status": "trading_day_data_ready",
+                "model_audit_status": "needs_attention",
+                "model_audit_walk_forward_action_items": 0,
+                "model_audit_walk_forward_resume_candidates": 0,
+                "model_audit_walk_forward_archive_review_candidates": 0,
+                "model_audit_top_action": "",
+                "model_audit_report_path": "audit/model_build_audit.md",
+                "model_audit_actions_path": "audit/walk_forward_run_actions.csv",
+            }
+        )
+
+        codes = {item["code"] for item in payload["alerts"]}
+        action_codes = {item["action_code"] for item in payload["action_items"]}
+        self.assertEqual(payload["alert_level"], "info")
+        self.assertEqual(payload["action_stage"], "monitor")
+        self.assertFalse(payload["action_required"])
+        self.assertNotIn("model_audit_needs_attention", codes)
+        self.assertNotIn("review_model_build_audit", action_codes)
+        self.assertIn("model_audit_resolved_attention", codes)
 
     def test_daily_alerts_flag_correlated_promotion_evidence_as_info(self) -> None:
         payload = build_daily_alert_payload(
@@ -10430,6 +10747,15 @@ satellite_filter:
         self.assertTrue(any(candidate.regime_overrides.get("ma_window") == 60 for candidate in candidates))
         self.assertTrue(any(candidate.regime_overrides.get("risk_on_drop_threshold") == -0.03 for candidate in candidates))
 
+    def test_portfolio_activation_dd50_grid_has_high_satellite_weights(self) -> None:
+        candidates = build_portfolio_candidate_grid("activation_dd50")
+        self.assertTrue(any(candidate.name == "core_only" for candidate in candidates))
+        self.assertTrue(any(candidate.name.startswith("sat30_") for candidate in candidates))
+        self.assertTrue(any(candidate.name.startswith("sat35_") for candidate in candidates))
+        self.assertTrue(any(candidate.name.startswith("sat50_") for candidate in candidates))
+        self.assertTrue(any(candidate.regime_overrides.get("risk_on_drop_threshold") == -0.03 for candidate in candidates))
+        self.assertTrue(any(candidate.satellite_filter.enabled is False for candidate in candidates))
+
     def test_portfolio_source_candidate_grid_crosses_sources_with_allocations(self) -> None:
         sources = {
             "quality": CurveConfig("satellite", Path("quality.csv"), "equity"),
@@ -10459,10 +10785,30 @@ satellite_filter:
         self.assertTrue(any(name.startswith("reversal__sat20_ma60_drop03") for name in source_capped_names))
         self.assertTrue(any(name.startswith("blend_q70_r30__sat25_ma60_drop03") for name in source_capped_names))
 
+    def test_portfolio_source_candidate_grid_activation_dd50_weights(self) -> None:
+        sources = {
+            "quality": CurveConfig("satellite", Path("quality.csv"), "equity"),
+        }
+        candidates = build_portfolio_source_candidate_grid(sources, "activation_dd50")
+        names = [candidate.name for candidate in candidates]
+        self.assertTrue(any(name.startswith("quality__sat30_") for name in names))
+        self.assertTrue(any(name.startswith("quality__sat35_") for name in names))
+        self.assertTrue(any(name.startswith("quality__sat50_") for name in names))
+        capped = build_portfolio_source_candidate_grid(sources, "activation_dd50", max_satellite_weight=0.35)
+        capped_names = [candidate.name for candidate in capped]
+        self.assertTrue(any(name.startswith("quality__sat35_") for name in capped_names))
+        self.assertFalse(any(name.startswith("quality__sat50_") for name in capped_names))
+        self.assertIn("core_only", names)
+
     def test_portfolio_walk_forward_activation_cli(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["portfolio", "walk-forward", "--grid", "activation"])
         self.assertEqual(args.grid, "activation")
+
+    def test_portfolio_walk_forward_activation_dd50_cli(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["portfolio", "walk-forward", "--grid", "activation_dd50"])
+        self.assertEqual(args.grid, "activation_dd50")
 
     def test_portfolio_source_selection_cli(self) -> None:
         parser = build_parser()
@@ -10496,6 +10842,8 @@ satellite_filter:
                 "reversal=0.20",
                 "--source-max-satellite-weight",
                 "quality=0.25",
+                "--source-group",
+                "highyield=highgain_pos8_dd50,highgain_dd40_protected",
             ]
         )
         self.assertEqual(args.portfolio_command, "source-selection")
@@ -10510,6 +10858,79 @@ satellite_filter:
         self.assertAlmostEqual(args.score_mode_min_edge, 0.04)
         self.assertAlmostEqual(args.max_satellite_weight, 0.20)
         self.assertEqual(args.source_max_satellite_weight, ["reversal=0.20", "quality=0.25"])
+        self.assertEqual(args.source_group, ["highyield=highgain_pos8_dd50,highgain_dd40_protected"])
+
+    def test_source_group_preselection_keeps_best_source_per_group(self) -> None:
+        allocation = PortfolioCandidate(
+            name="sat30",
+            weights={
+                "risk_on": {"core": 0.7, "satellite": 0.3, "cash": 0.0},
+                "risk_off": {"core": 1.0, "satellite": 0.0, "cash": 0.0},
+                "crash": {"core": 1.0, "satellite": 0.0, "cash": 0.0},
+            },
+            satellite_filter=SatelliteFilterConfig(),
+        )
+        highgain_pos8 = PortfolioSourceCandidate("highgain_pos8_dd50__sat30", "highgain_pos8_dd50", None, allocation)
+        highgain_dd40 = PortfolioSourceCandidate("highgain_dd40_protected__sat30", "highgain_dd40_protected", None, allocation)
+        quality = PortfolioSourceCandidate("quality__sat30", "quality", None, allocation)
+        result = PortfolioResult(
+            run_id="train",
+            run_dir=Path("."),
+            equity=pd.DataFrame(),
+            allocation_events=pd.DataFrame(),
+            monthly_returns=pd.DataFrame(),
+            metrics={},
+        )
+
+        filtered, status = _apply_source_group_preselection(
+            [(0.80, highgain_pos8, result), (0.92, highgain_dd40, result), (0.70, quality, result)],
+            {"highyield": ["highgain_pos8_dd50", "highgain_dd40_protected"]},
+        )
+
+        self.assertEqual([candidate.source_name for _, candidate, _ in filtered], ["highgain_dd40_protected", "quality"])
+        self.assertEqual(status["highgain_pos8_dd50"]["source_group_winner"], "highgain_dd40_protected")
+        self.assertFalse(status["highgain_pos8_dd50"]["source_group_selected"])
+        self.assertTrue(status["highgain_dd40_protected"]["source_group_selected"])
+
+    def test_source_group_preselection_applies_source_specific_margin_before_filtering(self) -> None:
+        allocation = PortfolioCandidate(
+            name="sat30",
+            weights={
+                "risk_on": {"core": 0.7, "satellite": 0.3, "cash": 0.0},
+                "risk_off": {"core": 1.0, "satellite": 0.0, "cash": 0.0},
+                "crash": {"core": 1.0, "satellite": 0.0, "cash": 0.0},
+            },
+            satellite_filter=SatelliteFilterConfig(),
+        )
+        highgain_pos8 = PortfolioSourceCandidate("highgain_pos8_dd50__sat30", "highgain_pos8_dd50", None, allocation)
+        highyield_qfull = PortfolioSourceCandidate("highyield_qfull_dd30__sat30", "highyield_qfull_dd30", None, allocation)
+        quality = PortfolioSourceCandidate("quality__sat30", "quality", None, allocation)
+        result = PortfolioResult(
+            run_id="train",
+            run_dir=Path("."),
+            equity=pd.DataFrame(),
+            allocation_events=pd.DataFrame(),
+            monthly_returns=pd.DataFrame(),
+            metrics={},
+        )
+
+        filtered, status = _apply_source_group_preselection(
+            [(1.433, highgain_pos8, result), (1.399, highyield_qfull, result), (1.100, quality, result)],
+            {"highyield": ["highgain_pos8_dd50", "highyield_qfull_dd30"]},
+            source_switch_margin_by_source={"highgain_pos8_dd50": 0.10},
+        )
+
+        selected_score, selected_candidate, _, raw_best = _select_source_candidate(
+            filtered,
+            source_switch_margin_by_source={"highgain_pos8_dd50": 0.10},
+        )
+
+        self.assertEqual(raw_best[1].source_name, "highyield_qfull_dd30")
+        self.assertEqual(selected_candidate.source_name, "highyield_qfull_dd30")
+        self.assertEqual(selected_score, 1.399)
+        self.assertEqual(status["highgain_pos8_dd50"]["source_group_winner"], "highyield_qfull_dd30")
+        self.assertFalse(status["highgain_pos8_dd50"]["source_group_selected"])
+        self.assertTrue(status["highyield_qfull_dd30"]["source_group_selected"])
 
     def test_source_selection_stability_penalty_keeps_previous_source_when_edge_is_small(self) -> None:
         allocation = PortfolioCandidate(
@@ -10813,6 +11234,42 @@ satellite_sources:
         self.assertTrue(growth)
         self.assertEqual(growth[0].risk_overrides["benchmark_off_exposure"], 0.65)
 
+    def test_opportunity_v2_grid_includes_high_gain_dd40_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidates = build_parameter_grid(make_config(Path(tmp)), grid="opportunity_v2")
+
+        self.assertEqual(len(candidates), 32)
+        self.assertTrue(any(candidate.name == "current_reb10_risk_loose" for candidate in candidates))
+        self.assertTrue(any(candidate.name.startswith("breakout_momentum_reb8") for candidate in candidates))
+        self.assertTrue(any(candidate.name.startswith("trend_accel_reb10") for candidate in candidates))
+        self.assertTrue(any(candidate.max_positions == 12 for candidate in candidates))
+        dd40 = [candidate for candidate in candidates if "risk_growth_dd40" in candidate.name]
+        self.assertTrue(dd40)
+        self.assertEqual(dd40[0].risk_overrides["protection_drawdown"], 0.40)
+        self.assertEqual(dd40[0].risk_overrides["drawdown_levels"][-1], (0.40, 0.0))
+
+    def test_opportunity_v2_gate_blocks_new_candidate_with_weak_validation(self) -> None:
+        candidate = ParameterCandidate("strong_gain_quality_reb15_risk_growth_dd40", {"momentum": 1.0}, 15, 12, {})
+
+        reason = _candidate_selection_gate_reason(
+            candidate,
+            {"total_return": -0.01, "sharpe": 0.2},
+            grid="opportunity_v2",
+        )
+
+        self.assertEqual(reason, "non_current_negative_validation_return")
+
+    def test_opportunity_v2_gate_allows_current_candidate_with_weak_validation(self) -> None:
+        candidate = ParameterCandidate("current_reb10_risk_loose", {"momentum": 1.0}, 10, 10, {})
+
+        reason = _candidate_selection_gate_reason(
+            candidate,
+            {"total_return": -0.10, "sharpe": -0.5},
+            grid="opportunity_v2",
+        )
+
+        self.assertIsNone(reason)
+
     def test_stable_grid_uses_broad_universe_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             candidates = build_parameter_grid(make_config(Path(tmp)), grid="stable")
@@ -10952,6 +11409,95 @@ satellite_sources:
         self.assertGreater(
             score_training_metrics(base, objective="opportunity_quality", diagnostics=diagnostics),
             score_training_metrics(high_drawdown, objective="opportunity_quality", diagnostics=diagnostics),
+        )
+
+    def test_opportunity_growth_score_rewards_return_and_drawdown_limit(self) -> None:
+        metrics = {
+            "total_return": 0.28,
+            "cagr": 0.10,
+            "sharpe": 0.55,
+            "max_drawdown": -0.20,
+            "profit_factor": 1.6,
+            "win_rate": 0.58,
+            "average_risk_exposure": 0.75,
+        }
+        weak = {
+            "total_return": 0.05,
+            "cagr": 0.02,
+            "sharpe": 0.15,
+            "max_drawdown": -0.26,
+            "profit_factor": 0.8,
+            "win_rate": 0.42,
+            "average_risk_exposure": 0.65,
+        }
+        diagnostics = {"monthly_win_rate": 0.40}
+        self.assertGreater(
+            score_training_metrics(metrics, objective="opportunity_growth", diagnostics=diagnostics),
+            score_training_metrics(weak, objective="opportunity_growth", diagnostics=diagnostics),
+        )
+
+    def test_opportunity_q_full_score_rewards_high_return(self) -> None:
+        metrics = {
+            "total_return": 0.30,
+            "cagr": 0.12,
+            "sharpe": 0.55,
+            "max_drawdown": -0.20,
+            "profit_factor": 1.7,
+            "win_rate": 0.58,
+            "average_risk_exposure": 0.80,
+        }
+        weak = {
+            "total_return": 0.06,
+            "cagr": 0.03,
+            "sharpe": 0.20,
+            "max_drawdown": -0.35,
+            "profit_factor": 0.9,
+            "win_rate": 0.42,
+            "average_risk_exposure": 0.55,
+        }
+        diagnostics = {
+            "monthly_win_rate": 0.45,
+            "annual_return_std": 0.05,
+            "return_concentration": 0.35,
+            "worst_month_return": -0.12,
+        }
+        self.assertGreater(
+            score_training_metrics(metrics, objective="opportunity_q_full", diagnostics=diagnostics),
+            score_training_metrics(weak, objective="opportunity_q_full", diagnostics=diagnostics),
+        )
+
+    def test_opportunity_q_full_score_penalizes_excess_drawdown(self) -> None:
+        diagnostics = {"monthly_win_rate": 0.40, "annual_return_std": 0.06, "return_concentration": 0.40, "worst_month_return": -0.14}
+        base = {
+            "total_return": 0.22,
+            "cagr": 0.08,
+            "sharpe": 0.60,
+            "max_drawdown": -0.24,
+            "profit_factor": 1.5,
+            "win_rate": 0.54,
+            "average_risk_exposure": 0.80,
+        }
+        high_drawdown = {**base, "max_drawdown": -0.70}
+        self.assertGreater(
+            score_training_metrics(base, objective="opportunity_q_full", diagnostics=diagnostics),
+            score_training_metrics(high_drawdown, objective="opportunity_q_full", diagnostics=diagnostics),
+        )
+
+    def test_opportunity_growth_score_penalizes_excess_drawdown(self) -> None:
+        diagnostics = {"monthly_win_rate": 0.40}
+        base = {
+            "total_return": 0.22,
+            "cagr": 0.09,
+            "sharpe": 0.65,
+            "max_drawdown": -0.20,
+            "profit_factor": 1.2,
+            "win_rate": 0.52,
+            "average_risk_exposure": 0.80,
+        }
+        high_drawdown = {**base, "max_drawdown": -0.60}
+        self.assertGreater(
+            score_training_metrics(base, objective="opportunity_growth", diagnostics=diagnostics),
+            score_training_metrics(high_drawdown, objective="opportunity_growth", diagnostics=diagnostics),
         )
 
     def test_robust_training_score_penalizes_losing_years(self) -> None:

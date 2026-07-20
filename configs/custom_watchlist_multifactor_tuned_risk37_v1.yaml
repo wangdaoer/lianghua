@@ -1,0 +1,9 @@
+﻿extends: custom_watchlist_multifactor_tuned.yaml
+
+project:
+  name: custom_watchlist_multifactor_tuned_risk37_v1
+
+risk:
+  enabled: true
+  protection_drawdown: 0.37
+  recovery_drawdown: 0.18

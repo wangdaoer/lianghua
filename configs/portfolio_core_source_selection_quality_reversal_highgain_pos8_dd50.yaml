@@ -1,0 +1,13 @@
+extends: portfolio_core_source_selection_quality_reversal_highgain_pos8.yaml
+
+project:
+  name: main_chinext_core_source_selection_quality_reversal_highgain_pos8_dd50
+
+satellite_sources:
+  highgain_pos8_dd50:
+    path: outputs/walk_forward/wf_highgain_pos8_dd50_robust_val6_full_20260624/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+notes: >
+  Adds the highgain_pos8 dd50 walk-forward equity curve as a high-risk
+  satellite candidate for source-selection experiments.

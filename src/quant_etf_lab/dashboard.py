@@ -7,11 +7,13 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
-from .market_data_source import DEFAULT_DAILY_MARKET_DATA_DIR, load_market_snapshot_rows
+from ._compat import read_text
+from .artifact_io import publish_json_if_semantically_changed, write_text_if_changed
+from .market_data_source import DEFAULT_DAILY_MARKET_DATA_DIR, MarketSnapshotLoadResult, load_market_snapshot_rows
 
 
 DEFAULT_DASHBOARD_OUTPUT = Path("outputs/research/latest_dashboard")
@@ -20,7 +22,9 @@ DEFAULT_DAILY_CHECK_DIR = Path("outputs/research/daily_model_check_latest")
 DEFAULT_PAPER_ACCOUNT_DIR = Path("outputs/research/paper_account_latest")
 DEFAULT_SENTIMENT_DIR = Path("outputs/research/market_sentiment_state_latest")
 DEFAULT_DATA_CACHE_DIR = DEFAULT_DAILY_MARKET_DATA_DIR
-DEFAULT_ALLOCATOR_DIR = Path("outputs/portfolio_source_selection/main_chinext_portfolio_source_selection_validation6_v1")
+DEFAULT_ALLOCATOR_DIR = Path(
+    "outputs/portfolio_source_selection/main_chinext_source_selection_highgain_pos8_dd50_cap30_activation_dd50_20260624"
+)
 DEFAULT_TRIGGER_REPORT = Path("D:/codex/outputs/trigger_reports/latest_trigger.md")
 DEFAULT_MODEL_AUDIT_DIR = Path("outputs/research/model_build_audit_latest")
 DEFAULT_PIPELINE_HISTORY_DIR = Path("outputs/research/pipeline_history_review_latest")
@@ -58,6 +62,17 @@ def _parse_date(value: Any) -> date | None:
     return pd.Timestamp(parsed).date()
 
 
+def _parse_date_series(values: pd.Series) -> pd.Series:
+    text = values.astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    compact = text.str.fullmatch(r"\d{8}", na=False)
+    parsed = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns]")
+    if compact.any():
+        parsed.loc[compact] = pd.to_datetime(text.loc[compact], format="%Y%m%d", errors="coerce")
+    if (~compact).any():
+        parsed.loc[~compact] = pd.to_datetime(text.loc[~compact], errors="coerce")
+    return parsed
+
+
 def _resolve_output(project_root: Path, output_dir: str | Path | None, as_of: date, date_stamp: bool) -> Path:
     default = DEFAULT_DASHBOARD_BASE if date_stamp else DEFAULT_DASHBOARD_OUTPUT
     raw = Path(output_dir) if output_dir is not None else default
@@ -91,7 +106,7 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(read_text(path))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
 
@@ -100,7 +115,7 @@ def _read_text_preview(path: Path, max_lines: int = 8) -> list[str]:
     if not path.exists():
         return []
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = read_text(path, encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
     preview: list[str] = []
@@ -196,9 +211,10 @@ def _summarize_daily_market_data_hub(
     cache_dir: Path,
     as_of: date,
     max_staleness_days: int,
+    market_snapshot: MarketSnapshotLoadResult | None = None,
 ) -> dict[str, Any]:
     try:
-        result = load_market_snapshot_rows(daily_data_dir=cache_dir, require_success=True)
+        result = market_snapshot or load_market_snapshot_rows(daily_data_dir=cache_dir, require_success=True)
     except (FileNotFoundError, ImportError, RuntimeError, ValueError) as error:
         return {
             "market_cache_status": "missing",
@@ -252,10 +268,11 @@ def _summarize_market_cache(
     as_of: date,
     max_staleness_days: int,
     min_cache_fresh_ratio: float,
+    market_snapshot: MarketSnapshotLoadResult | None = None,
 ) -> dict[str, Any]:
     cache_dir = _resolve(project_root, data_cache_dir, DEFAULT_DATA_CACHE_DIR)
     if _is_daily_market_data_hub(cache_dir):
-        return _summarize_daily_market_data_hub(cache_dir, as_of, max_staleness_days)
+        return _summarize_daily_market_data_hub(cache_dir, as_of, max_staleness_days, market_snapshot)
     csv_paths = sorted(cache_dir.rglob("*.csv")) if cache_dir.exists() else []
     dated_files: list[tuple[Path, date]] = []
     for path in csv_paths:
@@ -312,15 +329,14 @@ def _summarize_allocator(
     summary = _read_csv(resolved_dir / "portfolio_walk_forward_summary.csv")
     curve_latest = None
     if "date" in curve:
-        curve_dates = [_parse_date(value) for value in curve["date"]]
-        curve_dates = [value for value in curve_dates if value is not None]
-        curve_latest = max(curve_dates) if curve_dates else None
+        curve_latest_value = _parse_date_series(curve["date"]).max()
+        curve_latest = None if pd.isna(curve_latest_value) else pd.Timestamp(curve_latest_value).date()
 
     summary_latest = None
     selected_params_path: Path | None = None
     if "test_end" in summary:
         data = summary.copy()
-        data["_sort_date"] = data["test_end"].map(_parse_date)
+        data["_sort_date"] = _parse_date_series(data["test_end"])
         data = data.dropna(subset=["_sort_date"]).sort_values("_sort_date")
         if not data.empty:
             latest_row = data.iloc[-1]
@@ -897,6 +913,9 @@ def run_daily_dashboard(
     max_staleness_days: int = 3,
     min_cache_fresh_ratio: float = 0.90,
     date_stamp: bool = False,
+    summary_cache: dict[str, dict[str, Any]] | None = None,
+    market_snapshot: MarketSnapshotLoadResult | None = None,
+    publish_artifacts: bool = True,
 ) -> DailyDashboardResult:
     root = Path(project_root).resolve()
     as_of = _parse_date(as_of_date) if as_of_date is not None else datetime.now().date()
@@ -908,21 +927,53 @@ def run_daily_dashboard(
         "as_of_date": as_of.isoformat(),
         "max_staleness_days": int(max_staleness_days),
     }
-    snapshot.update(_summarize_daily_check(root, daily_check_dir, as_of))
-    snapshot.update(_summarize_market_cache(root, data_cache_dir, as_of, max_staleness_days, min_cache_fresh_ratio))
-    snapshot.update(_summarize_allocator(root, allocator_dir, as_of, max_staleness_days))
-    snapshot.update(_summarize_paper_account(root, paper_account_dir, as_of, max_staleness_days))
-    snapshot.update(_summarize_sentiment(root, sentiment_dir, as_of, max_staleness_days))
-    snapshot.update(_summarize_trigger(trigger_report, as_of, max_staleness_days))
-    snapshot.update(_summarize_model_audit(root, model_audit_dir, as_of, max_staleness_days))
+    def cached(name: str, builder: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        if summary_cache is None:
+            return builder()
+        if name not in summary_cache:
+            summary_cache[name] = dict(builder())
+        return dict(summary_cache[name])
+
+    snapshot.update(cached("daily_check", lambda: _summarize_daily_check(root, daily_check_dir, as_of)))
+    snapshot.update(
+        cached(
+            "market_cache",
+            lambda: _summarize_market_cache(
+                root,
+                data_cache_dir,
+                as_of,
+                max_staleness_days,
+                min_cache_fresh_ratio,
+                market_snapshot,
+            ),
+        )
+    )
+    snapshot.update(cached("allocator", lambda: _summarize_allocator(root, allocator_dir, as_of, max_staleness_days)))
+    snapshot.update(
+        cached(
+            "paper_account",
+            lambda: _summarize_paper_account(root, paper_account_dir, as_of, max_staleness_days),
+        )
+    )
+    snapshot.update(cached("sentiment", lambda: _summarize_sentiment(root, sentiment_dir, as_of, max_staleness_days)))
+    snapshot.update(cached("trigger", lambda: _summarize_trigger(trigger_report, as_of, max_staleness_days)))
+    snapshot.update(
+        cached(
+            "model_audit",
+            lambda: _summarize_model_audit(root, model_audit_dir, as_of, max_staleness_days),
+        )
+    )
     snapshot.update(_summarize_pipeline_history(root, pipeline_history_dir, as_of))
     snapshot.update(
-        _summarize_allocator_observation(
-            root,
-            daily_run_status_dir,
-            allocator_observation_dir,
-            as_of,
-            max_staleness_days,
+        cached(
+            "allocator_observation",
+            lambda: _summarize_allocator_observation(
+                root,
+                daily_run_status_dir,
+                allocator_observation_dir,
+                as_of,
+                max_staleness_days,
+            ),
         )
     )
     snapshot["dashboard_posture"] = _dashboard_posture(snapshot)
@@ -930,8 +981,19 @@ def run_daily_dashboard(
     resolved_output.mkdir(parents=True, exist_ok=True)
     snapshot_path = resolved_output / "latest_dashboard_snapshot.json"
     report_path = resolved_output / "latest_dashboard.md"
-    snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-    report_path.write_text(_render_report(snapshot), encoding="utf-8")
+    if publish_artifacts:
+        snapshot, snapshot_changed = publish_json_if_semantically_changed(
+            snapshot_path,
+            snapshot,
+            ignored_fields=(
+                "generated_at",
+                "daily_check_generated_at",
+                "paper_account_generated_at",
+                "pipeline_history_generated_at",
+            ),
+        )
+        if snapshot_changed or not report_path.exists():
+            write_text_if_changed(report_path, _render_report(snapshot), encoding="utf-8")
     return DailyDashboardResult(
         output_dir=resolved_output,
         report_path=report_path,

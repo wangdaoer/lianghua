@@ -213,6 +213,327 @@ class SatelliteRiskBudgetTests(unittest.TestCase):
             self.assertIn("Satellite Risk Budget Review", report_text)
             self.assertIn("research-only", report_text)
 
+    def test_satellite_risk_budget_review_reads_compact_best_worst_group_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pipeline_snapshot = root / "daily_pipeline_snapshot.json"
+            outcome_analysis = root / "stock_target_review_outcome_analysis.json"
+            pipeline_snapshot.write_text(
+                json.dumps(
+                    {
+                        "as_of_date": "2026-06-30",
+                        "pipeline_report_path": "outputs/research/daily_pipeline/daily_pipeline.md",
+                        "dashboard_posture": "core_base_watch_allocator_gate",
+                        "trading_day_gate_status": "trading_day_data_ready",
+                        "after_close_data_status": "ready",
+                        "alert_level": "info",
+                        "history_review_health_state": "ok",
+                        "model_audit_walk_forward_action_items": 0,
+                        "promotion_decision": "promote_candidate",
+                        "paper_latest_regime": "risk_off",
+                        "paper_latest_core_weight": 1.0,
+                        "paper_latest_satellite_weight": 0.0,
+                        "paper_stock_target_review_action_count": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            outcome_analysis.write_text(
+                json.dumps(
+                    {
+                        "analysis_status": "ready_for_review",
+                        "ready_horizon_count": 1,
+                        "ready_horizons": ["1d"],
+                        "top_analysis_rows": [
+                            {
+                                "dimension": "overall",
+                                "group_value": "all",
+                                "evaluable_1d": 30,
+                                "avg_return_1d": 0.011,
+                                "win_rate_1d": 0.60,
+                            }
+                        ],
+                        "best_groups": {
+                            "1d": {
+                                "dimension": "layer",
+                                "group_value": "satellite",
+                                "evaluable_count": 12,
+                                "avg_return": 0.08,
+                                "win_rate": 0.75,
+                            }
+                        },
+                        "worst_groups": {
+                            "1d": {
+                                "dimension": "layer",
+                                "group_value": "core",
+                                "evaluable_count": 18,
+                                "avg_return": -0.02,
+                                "win_rate": 0.33,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_satellite_risk_budget_review(
+                pipeline_snapshot=pipeline_snapshot,
+                outcome_analysis_path=outcome_analysis,
+                output_dir=root / "review",
+            )
+
+            self.assertEqual(result.snapshot["best_group_avg_return"], 0.08)
+            self.assertEqual(result.snapshot["best_group_win_rate"], 0.75)
+            self.assertEqual(result.snapshot["worst_group_avg_return"], -0.02)
+            self.assertEqual(result.snapshot["worst_group_win_rate"], 0.33)
+
+    def test_satellite_risk_budget_review_surfaces_strong_group_opportunities_when_overall_is_weak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pipeline_snapshot = root / "daily_pipeline_snapshot.json"
+            outcome_analysis = root / "stock_target_review_outcome_analysis.json"
+            pipeline_snapshot.write_text(
+                json.dumps(
+                    {
+                        "as_of_date": "2026-06-30",
+                        "pipeline_report_path": "outputs/research/daily_pipeline/daily_pipeline.md",
+                        "dashboard_posture": "core_base_watch_allocator_gate",
+                        "trading_day_gate_status": "trading_day_data_ready",
+                        "after_close_data_status": "ready",
+                        "alert_level": "info",
+                        "history_review_health_state": "ok",
+                        "model_audit_walk_forward_action_items": 0,
+                        "promotion_decision": "promote_candidate",
+                        "paper_latest_regime": "risk_off",
+                        "paper_latest_core_weight": 1.0,
+                        "paper_latest_satellite_weight": 0.0,
+                        "paper_stock_target_review_action_count": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            outcome_analysis.write_text(
+                json.dumps(
+                    {
+                        "analysis_status": "ready_for_review",
+                        "ready_horizon_count": 2,
+                        "ready_horizons": ["1d", "5d"],
+                        "top_analysis_rows": [
+                            {
+                                "dimension": "overall",
+                                "group_value": "all",
+                                "evaluable_1d": 80,
+                                "avg_return_1d": 0.002,
+                                "win_rate_1d": 0.40,
+                                "evaluable_5d": 40,
+                                "avg_return_5d": -0.005,
+                                "win_rate_5d": 0.35,
+                            },
+                            {
+                                "dimension": "layer",
+                                "group_value": "satellite",
+                                "evaluable_1d": 16,
+                                "avg_return_1d": 0.055,
+                                "win_rate_1d": 0.75,
+                                "evaluable_5d": 10,
+                                "avg_return_5d": 0.11,
+                                "win_rate_5d": 0.80,
+                            },
+                            {
+                                "dimension": "layer",
+                                "group_value": "core",
+                                "evaluable_1d": 64,
+                                "avg_return_1d": -0.010,
+                                "win_rate_1d": 0.30,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_satellite_risk_budget_review(
+                pipeline_snapshot=pipeline_snapshot,
+                outcome_analysis_path=outcome_analysis,
+                output_dir=root / "review",
+            )
+
+            self.assertEqual(result.snapshot["risk_budget_decision"], "hold_default_core_base")
+            self.assertEqual(result.snapshot["strong_group_opportunity_count"], 2)
+            self.assertEqual(result.snapshot["strong_group_opportunities"][0]["dimension"], "layer")
+            self.assertEqual(result.snapshot["strong_group_opportunities"][0]["group_value"], "satellite")
+            self.assertEqual(result.snapshot["strong_group_opportunities"][0]["horizon"], "5d")
+            self.assertEqual(result.snapshot["strong_group_opportunity_status"], "candidate")
+            report_text = result.report_path.read_text(encoding="utf-8")
+            self.assertIn("Group Opportunity Evidence", report_text)
+            self.assertIn("layer=satellite", report_text)
+
+    def test_satellite_risk_budget_review_writes_deduped_satellite_trial_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pipeline_snapshot = root / "daily_pipeline_snapshot.json"
+            outcome_analysis = root / "stock_target_review_outcome_analysis.json"
+            output_dir = root / "review"
+            pipeline_snapshot.write_text(
+                json.dumps(
+                    {
+                        "as_of_date": "2026-06-30",
+                        "pipeline_report_path": "outputs/research/daily_pipeline/daily_pipeline.md",
+                        "dashboard_posture": "core_base_watch_allocator_gate",
+                        "trading_day_gate_status": "trading_day_data_ready",
+                        "after_close_data_status": "ready",
+                        "alert_level": "info",
+                        "history_review_health_state": "ok",
+                        "model_audit_walk_forward_action_items": 0,
+                        "promotion_decision": "promote_candidate",
+                        "paper_latest_regime": "risk_off",
+                        "paper_latest_core_weight": 1.0,
+                        "paper_latest_satellite_weight": 0.0,
+                        "paper_stock_target_review_action_count": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            outcome_analysis.write_text(
+                json.dumps(
+                    {
+                        "analysis_status": "ready_for_review",
+                        "ready_horizon_count": 2,
+                        "ready_horizons": ["1d", "5d"],
+                        "top_analysis_rows": [
+                            {
+                                "dimension": "overall",
+                                "group_value": "all",
+                                "evaluable_1d": 100,
+                                "avg_return_1d": 0.012,
+                                "win_rate_1d": 0.62,
+                            },
+                            {
+                                "dimension": "layer",
+                                "group_value": "satellite",
+                                "evaluable_1d": 16,
+                                "avg_return_1d": 0.055,
+                                "win_rate_1d": 0.75,
+                                "evaluable_5d": 10,
+                                "avg_return_5d": 0.11,
+                                "win_rate_5d": 0.80,
+                            },
+                            {
+                                "dimension": "review_bucket",
+                                "group_value": "suppressed_layer_review",
+                                "evaluable_5d": 9,
+                                "avg_return_5d": 0.08,
+                                "win_rate_5d": 0.77,
+                            },
+                            {
+                                "dimension": "layer",
+                                "group_value": "core",
+                                "evaluable_1d": 64,
+                                "avg_return_1d": -0.01,
+                                "win_rate_1d": 0.30,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_satellite_risk_budget_review(
+                pipeline_snapshot=pipeline_snapshot,
+                outcome_analysis_path=outcome_analysis,
+                output_dir=output_dir,
+                trial_satellite_budget=0.05,
+                max_satellite_budget=0.10,
+                min_overall_win_rate=0.55,
+                min_overall_avg_return=0.0,
+                max_worst_group_loss=-0.05,
+            )
+
+            self.assertEqual(result.snapshot["risk_budget_decision"], "eligible_for_small_satellite_trial")
+            self.assertEqual(result.snapshot["satellite_trial_rule_count"], 2)
+            self.assertTrue((output_dir / "satellite_trial_rules.csv").exists())
+            self.assertTrue((output_dir / "satellite_trial_rules.json").exists())
+            rules = pd.read_csv(output_dir / "satellite_trial_rules.csv")
+            self.assertEqual(len(rules), 2)
+            self.assertEqual(rules.iloc[0]["dimension"], "layer")
+            self.assertEqual(rules.iloc[0]["group_value"], "satellite")
+            self.assertEqual(rules.iloc[0]["horizon"], "5d")
+            self.assertEqual(rules.iloc[0]["trial_rule_status"], "eligible_when_risk_on")
+            self.assertEqual(rules.iloc[0]["activation_gate"], "risk_on_only")
+            self.assertAlmostEqual(float(rules.iloc[0]["active_total_budget"]), 0.05)
+            self.assertAlmostEqual(float(rules.iloc[0]["active_group_weight_cap"]), 0.025)
+            report_text = result.report_path.read_text(encoding="utf-8")
+            self.assertIn("Satellite Trial Rules", report_text)
+            self.assertIn("risk_on_only", report_text)
+
+    def test_satellite_risk_budget_review_keeps_trial_rules_inactive_when_pipeline_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pipeline_snapshot = root / "daily_pipeline_snapshot.json"
+            outcome_analysis = root / "stock_target_review_outcome_analysis.json"
+            output_dir = root / "review"
+            pipeline_snapshot.write_text(
+                json.dumps(
+                    {
+                        "as_of_date": "2026-06-30",
+                        "pipeline_report_path": "outputs/research/daily_pipeline/daily_pipeline.md",
+                        "dashboard_posture": "defensive_review_only",
+                        "trading_day_gate_status": "trading_day_data_ready",
+                        "after_close_data_status": "ready",
+                        "alert_level": "info",
+                        "history_review_health_state": "ok",
+                        "model_audit_walk_forward_action_items": 0,
+                        "promotion_decision": "watch_candidate",
+                        "paper_latest_regime": "risk_off",
+                        "paper_latest_core_weight": 1.0,
+                        "paper_latest_satellite_weight": 0.0,
+                        "paper_stock_target_review_action_count": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            outcome_analysis.write_text(
+                json.dumps(
+                    {
+                        "analysis_status": "ready_for_review",
+                        "ready_horizon_count": 1,
+                        "ready_horizons": ["1d"],
+                        "top_analysis_rows": [
+                            {
+                                "dimension": "overall",
+                                "group_value": "all",
+                                "evaluable_1d": 100,
+                                "avg_return_1d": 0.012,
+                                "win_rate_1d": 0.62,
+                            },
+                            {
+                                "dimension": "layer",
+                                "group_value": "satellite",
+                                "evaluable_1d": 16,
+                                "avg_return_1d": 0.055,
+                                "win_rate_1d": 0.75,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_satellite_risk_budget_review(
+                pipeline_snapshot=pipeline_snapshot,
+                outcome_analysis_path=outcome_analysis,
+                output_dir=output_dir,
+                trial_satellite_budget=0.05,
+            )
+
+            self.assertEqual(result.snapshot["risk_budget_decision"], "blocked_by_pipeline_gates")
+            self.assertEqual(result.snapshot["satellite_trial_rule_count"], 1)
+            rules = pd.read_csv(output_dir / "satellite_trial_rules.csv")
+            self.assertEqual(rules.iloc[0]["trial_rule_status"], "blocked_by_pipeline_gates")
+            self.assertEqual(float(rules.iloc[0]["active_total_budget"]), 0.0)
+            self.assertEqual(float(rules.iloc[0]["active_group_weight_cap"]), 0.0)
+            self.assertEqual(float(rules.iloc[0]["reference_total_budget"]), 0.05)
+
     def test_satellite_risk_budget_review_holds_when_network_risk_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

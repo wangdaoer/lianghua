@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ._compat import read_text
 from .process_lock import list_process_locks
 
 
@@ -26,7 +27,9 @@ DEFAULT_BASELINE_RUN = Path("outputs/backtests/ashare_main_chinext_hold_prefer_w
 DEFAULT_CORE_WF = Path("outputs/walk_forward/main_chinext_stable_v2_full_20260613_011322")
 DEFAULT_SATELLITE_WF = Path("outputs/walk_forward/main_chinext_satellite_quality_v2_full")
 DEFAULT_PORTFOLIO_RUN = Path("outputs/portfolios/main_chinext_core_satellite_quality_v2_guarded")
-DEFAULT_PORTFOLIO_WF = Path("outputs/portfolio_source_selection/main_chinext_portfolio_source_selection_validation6_v1")
+DEFAULT_PORTFOLIO_WF = Path(
+    "outputs/portfolio_source_selection/main_chinext_source_selection_highgain_pos8_dd50_cap30_activation_dd50_20260624"
+)
 
 
 def _resolve(project_root: Path, path: str | Path | None, default: Path) -> Path:
@@ -62,7 +65,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(read_text(path))
     except (OSError, json.JSONDecodeError):
         return None
 

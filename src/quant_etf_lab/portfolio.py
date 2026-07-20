@@ -496,8 +496,8 @@ def _portfolio_candidate_weights(satellite_weight: float) -> dict[str, dict[str,
 
 def build_portfolio_candidate_grid(grid: str = "guarded") -> tuple[PortfolioCandidate, ...]:
     disabled = SatelliteFilterConfig(enabled=False)
-    if grid not in {"compact", "guarded", "activation"}:
-        raise ValueError("grid must be 'compact', 'guarded', or 'activation'.")
+    if grid not in {"compact", "guarded", "activation", "activation_dd50"}:
+        raise ValueError("grid must be 'compact', 'guarded', 'activation', or 'activation_dd50'.")
 
     candidates = [
         PortfolioCandidate("core_only", _portfolio_candidate_weights(0.0), disabled),
@@ -592,6 +592,31 @@ def build_portfolio_candidate_grid(grid: str = "guarded") -> tuple[PortfolioCand
                         )
                     )
         return tuple(activation_candidates)
+    if grid == "activation_dd50":
+        dd50_candidates = [PortfolioCandidate("core_only", _portfolio_candidate_weights(0.0), disabled)]
+        regime_profiles = {
+            "ma60_drop03": {"ma_window": 60, "risk_on_drop_threshold": -0.03, "crash_drop_threshold": -0.07},
+            "ma120_drop03": {"ma_window": 120, "risk_on_drop_threshold": -0.03, "crash_drop_threshold": -0.07},
+            "ma120_drop05": {"ma_window": 120, "risk_on_drop_threshold": -0.05, "crash_drop_threshold": -0.08},
+            "ma200_drop05": {"ma_window": 200, "risk_on_drop_threshold": -0.05, "crash_drop_threshold": -0.08},
+        }
+        activation_filters = {
+            "unfiltered": disabled,
+            "health_mom10_dd20": filters["health_mom10_dd20"],
+            "health_ma60_mom20_dd15": filters["health_ma60_mom20_dd15"],
+        }
+        for regime_name, regime_overrides in regime_profiles.items():
+            for satellite_weight in (0.30, 0.35, 0.50):
+                for filter_name, satellite_filter in activation_filters.items():
+                    dd50_candidates.append(
+                        PortfolioCandidate(
+                            f"sat{int(satellite_weight * 100):02d}_{regime_name}_{filter_name}",
+                            _portfolio_candidate_weights(satellite_weight),
+                            satellite_filter,
+                            dict(regime_overrides),
+                        )
+                    )
+        return tuple(dd50_candidates)
     return tuple(candidates)
 
 
@@ -1073,6 +1098,84 @@ def _select_source_candidate(
     return selected[0], selected[1], selected[2], raw_best
 
 
+def _normalize_source_groups(source_groups: dict[str, list[str]] | None) -> dict[str, tuple[str, ...]]:
+    normalized: dict[str, tuple[str, ...]] = {}
+    seen: dict[str, str] = {}
+    for group_name, raw_sources in (source_groups or {}).items():
+        group = str(group_name).strip()
+        if not group:
+            raise ValueError("source group name cannot be empty.")
+        sources = tuple(str(source).strip() for source in raw_sources if str(source).strip())
+        if len(sources) < 2:
+            raise ValueError(f"source group {group} must contain at least two sources.")
+        for source in sources:
+            if source in seen:
+                raise ValueError(f"source {source} appears in multiple source groups: {seen[source]} and {group}.")
+            seen[source] = group
+        normalized[group] = sources
+    return normalized
+
+
+def _apply_source_group_preselection(
+    scored: list[tuple[float, PortfolioSourceCandidate, PortfolioResult]],
+    source_groups: dict[str, list[str]] | None,
+    source_switch_margin_by_source: dict[str, float] | None = None,
+) -> tuple[list[tuple[float, PortfolioSourceCandidate, PortfolioResult]], dict[str, dict[str, Any]]]:
+    groups = _normalize_source_groups(source_groups)
+    if not groups:
+        return scored, {}
+    source_margins = {str(key): float(value) for key, value in (source_switch_margin_by_source or {}).items()}
+    negative_sources = [source for source, margin in source_margins.items() if margin < 0.0]
+    if negative_sources:
+        raise ValueError(f"source_switch_margin_by_source cannot be negative: {sorted(negative_sources)}")
+
+    source_to_group = {
+        source: group_name
+        for group_name, sources in groups.items()
+        for source in sources
+    }
+    scored_by_group: dict[str, list[tuple[float, PortfolioSourceCandidate, PortfolioResult]]] = {}
+    for score, candidate, result in scored:
+        group = source_to_group.get(candidate.source_name)
+        if group is None:
+            continue
+        scored_by_group.setdefault(group, []).append((score, candidate, result))
+
+    best_by_group: dict[str, tuple[float, str]] = {}
+    for group, group_scored in scored_by_group.items():
+        group_scored.sort(key=lambda item: item[0], reverse=True)
+        raw_best = group_scored[0]
+        winner = raw_best
+        source_margin = source_margins.get(raw_best[1].source_name, 0.0)
+        if source_margin > 0.0:
+            alternatives = [
+                item
+                for item in group_scored
+                if item[1].source_name != raw_best[1].source_name
+            ]
+            if alternatives and float(raw_best[0]) < float(alternatives[0][0]) + float(source_margin):
+                winner = alternatives[0]
+        best_by_group[group] = (float(winner[0]), winner[1].source_name)
+
+    status: dict[str, dict[str, Any]] = {}
+    for group, sources in groups.items():
+        winner = best_by_group.get(group, (None, ""))[1]
+        for source in sources:
+            status[source] = {
+                "source_group": group,
+                "source_group_winner": winner,
+                "source_group_selected": bool(source == winner),
+            }
+
+    filtered = [
+        item
+        for item in scored
+        if item[1].source_name not in source_to_group
+        or status[item[1].source_name]["source_group_selected"]
+    ]
+    return filtered, status
+
+
 def _stitch_portfolio_equity(results: list[PortfolioResult], initial_cash: float) -> pd.DataFrame:
     records: list[pd.DataFrame] = []
     base_equity = float(initial_cash)
@@ -1322,6 +1425,7 @@ def run_portfolio_source_selection_walk_forward(
     source_stability_penalty: float = 0.0,
     max_satellite_weight: float | None = None,
     source_max_satellite_weight: dict[str, float] | None = None,
+    source_groups: dict[str, list[str]] | None = None,
     output_dir: Path | None = None,
     run_id_prefix: str | None = None,
 ) -> tuple[Path, pd.DataFrame]:
@@ -1329,6 +1433,11 @@ def run_portfolio_source_selection_walk_forward(
     windows = generate_portfolio_windows(start, end, train_months, test_months, step_months)
     if not windows:
         raise ValueError("No portfolio source-selection windows generated.")
+    normalized_source_groups = _normalize_source_groups(source_groups)
+    grouped_sources = {source for sources in normalized_source_groups.values() for source in sources}
+    missing_group_sources = sorted(grouped_sources - set(satellite_sources))
+    if missing_group_sources:
+        raise ValueError(f"source_groups reference unknown satellite sources: {missing_group_sources}")
     candidates = build_portfolio_source_candidate_grid(
         satellite_sources,
         grid,
@@ -1345,6 +1454,7 @@ def run_portfolio_source_selection_walk_forward(
     test_results: list[PortfolioResult] = []
     previous_selected_source: str | None = None
     for window in windows:
+        window_candidate_start = len(candidate_rows)
         validation_dates = _source_validation_dates(window, source_validation_months)
         scored: list[tuple[float, PortfolioSourceCandidate, PortfolioResult]] = []
         balanced_scored: list[tuple[float, PortfolioSourceCandidate, PortfolioResult]] = []
@@ -1416,6 +1526,28 @@ def run_portfolio_source_selection_walk_forward(
                     **{f"validation_{key}": value for key, value in validation_metrics.items()},
                 }
             )
+        scored, source_group_status = _apply_source_group_preselection(
+            scored,
+            source_groups,
+            source_switch_margin_by_source=source_switch_margin_by_source,
+        )
+        if source_group_status:
+            kept_sources = {candidate.source_name for _, candidate, _ in scored}
+            balanced_scored = [
+                item
+                for item in balanced_scored
+                if item[1].source_name in kept_sources or item[1].source_name == "core_only"
+            ]
+            for row in candidate_rows[window_candidate_start:]:
+                status = source_group_status.get(str(row["source_name"]), {})
+                row["source_group"] = status.get("source_group", "")
+                row["source_group_winner"] = status.get("source_group_winner", "")
+                row["source_group_selected"] = status.get("source_group_selected", True)
+        else:
+            for row in candidate_rows[window_candidate_start:]:
+                row["source_group"] = ""
+                row["source_group_winner"] = ""
+                row["source_group_selected"] = True
         best_score, best_candidate, best_train_result, raw_best = _select_source_candidate(
             scored,
             default_source_name=default_source_name,
@@ -1468,6 +1600,9 @@ def run_portfolio_source_selection_walk_forward(
                 "default_source": default_source_name or "",
                 "source_switch_margin": float(source_switch_margin),
                 "source_switch_margin_by_source": json.dumps(source_switch_margin_by_source or {}, sort_keys=True),
+                "source_groups": json.dumps(normalized_source_groups, sort_keys=True),
+                "selected_source_group": source_group_status.get(best_candidate.source_name, {}).get("source_group", ""),
+                "selected_source_group_winner": source_group_status.get(best_candidate.source_name, {}).get("source_group_winner", ""),
                 "score_mode_min_edge": float(score_mode_min_edge),
                 "source_validation_months": int(source_validation_months),
                 "previous_selected_source": previous_selected_source or "",

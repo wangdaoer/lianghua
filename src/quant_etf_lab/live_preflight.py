@@ -55,9 +55,13 @@ class LivePreflightResult:
 def _load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            payload = json.loads(path.read_text(encoding=encoding))
+            break
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            payload = {}
+    else:
         return {}
     return payload if isinstance(payload, dict) else {}
 

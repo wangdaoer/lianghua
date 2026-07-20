@@ -311,7 +311,6 @@ function Invoke-DailyResearchRefreshWithObservation {
     $RunPipelinePreflightSmoke = $false
     $RetryPaperAccount = $false
     $RefreshArgs = @()
-    $DateStamp = if ($ObservationDate) { $ObservationDate } else { Get-Date -Format "yyyyMMdd" }
 
     for ($Index = 0; $Index -lt $RawArgs.Count; $Index++) {
         $Arg = $RawArgs[$Index]
@@ -346,6 +345,7 @@ function Invoke-DailyResearchRefreshWithObservation {
     if ($ObservationDate -and $ObservationDate -notmatch "^\d{8}$") {
         throw "--observation-date must be YYYYMMDD."
     }
+    $DateStamp = if ($ObservationDate) { $ObservationDate } else { Get-Date -Format "yyyyMMdd" }
 
     $RefreshScript = Join-Path $PSScriptRoot "run_daily_research_refresh_logged.ps1"
     $RefreshExitCode = Invoke-DailyPipelineRefresh `

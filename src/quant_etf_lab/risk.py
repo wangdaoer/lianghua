@@ -100,11 +100,22 @@ def build_benchmark_risk_frame(config: LabConfig, dates: list[pd.Timestamp]) -> 
             "benchmark_reason",
         ]
     ].rename(columns={"close": "benchmark_close"})
-    indexed = indexed.reindex(pd.DatetimeIndex(dates)).ffill()
-    indexed["benchmark_rsrs_risk_on"] = indexed["benchmark_rsrs_risk_on"].fillna(True).astype(bool)
-    indexed["benchmark_risk_on"] = indexed["benchmark_risk_on"].fillna(True).astype(bool)
+    indexed = indexed.reindex(pd.DatetimeIndex(dates))
+    for column in [
+        "benchmark_close",
+        "benchmark_ma",
+        "benchmark_return",
+        "benchmark_rsrs_beta",
+        "benchmark_rsrs_zscore",
+        "benchmark_exposure",
+    ]:
+        indexed[column] = indexed[column].ffill()
     indexed["benchmark_exposure"] = indexed["benchmark_exposure"].fillna(1.0)
-    indexed["benchmark_reason"] = indexed["benchmark_reason"].fillna("benchmark_unknown")
+    benchmark_rsrs_risk_on = indexed["benchmark_rsrs_risk_on"].astype("boolean").ffill().fillna(True).astype(bool)
+    indexed["benchmark_rsrs_risk_on"] = benchmark_rsrs_risk_on
+    benchmark_risk_on = indexed["benchmark_risk_on"].astype("boolean").ffill().fillna(True).astype(bool)
+    indexed["benchmark_risk_on"] = benchmark_risk_on
+    indexed["benchmark_reason"] = indexed["benchmark_reason"].ffill().fillna("benchmark_unknown")
     return indexed
 
 

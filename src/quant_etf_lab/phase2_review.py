@@ -12,11 +12,15 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ._compat import read_text
+
 
 DEFAULT_PHASE2_COMPONENTS = Path(
     "outputs/research/phase2_model_status_source_selection_default_20260614/phase2_components.csv"
 )
-DEFAULT_ALLOCATOR_DIR = Path("outputs/portfolio_source_selection/main_chinext_portfolio_source_selection_validation6_v1")
+DEFAULT_ALLOCATOR_DIR = Path(
+    "outputs/portfolio_source_selection/main_chinext_source_selection_highgain_pos8_dd50_cap30_activation_dd50_20260624"
+)
 DEFAULT_PROMOTION_REVIEW_DIR = Path("outputs/research/allocator_promotion_with_execution_cost_20260614")
 
 
@@ -52,7 +56,7 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(read_text(path))
     except (OSError, json.JSONDecodeError):
         return {}
 

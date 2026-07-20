@@ -37,7 +37,12 @@ def write_dashboard_snapshot(path: Path, paper_dir: Path, **overrides: object) -
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def write_paper_account_fixture(paper_dir: Path, action_count: int = 0, satellite_weight: float = 0.0) -> None:
+def write_paper_account_fixture(
+    paper_dir: Path,
+    action_count: int = 0,
+    satellite_weight: float = 0.0,
+    metrics_encoding: str = "utf-8",
+) -> None:
     paper_dir.mkdir(parents=True, exist_ok=True)
     target_holdings_path = paper_dir / "target_holdings.csv"
     actions_path = paper_dir / "stock_target_review_actions.csv"
@@ -62,7 +67,7 @@ def write_paper_account_fixture(paper_dir: Path, action_count: int = 0, satellit
                 "stock_target_review_action_count": action_count,
             }
         ),
-        encoding="utf-8",
+        encoding=metrics_encoding,
     )
 
 
@@ -278,3 +283,26 @@ class LivePreflightTests(unittest.TestCase):
             self.assertIn("live_shadow_review_blocking_decision_count=1", result.snapshot["blocking_items"])
             self.assertIn("live_shadow_review_monitor_decision_count=1", result.snapshot["monitor_items"])
             self.assertIn("Live-shadow review decisions", result.report_path.read_text(encoding="utf-8"))
+
+    def test_live_preflight_reads_bom_encoded_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paper_dir = root / "paper"
+            dashboard_snapshot = root / "latest_dashboard_snapshot.json"
+            write_paper_account_fixture(
+                paper_dir,
+                action_count=0,
+                satellite_weight=0.0,
+                metrics_encoding="utf-8-sig",
+            )
+            write_dashboard_snapshot(dashboard_snapshot, paper_dir)
+
+            result = run_live_preflight(
+                dashboard_snapshot=dashboard_snapshot,
+                paper_account_dir=paper_dir,
+                output_dir=root / "live_preflight",
+            )
+
+            self.assertEqual(result.snapshot["decision"], "ready_for_watch_only_pre_stage")
+            self.assertEqual(result.snapshot["stock_target_review_action_count"], 0)
+            self.assertEqual(result.snapshot["stock_target_review_blocking_action_count"], 0)

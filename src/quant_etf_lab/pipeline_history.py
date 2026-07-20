@@ -324,6 +324,7 @@ def run_pipeline_history_review(
     max_staleness_days: int = 3,
     drawdown_watch_threshold: float = -0.08,
     min_sharpe_watch: float = 0.5,
+    history_frame: pd.DataFrame | None = None,
 ) -> PipelineHistoryReviewResult:
     root = Path(project_root).resolve()
     as_of = _parse_date(as_of_date) if as_of_date is not None else datetime.now().date()
@@ -334,7 +335,11 @@ def run_pipeline_history_review(
 
     resolved_history = _resolve(root, history_file, DEFAULT_HISTORY_FILE)
     resolved_output = _resolve(root, output_dir, DEFAULT_OUTPUT_DIR)
-    history, history_status = _read_history(resolved_history)
+    if history_frame is None:
+        history, history_status = _read_history(resolved_history)
+    else:
+        history = history_frame.copy()
+        history_status = "empty" if history.empty else "ok"
     clean = _clean_history(history) if history_status == "ok" else pd.DataFrame()
 
     generated_at = datetime.now().isoformat(timespec="seconds")

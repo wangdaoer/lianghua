@@ -7,7 +7,7 @@ strategy:
   name: multi_factor
   momentum_focus_enabled: true
   momentum_focus_board_scope: all
-  momentum_focus_threshold_pct: 7.0
+  momentum_focus_threshold_pct: 5.0
   momentum_focus_limit_up_boost: 0.20
   momentum_focus_strong_gain_boost: 0.05
   momentum_focus_only: true

@@ -1,0 +1,126 @@
+project:
+  name: custom_watchlist_multifactor_qfull_static_reversal_lowvol_strict_v1
+  initial_cash: 1000000.0
+data:
+  start_date: '20180101'
+  end_date: '20260625'
+  period: daily
+  adjust: qfq
+strategy:
+  name: multi_factor
+  fast_window: 20
+  slow_window: 60
+  trend_window: 120
+  rsi_window: 14
+  rsi_oversold: 35.0
+  rsi_recover: 40.0
+  rsi_exit: 65.0
+  max_positions: 10
+  allocation_buffer: 0.995
+  lot_size: 100
+  min_score: 60.0
+  min_hold_days: 0
+  score_weighted_allocation: false
+  score_allocation_method: proportional
+  score_allocation_tilt_strength: 0.5
+  score_allocation_min_multiplier: 0.5
+  score_allocation_max_multiplier: 1.5
+  volatility_stop_loss_enabled: false
+  volatility_stop_window: 20
+  volatility_stop_multiplier: 3.0
+  volatility_stop_min_pct: 0.05
+  volatility_stop_max_pct: 0.18
+  time_stop_enabled: false
+  time_stop_min_hold_days: 20
+  time_stop_return_threshold_pct: 0.0
+  stop_loss_pct: null
+  take_profit_pct: null
+  trailing_stop_pct: null
+  prefer_existing_positions: false
+  signal_min_history: 0
+  rebalance_loss_guard_pct: null
+  rebalance_loss_guard_max_days: 0
+  market_breadth_enabled: false
+  market_breadth_window: 120
+  market_breadth_min_ratio: 0.0
+  market_breadth_min_count: 1
+  market_breadth_exposure_enabled: false
+  market_breadth_weak_ratio: 0.3
+  market_breadth_weak_exposure: 0.5
+  cross_sectional_score_enabled: false
+  cross_sectional_score_weights:
+    signal: 0.6
+    momentum: 0.2
+    trend: 0.15
+    liquidity: 0.05
+    volatility: 0.0
+  loss_cooldown_days: 0
+  loss_cooldown_min_losses: 1
+  factor_momentum_window: 60
+  factor_reversal_window: 5
+  factor_volatility_window: 20
+  factor_liquidity_window: 20
+  factor_trend_window: 120
+  factor_convergence_windows:
+  - 5
+  - 10
+  - 20
+  - 60
+  - 120
+  factor_volume_price_window: 20
+  factor_shadow_window: 20
+  factor_chip_reversal_drawdown_window: 20
+  factor_chip_reversal_cost_window: 20
+  factor_chip_reversal_min_drawdown_pct: 12.0
+  factor_chip_reversal_min_score: 0.08
+  factor_min_history: 120
+  factor_rebalance_interval: 20
+  factor_weights:
+    momentum: 0.1
+    trend: 0.15
+    reversal: 0.4
+    volatility: 0.25
+    liquidity: 0.1
+  factor_entry_filter_enabled: false
+  factor_entry_trend_window: 120
+  factor_entry_min_trend: 0.0
+  factor_entry_momentum_window: 20
+  factor_entry_min_momentum: -0.05
+  momentum_focus_enabled: false
+  momentum_focus_board_scope: main_chinext
+  momentum_focus_threshold_pct: 5.0
+  momentum_focus_limit_up_boost: 0.0
+  momentum_focus_strong_gain_boost: 0.0
+  momentum_focus_only: false
+costs:
+  commission_rate: 0.0003
+  slippage_rate: 0.0005
+  stamp_tax_rate: 0.0005
+risk:
+  enabled: true
+  benchmark_code: '510300'
+  benchmark_name: CSI300 ETF
+  benchmark_asset_type: etf
+  benchmark_ma_window: 120
+  benchmark_drop_window: 20
+  benchmark_drop_threshold: -0.05
+  benchmark_off_exposure: 0.35
+  benchmark_crash_exposure: 0.0
+  benchmark_rsrs_enabled: false
+  benchmark_rsrs_window: 18
+  benchmark_rsrs_zscore_window: 600
+  benchmark_rsrs_threshold: -0.7
+  benchmark_rsrs_off_exposure: 0.35
+  drawdown_levels:
+  - drawdown: 0.08
+    exposure: 0.55
+  - drawdown: 0.15
+    exposure: 0.3
+  - drawdown: 0.25
+    exposure: 0.0
+  protection_drawdown: 0.25
+  recovery_drawdown: 0.12
+stock_market_cap_path: D:\codex\量化\data\processed\stock_market_cap_yi.csv
+stock_tracking_max_market_cap_yi: 0.0
+universe: []
+universe_file: D:\codex\量化\configs\custom_stocks.csv

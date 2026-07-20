@@ -1,0 +1,14 @@
+extends: portfolio_core_source_selection_quality_reversal_v1.yaml
+
+project:
+  name: main_chinext_core_source_selection_quality_reversal_highgain_dd40_only
+
+satellite_sources:
+  highgain_dd40_protected:
+    path: outputs/walk_forward/wf_next_highgain_only_entry_highgain_dd40_grid_v2_capital_gate_full/oos_equity_stitched.csv
+    equity_column: stitched_equity
+
+notes: >
+  Research-only source-selection config that compares the protected
+  highgain-dd40 curve against the quality/reversal baseline sources without
+  the other high-yield satellite families.

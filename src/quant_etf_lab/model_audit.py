@@ -15,6 +15,8 @@ from typing import Any
 import pandas as pd
 import yaml
 
+from ._compat import read_text
+
 
 DEFAULT_WALK_FORWARD_RESOLUTION_PATH = Path("outputs/research/walk_forward_run_resolutions.csv")
 _RESOLVED_WALK_FORWARD_STATUSES = {"resolved", "superseded", "abandoned", "duplicate", "replaced", "finalized"}
@@ -42,9 +44,9 @@ def _fingerprint(value: Any) -> str:
 
 def _read_yaml(path: Path) -> dict[str, Any]:
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        raw = yaml.safe_load(read_text(path)) or {}
     except UnicodeDecodeError:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+        raw = yaml.safe_load(read_text(path, encoding="utf-8-sig")) or {}
     if not isinstance(raw, dict):
         return {}
     return raw
@@ -132,7 +134,7 @@ def _markdown_metric(summary_path: Path, label: str) -> str | None:
     if not summary_path.exists():
         return None
     pattern = re.compile(rf"^\|\s*{re.escape(label)}\s*\|\s*(.*?)\s*\|")
-    for line in summary_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+    for line in read_text(summary_path, encoding="utf-8", errors="ignore").splitlines():
         match = pattern.match(line)
         if match:
             return match.group(1).strip()
@@ -342,7 +344,7 @@ def _scan_locks(lock_dir: Path) -> list[dict[str, Any]]:
     current_pid = os.getpid()
     for path in sorted(lock_dir.glob("*.lock.json")):
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(read_text(path))
         except json.JSONDecodeError:
             locks.append({"file": str(path), "status": "invalid_json"})
             continue

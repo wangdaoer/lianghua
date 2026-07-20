@@ -1,4 +1,4 @@
-"""Research-only after-event outcome analysis for limit-up and strong-gain stocks."""
+"""Research-only after-event outcome analysis for strong-gain stocks."""
 
 from __future__ import annotations
 
@@ -95,10 +95,10 @@ def _read_price_csv(path: Path) -> pd.DataFrame:
 def build_momentum_events(
     prices: pd.DataFrame,
     horizons: Iterable[int] = (1, 3, 5, 10),
-    strong_gain_threshold_pct: float = 7.0,
+    strong_gain_threshold_pct: float = 5.0,
     board_scope: str = "main_chinext",
 ) -> pd.DataFrame:
-    """Label limit-up/strong-gain events and attach future returns."""
+    """Label strong-gain events and attach future returns."""
     if prices.empty:
         return pd.DataFrame()
     horizons_list = [int(horizon) for horizon in horizons]
@@ -135,7 +135,7 @@ def build_momentum_events(
     events["board"] = board
     events["limit_up"] = events["daily_return_pct"] >= threshold
     events["strong_gain"] = True
-    events["signal_type"] = events["limit_up"].map({True: "limit_up", False: "strong_gain_7pct"})
+    events["signal_type"] = f"strong_gain_{float(strong_gain_threshold_pct):g}"
     events["next_open"] = data["open"].shift(-1).loc[events.index]
     events["capital_efficiency"] = events["amount"] / 100_000_000.0
     events["amount_bucket"] = events["capital_efficiency"].map(_amount_bucket)
@@ -331,7 +331,7 @@ def run_momentum_outcome_analysis(
     data_dir: str | Path | None = DEFAULT_DATA_DIR,
     output_dir: str | Path | None = DEFAULT_OUTPUT_DIR,
     horizons: Iterable[int] = (1, 3, 5, 10),
-    strong_gain_threshold_pct: float = 7.0,
+    strong_gain_threshold_pct: float = 5.0,
     board_scope: str = "main_chinext",
     min_events: int = 5,
     max_symbols: int | None = None,

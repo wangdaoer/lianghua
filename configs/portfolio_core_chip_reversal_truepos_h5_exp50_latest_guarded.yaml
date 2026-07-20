@@ -1,0 +1,20 @@
+extends: base/portfolio_core_satellite_guarded_base.yaml
+
+project:
+  name: main_chinext_core_chip_reversal_truepos_h5_exp50_latest_guarded
+
+curves:
+  satellite:
+    path: outputs/research/gain_gt5_chip_confirm_2018_2026_20260618/true_position_h5_new5_total25_exp50/equity_curve.csv
+    equity_column: equity
+
+weights:
+  risk_on:
+    core: 0.90
+    satellite: 0.10
+
+notes: >
+  Research-only allocator test using the latest true-position chip-reversal H5
+  curve. The curve uses next-open entry, fifth-day close exit, max 5 new
+  positions per day, max 25 concurrent positions, 50% target exposure, and
+  broker_action=none.
