@@ -171,6 +171,10 @@ def _choose_non_empty(left: pd.Series, right: pd.Series) -> pd.Series:
     return left_text.where(left_text.notna() & (left_text.str.len() > 0), right_text)
 
 
+def _choose_present(left: pd.Series, right: pd.Series) -> pd.Series:
+    return left.where(left.notna(), right)
+
+
 def _ordered_columns(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     for column in columns:
         if column not in frame.columns:
@@ -358,11 +362,11 @@ def build_model_decision_table(base: pd.DataFrame, overlay: pd.DataFrame) -> pd.
     merged = base_part.merge(overlay_part, on="symbol", how="outer")
     merged["stock_name"] = _choose_non_empty(merged["stock_name_personal"], merged["stock_name_base"])
     merged["trend_state"] = _choose_non_empty(merged["trend_state_personal"], merged["trend_state_base"])
-    merged["close"] = merged["close_personal"].combine_first(merged["close_base"])
-    merged["return_5d"] = merged["return_5d_personal"].combine_first(merged["return_5d_base"])
-    merged["return_20d"] = merged["return_20d_personal"].combine_first(merged["return_20d_base"])
-    merged["return_60d"] = merged["return_60d_personal"].combine_first(merged["return_60d_base"])
-    merged["close_position"] = merged["close_position_personal"].combine_first(merged["close_position_base"])
+    merged["close"] = _choose_present(merged["close_personal"], merged["close_base"])
+    merged["return_5d"] = _choose_present(merged["return_5d_personal"], merged["return_5d_base"])
+    merged["return_20d"] = _choose_present(merged["return_20d_personal"], merged["return_20d_base"])
+    merged["return_60d"] = _choose_present(merged["return_60d_personal"], merged["return_60d_base"])
+    merged["close_position"] = _choose_present(merged["close_position_personal"], merged["close_position_base"])
 
     merged["base_target_weight"] = _numeric(merged["base_target_weight"], 0.0)
     merged["personal_target_weight"] = _numeric(merged["personal_target_weight"], 0.0)
@@ -478,11 +482,11 @@ def build_priority_watchlist(
     merged["strategy_family_reason"] = _choose_non_empty(
         merged["strategy_family_reason_pattern"], merged["strategy_family_reason_model"]
     )
-    merged["close"] = merged["close_model"].combine_first(merged["close_pattern"])
-    merged["return_5d"] = merged["return_5d_model"].combine_first(merged["return_5d_pattern"])
-    merged["return_20d"] = merged["return_20d_model"].combine_first(merged["return_20d_pattern"])
-    merged["return_60d"] = merged["return_60d_model"].combine_first(merged["return_60d_pattern"])
-    merged["close_position"] = merged["close_position_model"].combine_first(merged["close_position_pattern"])
+    merged["close"] = _choose_present(merged["close_model"], merged["close_pattern"])
+    merged["return_5d"] = _choose_present(merged["return_5d_model"], merged["return_5d_pattern"])
+    merged["return_20d"] = _choose_present(merged["return_20d_model"], merged["return_20d_pattern"])
+    merged["return_60d"] = _choose_present(merged["return_60d_model"], merged["return_60d_pattern"])
+    merged["close_position"] = _choose_present(merged["close_position_model"], merged["close_position_pattern"])
 
     merged["personal_selected"] = _bool_without_na(merged["personal_selected"])
     confirmed_pattern = merged["state_pattern_bucket"].astype("string").eq("pattern_confirmed_by_trend")
