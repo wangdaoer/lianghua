@@ -68,7 +68,7 @@ class UpdateBenchmark510300Test(unittest.TestCase):
         self.assertEqual(sohu[date(2026, 7, 13)].amount, 7_705_111_250)
         self.assertEqual(yahoo[date(2026, 7, 13)].volume, 1_619_052_968)
 
-    def test_rejects_intraday_sina_snapshot_for_current_asof(self):
+    def test_intraday_sina_is_excluded_when_two_history_sources_agree(self):
         with tempfile.TemporaryDirectory() as tmp:
             benchmark = Path(tmp) / "510300.csv"
             self._write_base(benchmark)
@@ -78,14 +78,17 @@ class UpdateBenchmark510300Test(unittest.TestCase):
             )
             _, sohu, yahoo = self._fetchers()
 
-            with self.assertRaisesRegex(ValueError, "before market close"):
-                refresh_benchmark(
-                    benchmark,
-                    date(2026, 7, 13),
-                    fetch_sina=lambda symbol: intraday,
-                    fetch_sohu=sohu,
-                    fetch_yahoo=yahoo,
-                )
+            result = refresh_benchmark(
+                benchmark,
+                date(2026, 7, 13),
+                fetch_sina=lambda symbol: intraday,
+                fetch_sohu=sohu,
+                fetch_yahoo=yahoo,
+            )
+
+            self.assertEqual(result["status"], "updated_degraded")
+            self.assertEqual(result["sources"], ["Sohu", "Yahoo"])
+            self.assertEqual(result["stale_sources"], ["Sina"])
 
     def test_prior_day_catchup_ignores_next_day_intraday_sina_quote(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -135,12 +138,114 @@ class UpdateBenchmark510300Test(unittest.TestCase):
             self.assertEqual(int(frame.iloc[-1]["amount"]), 7_705_111_563)
             self.assertTrue(status["source_agreement"])
 
-    def test_source_disagreement_leaves_original_file_unchanged(self):
+    def test_stale_sohu_uses_yahoo_and_post_close_sina(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            benchmark = Path(tmp) / "510300.csv"
+            self._write_base(benchmark)
+            sina, sohu, yahoo = self._fetchers()
+
+            def stale_sohu(symbol: str, start: date, end: date):
+                return {
+                    key: value
+                    for key, value in sohu(symbol, start, end).items()
+                    if key < date(2026, 7, 13)
+                }
+
+            result = refresh_benchmark(
+                benchmark,
+                date(2026, 7, 13),
+                fetch_sina=sina,
+                fetch_sohu=stale_sohu,
+                fetch_yahoo=yahoo,
+            )
+
+            frame = pd.read_csv(benchmark)
+            self.assertEqual(result["status"], "updated_degraded")
+            self.assertEqual(result["source_mode"], "degraded_two_source")
+            self.assertEqual(result["sources"], ["Yahoo", "Sina"])
+            self.assertEqual(result["stale_sources"], ["Sohu"])
+            self.assertTrue(result["warnings"])
+            self.assertEqual(int(frame.iloc[-1]["amount"]), 7_705_111_563)
+
+    def test_malformed_sohu_uses_verified_two_source_degraded_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            benchmark = Path(tmp) / "510300.csv"
+            self._write_base(benchmark)
+            sina, _, yahoo = self._fetchers()
+
+            def malformed_sohu(symbol: str, start: date, end: date):
+                raise ValueError("Sohu returned malformed history data")
+
+            result = refresh_benchmark(
+                benchmark,
+                date(2026, 7, 13),
+                fetch_sina=sina,
+                fetch_sohu=malformed_sohu,
+                fetch_yahoo=yahoo,
+            )
+
+            self.assertEqual(result["status"], "updated_degraded")
+            self.assertEqual(result["source_mode"], "degraded_two_source")
+            self.assertEqual(result["sources"], ["Yahoo", "Sina"])
+            self.assertEqual(result["stale_sources"], ["Sohu"])
+            self.assertTrue(any("malformed history data" in warning for warning in result["warnings"]))
+            self.assertEqual(len(pd.read_csv(benchmark)), 2)
+
+    def test_malformed_yahoo_uses_sohu_and_sina(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            benchmark = Path(tmp) / "510300.csv"
+            self._write_base(benchmark)
+            sina, sohu, _ = self._fetchers()
+
+            def malformed_yahoo(symbol: str, start: date, end: date):
+                raise ValueError("Yahoo returned malformed chart data")
+
+            result = refresh_benchmark(
+                benchmark,
+                date(2026, 7, 13),
+                fetch_sina=sina,
+                fetch_sohu=sohu,
+                fetch_yahoo=malformed_yahoo,
+            )
+
+            self.assertEqual(result["status"], "updated_degraded")
+            self.assertEqual(result["sources"], ["Sohu", "Sina"])
+            self.assertEqual(result["stale_sources"], ["Yahoo"])
+
+    def test_unavailable_sina_uses_sohu_and_yahoo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            benchmark = Path(tmp) / "510300.csv"
+            self._write_base(benchmark)
+            _, sohu, yahoo = self._fetchers()
+
+            def unavailable_sina(symbol: str):
+                raise RuntimeError("Sina request failed")
+
+            result = refresh_benchmark(
+                benchmark,
+                date(2026, 7, 13),
+                fetch_sina=unavailable_sina,
+                fetch_sohu=sohu,
+                fetch_yahoo=yahoo,
+            )
+
+            self.assertEqual(result["status"], "updated_degraded")
+            self.assertEqual(result["sources"], ["Sohu", "Yahoo"])
+            self.assertEqual(result["stale_sources"], ["Sina"])
+
+    def test_stale_sohu_fallback_rejects_yahoo_sina_disagreement(self):
         with tempfile.TemporaryDirectory() as tmp:
             benchmark = Path(tmp) / "510300.csv"
             self._write_base(benchmark)
             original = benchmark.read_bytes()
             sina, sohu, yahoo = self._fetchers()
+
+            def stale_sohu(symbol: str, start: date, end: date):
+                return {
+                    key: value
+                    for key, value in sohu(symbol, start, end).items()
+                    if key < date(2026, 7, 13)
+                }
 
             def bad_yahoo(symbol: str, start: date, end: date):
                 rows = yahoo(symbol, start, end)
@@ -155,8 +260,56 @@ class UpdateBenchmark510300Test(unittest.TestCase):
                     benchmark,
                     date(2026, 7, 13),
                     fetch_sina=sina,
-                    fetch_sohu=sohu,
+                    fetch_sohu=stale_sohu,
                     fetch_yahoo=bad_yahoo,
+                )
+
+            self.assertEqual(benchmark.read_bytes(), original)
+
+    def test_one_dissenting_source_is_excluded_when_other_two_agree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            benchmark = Path(tmp) / "510300.csv"
+            self._write_base(benchmark)
+            sina, sohu, yahoo = self._fetchers()
+
+            def bad_yahoo(symbol: str, start: date, end: date):
+                rows = yahoo(symbol, start, end)
+                row = rows[date(2026, 7, 13)]
+                rows[date(2026, 7, 13)] = BenchmarkRow(
+                    row.date, row.open, row.high, row.low, 4.900, row.volume, row.amount
+                )
+                return rows
+
+            result = refresh_benchmark(
+                benchmark,
+                date(2026, 7, 13),
+                fetch_sina=sina,
+                fetch_sohu=sohu,
+                fetch_yahoo=bad_yahoo,
+            )
+
+            self.assertEqual(result["status"], "updated_degraded")
+            self.assertEqual(result["sources"], ["Sohu", "Sina"])
+            self.assertEqual(result["stale_sources"], ["Yahoo"])
+            self.assertEqual(len(pd.read_csv(benchmark)), 2)
+
+    def test_only_one_available_source_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            benchmark = Path(tmp) / "510300.csv"
+            self._write_base(benchmark)
+            original = benchmark.read_bytes()
+            sina, _, _ = self._fetchers()
+
+            def unavailable_history(symbol: str, start: date, end: date):
+                raise RuntimeError("history request failed")
+
+            with self.assertRaisesRegex(ValueError, "requires two agreeing sources"):
+                refresh_benchmark(
+                    benchmark,
+                    date(2026, 7, 13),
+                    fetch_sina=sina,
+                    fetch_sohu=unavailable_history,
+                    fetch_yahoo=unavailable_history,
                 )
 
             self.assertEqual(benchmark.read_bytes(), original)
@@ -203,6 +356,34 @@ class UpdateBenchmark510300Test(unittest.TestCase):
             self.assertEqual(result["status"], "already_fresh")
             self.assertEqual(result["rows_added"], 0)
             self.assertEqual(len(frame), 2)
+
+    def test_already_fresh_file_accepts_one_stale_history_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            benchmark = Path(tmp) / "510300.csv"
+            self._write_base(benchmark)
+            with benchmark.open("a", encoding="utf-8", newline="") as handle:
+                handle.write("2026-07-13,4.802,4.821,4.719,4.744,1619052968,7705111563\n")
+            sina, sohu, yahoo = self._fetchers()
+
+            def stale_sohu(symbol: str, start: date, end: date):
+                return {
+                    key: value
+                    for key, value in sohu(symbol, start, end).items()
+                    if key < date(2026, 7, 13)
+                }
+
+            result = refresh_benchmark(
+                benchmark,
+                date(2026, 7, 13),
+                fetch_sina=sina,
+                fetch_sohu=stale_sohu,
+                fetch_yahoo=yahoo,
+            )
+
+            self.assertEqual(result["status"], "already_fresh_degraded")
+            self.assertEqual(result["sources"], ["Yahoo", "Sina"])
+            self.assertEqual(result["stale_sources"], ["Sohu"])
+            self.assertEqual(len(pd.read_csv(benchmark)), 2)
 
     @staticmethod
     def _write_base(path: Path) -> None:

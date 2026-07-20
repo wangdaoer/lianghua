@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +18,10 @@ DEFAULT_DAILY_DIR = daily_data_root() / "ths_exports" / "normalized"
 DEFAULT_OUTPUT = Path("data_panel_history_main_chinext_20220101_latest.csv")
 DEFAULT_PREFIXES = ("000", "001", "002", "003", "300", "301", "600", "601", "603", "605")
 ZERO_PLACEHOLDER_COLUMNS = ("open", "high", "low", "close", "volume", "amount")
+OPTIONAL_POINT_IN_TIME_COLUMNS = (
+    "main_net_inflow",
+    "main_net_volume_ratio",
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,8 @@ class DailySummary:
     symbols: int
     amount_source: str
     raw_positive_ratio: float
+    money_flow_source: str = "unavailable"
+    money_flow_ratio_source: str = "unavailable"
 
 
 def clean_code(value: object) -> str:
@@ -86,6 +92,13 @@ def parse_number(value: object) -> float:
     return float(match.group(0)) * multiplier
 
 
+def parse_percent_ratio(value: object) -> float:
+    """Convert a THS percentage-point field such as ``0.77`` to ``0.0077``."""
+
+    parsed = parse_number(value)
+    return parsed / 100.0 if np.isfinite(parsed) else np.nan
+
+
 def _numeric(series: pd.Series) -> pd.Series:
     return series.map(parse_number).astype(float)
 
@@ -101,6 +114,9 @@ def _finalize(frame: pd.DataFrame, prefixes: tuple[str, ...]) -> pd.DataFrame:
     frame = frame[frame["symbol"].map(lambda x: allowed_code(x, prefixes))]
     for col in ["open", "high", "low", "close", "volume", "amount"]:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    for col in OPTIONAL_POINT_IN_TIME_COLUMNS:
+        if col in frame:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
     frame["amount"] = frame["amount"].where(frame["amount"].gt(0))
     frame["volume"] = frame["volume"].where(frame["volume"].gt(0), frame["amount"] / frame["close"])
     frame = frame.dropna(subset=["date", "symbol", "open", "high", "low", "close", "volume", "amount"])
@@ -112,11 +128,40 @@ def _finalize(frame: pd.DataFrame, prefixes: tuple[str, ...]) -> pd.DataFrame:
         & frame["volume"].gt(0)
         & frame["amount"].gt(0)
     ]
-    return frame[["date", "symbol", "open", "high", "low", "close", "volume", "amount"]]
+    columns = ["date", "symbol", "open", "high", "low", "close", "volume", "amount"]
+    columns.extend(column for column in OPTIONAL_POINT_IN_TIME_COLUMNS if column in frame)
+    return frame[columns]
 
 
 def read_daily_csv(path: Path, trade_date: str, prefixes: tuple[str, ...]) -> tuple[pd.DataFrame, DailySummary]:
     raw = pd.read_csv(path)
+    money_flow_column = next(
+        (
+            column
+            for column in ("main_net_inflow", "net_money_flow", "net_mf_amount", "money_flow")
+            if column in raw
+        ),
+        None,
+    )
+    money_flow = (
+        pd.to_numeric(raw[money_flow_column], errors="coerce")
+        if money_flow_column is not None
+        else pd.Series(np.nan, index=raw.index, dtype=float)
+    )
+    ratio_column = next(
+        (
+            column
+            for column in ("main_net_volume_ratio", "main_net_volume_ratio_pct", "主力净量")
+            if column in raw
+        ),
+        None,
+    )
+    if ratio_column == "main_net_volume_ratio":
+        money_flow_ratio = pd.to_numeric(raw[ratio_column], errors="coerce")
+    elif ratio_column is not None:
+        money_flow_ratio = raw[ratio_column].map(parse_percent_ratio).astype(float)
+    else:
+        money_flow_ratio = pd.Series(np.nan, index=raw.index, dtype=float)
     frame = pd.DataFrame(
         {
             "date": pd.to_datetime(raw.get("trade_date", trade_date), errors="coerce"),
@@ -129,6 +174,8 @@ def read_daily_csv(path: Path, trade_date: str, prefixes: tuple[str, ...]) -> tu
             "amount": pd.to_numeric(raw.get("amount", raw.get("turnover")), errors="coerce"),
             "turnover_rate": pd.to_numeric(raw.get("turnover_rate"), errors="coerce"),
             "market_cap": pd.to_numeric(raw.get("market_cap"), errors="coerce"),
+            "main_net_inflow": money_flow,
+            "main_net_volume_ratio": money_flow_ratio,
         }
     )
     frame["date"] = frame["date"].fillna(pd.Timestamp(trade_date))
@@ -155,6 +202,8 @@ def read_daily_csv(path: Path, trade_date: str, prefixes: tuple[str, ...]) -> tu
         symbols=int(out["symbol"].nunique()),
         amount_source=amount_source,
         raw_positive_ratio=raw_positive_ratio,
+        money_flow_source=(money_flow_column or "unavailable"),
+        money_flow_ratio_source=(ratio_column or "unavailable"),
     )
     return out, summary
 
@@ -176,6 +225,12 @@ def read_daily_xls(path: Path, trade_date: str, prefixes: tuple[str, ...]) -> tu
             "amount": _numeric(raw.get("总金额", pd.Series(np.nan, index=raw.index))),
             "turnover_rate": _numeric(raw.get("换手", pd.Series(np.nan, index=raw.index))),
             "market_cap": _numeric(raw.get("总市值", pd.Series(np.nan, index=raw.index))),
+            "main_net_inflow": _numeric(
+                raw.get("大单净额", pd.Series(np.nan, index=raw.index))
+            ),
+            "main_net_volume_ratio": raw.get(
+                "主力净量", pd.Series(np.nan, index=raw.index)
+            ).map(parse_percent_ratio).astype(float),
         }
     )
     tradable = frame["close"].gt(0)
@@ -194,6 +249,12 @@ def read_daily_xls(path: Path, trade_date: str, prefixes: tuple[str, ...]) -> tu
         symbols=int(out["symbol"].nunique()),
         amount_source=amount_source,
         raw_positive_ratio=raw_positive_ratio,
+        money_flow_source=(
+            "大单净额" if frame["main_net_inflow"].notna().any() else "unavailable"
+        ),
+        money_flow_ratio_source=(
+            "主力净量" if frame["main_net_volume_ratio"].notna().any() else "unavailable"
+        ),
     )
     return out, summary
 
@@ -213,6 +274,10 @@ def select_daily_files(daily_dir: Path, start_date: str, end_date: str | None) -
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date) if end_date else None
     for path in candidates:
+        if not re.fullmatch(
+            r"ths_hs_a_share_\d{4}-\d{2}-\d{2}\.(?:csv|xls)", path.name
+        ):
+            continue
         trade_date = pd.Timestamp(date_from_name(path))
         if trade_date < start or (end is not None and trade_date > end):
             continue
@@ -237,13 +302,48 @@ def load_daily_panel(
         trade_date = date_from_name(path)
         if path.suffix.lower() == ".csv":
             frame, summary = read_daily_csv(path, trade_date, prefixes)
+            xls_path = path.with_suffix(".xls")
+            if xls_path.exists():
+                xls_frame, xls_summary = read_daily_xls(xls_path, trade_date, prefixes)
+                point_in_time_columns = [
+                    column
+                    for column in OPTIONAL_POINT_IN_TIME_COLUMNS
+                    if column in xls_frame and xls_frame[column].notna().any()
+                ]
+                if point_in_time_columns:
+                    flow = xls_frame[["date", "symbol", *point_in_time_columns]]
+                    frame = frame.drop(columns=point_in_time_columns, errors="ignore").merge(
+                        flow,
+                        on=["date", "symbol"],
+                        how="left",
+                        validate="one_to_one",
+                    )
+                    summary = replace(
+                        summary,
+                        money_flow_source=f"xls:{xls_summary.money_flow_source}",
+                        money_flow_ratio_source=(
+                            f"xls:{xls_summary.money_flow_ratio_source}"
+                        ),
+                    )
         else:
             frame, summary = read_daily_xls(path, trade_date, prefixes)
         if not frame.empty:
             frames.append(frame)
         summaries.append(summary)
     if not frames:
-        return pd.DataFrame(columns=["date", "symbol", "open", "high", "low", "close", "volume", "amount"]), summaries
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "symbol",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "amount",
+                *OPTIONAL_POINT_IN_TIME_COLUMNS,
+            ]
+        ), summaries
     return pd.concat(frames, ignore_index=True), summaries
 
 
@@ -291,6 +391,8 @@ def main() -> None:
         print(
             f"{summary.date} rows={summary.rows} symbols={summary.symbols} "
             f"amount_source={summary.amount_source} raw_positive_ratio={summary.raw_positive_ratio:.3f} "
+            f"money_flow_source={summary.money_flow_source} "
+            f"money_flow_ratio_source={summary.money_flow_ratio_source} "
             f"file={Path(summary.file).name}"
         )
 

@@ -17,12 +17,17 @@ OBSERVATION_PREFIXES = (
     "daily_personal_overlay_selected_",
     "early_pattern_watchlist_",
     "hidden_accumulation_trade_watch_tracking_",
+    "main_net_volume_shadow_",
+    "institutional_accumulation_shadow_",
+    "institutional_accumulation_tracking_",
+    "czsc_structure_shadow_",
     "merged_model_decision_table_",
     "merged_priority_watchlist_",
     "merged_state_pattern_scan_",
     "rank_model_candidates_trend_gated_",
     "strategy_family_forward_",
     "strategy_family_health_",
+    "strategy_arena_",
     "trend_ignition_score_forward_",
 )
 
@@ -75,7 +80,7 @@ def select_supported_observation_files(
     return [
         path
         for path in select_observation_files(output_dir, asof_date)
-        if path.name.startswith(OBSERVATION_PREFIXES)
+        if path.name.startswith(OBSERVATION_PREFIXES) and not path.stem.endswith("_cn")
     ]
 
 
@@ -191,7 +196,10 @@ def main() -> None:
     )
     for path in observation_paths:
         frame = prepare_observation_frame(path, selected_asof)
-        print(f"observations {path.name}: {db.import_observations(frame, path.stem, str(path))}")
+        print(
+            f"observations {path.name}: "
+            f"{db.import_observations(frame, path.stem, str(path.resolve()))}"
+        )
 
     tdx_symbol_filter = None
     if args.tdx_symbols_from_panel and panel.exists():

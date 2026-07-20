@@ -108,6 +108,45 @@ class DailyRunCardTest(unittest.TestCase):
         self.assertEqual(first["record_hash"], second["record_hash"])
         self.assertEqual(first["artifacts"], second["artifacts"])
 
+    def test_detailed_passing_test_status_does_not_emit_warning(self):
+        card = build_daily_run_card(
+            {
+                "asof_date": "2026-07-15",
+                "verification": {"tests": "560 passed; 563 subtests passed"},
+                "artifacts": {},
+            }
+        )
+
+        self.assertEqual(card["warnings"], [])
+
+    def test_detailed_failed_test_status_emits_warning(self):
+        card = build_daily_run_card(
+            {
+                "asof_date": "2026-07-15",
+                "verification": {"tests": "560 passed, 1 failed"},
+                "artifacts": {},
+            }
+        )
+
+        self.assertIn("tests:560 passed, 1 failed", card["warnings"])
+
+    def test_degraded_benchmark_refresh_emits_warning(self):
+        card = build_daily_run_card(
+            {
+                "asof_date": "2026-07-16",
+                "verification": {
+                    "tests": "passed",
+                    "benchmark_refresh_status": "updated_degraded",
+                },
+                "artifacts": {},
+            }
+        )
+
+        self.assertIn(
+            "benchmark_refresh:updated_degraded",
+            card["warnings"],
+        )
+
     @staticmethod
     def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -497,6 +497,8 @@ def build_priority_watchlist(
     merged["risk_flags"] = ""
     merged.loc[st_risk, "priority_bucket"] = "risk_watch"
     merged.loc[st_risk, "risk_flags"] = "st_or_special_treatment"
+    merged.loc[st_risk, "personal_selected"] = False
+    merged.loc[st_risk, "personal_target_weight"] = 0.0
 
     bucket_rank = merged["priority_bucket"].map(
         {

@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from numbers import Integral, Real
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import pandas as pd
 
@@ -21,6 +22,31 @@ from run_multifactor_observation_evolution import load_market_data
 
 
 FACTOR = "liquidity_stability_20"
+FACTOR_DIRECTIONS: dict[str, float] = {
+    FACTOR: 1.0,
+    "momentum_20": 1.0,
+    "momentum_60": 1.0,
+    "breakout_distance_20": 1.0,
+    "trend_acceleration": 1.0,
+    "liquidity_20": 1.0,
+    "flow_persistence": 1.0,
+    "volatility_20": -1.0,
+}
+REPLACEMENT_TARGET_MATURE_DAYS = 20
+REPLACEMENT_SHORTLIST_SIZE = 3
+
+
+def _json_safe(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Real) and not isinstance(value, bool):
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        return int(value) if isinstance(value, Integral) else number
+    return value
 
 
 def _rank_ic(group: pd.DataFrame, factor: str, return_column: str) -> float:
@@ -79,6 +105,82 @@ def compute_daily_factor_observations(
                     "breadth_gap": float(group["breadth_gap"].iloc[0]),
                 }
             )
+    return pd.DataFrame(rows)
+
+
+def compute_daily_factor_competition(
+    factor_panel: pd.DataFrame,
+    breadth_state: pd.DataFrame,
+    factor_directions: Mapping[str, float] = FACTOR_DIRECTIONS,
+    horizons: Sequence[int] = DEFAULT_HORIZONS,
+) -> pd.DataFrame:
+    """Compare candidate factors under one PIT return and breadth calculation."""
+    requested = {
+        str(factor): float(direction)
+        for factor, direction in factor_directions.items()
+        if factor in factor_panel
+    }
+    if FACTOR not in requested:
+        raise ValueError(f"missing incumbent factor: {FACTOR}")
+    if any(direction not in (-1.0, 1.0) for direction in requested.values()):
+        raise ValueError("factor directions must be either -1 or 1")
+
+    enriched = attach_forward_open_returns(factor_panel, horizons)
+    enriched = enriched.merge(
+        breadth_state.reset_index()[["date", "breadth_gap", "breadth_healthy"]],
+        on="date",
+        how="left",
+        validate="many_to_one",
+    )
+    eligible = enriched.get("score_eligible", pd.Series(True, index=enriched.index))
+    enriched = enriched.loc[
+        eligible.fillna(False) & enriched["breadth_healthy"].fillna(False)
+    ]
+
+    rows: list[dict[str, object]] = []
+    for date, group in enriched.groupby("date", sort=True):
+        for factor, direction in requested.items():
+            raw_values = pd.to_numeric(group[factor], errors="coerce")
+            signal_values = raw_values * direction
+            signal_rank = signal_values.rank(method="average", pct=True)
+            for horizon in horizons:
+                return_column = f"forward_open_return_{int(horizon)}d"
+                forward = pd.to_numeric(group[return_column], errors="coerce")
+                valid = signal_values.notna() & forward.notna()
+                top = valid & signal_rank.ge(0.8)
+                bottom = valid & signal_rank.le(0.2)
+                rank_ic = math.nan
+                if valid.any():
+                    values = pd.DataFrame(
+                        {
+                            "signal": signal_values.loc[valid],
+                            "forward": forward.loc[valid],
+                        }
+                    ).dropna()
+                    if (
+                        len(values) >= 20
+                        and values["signal"].nunique() >= 2
+                        and values["forward"].nunique() >= 2
+                    ):
+                        rank_ic = float(
+                            values["signal"].rank().corr(values["forward"].rank())
+                        )
+                rows.append(
+                    {
+                        "date": pd.Timestamp(date),
+                        "factor": factor,
+                        "direction": direction,
+                        "horizon": int(horizon),
+                        "observations": int(valid.sum()),
+                        "rank_ic": rank_ic,
+                        "top_bottom_spread": (
+                            float(forward.loc[top].mean() - forward.loc[bottom].mean())
+                            if top.any() and bottom.any()
+                            else math.nan
+                        ),
+                        "breadth_gap": float(group["breadth_gap"].iloc[0]),
+                    }
+                )
     return pd.DataFrame(rows)
 
 
@@ -167,6 +269,314 @@ def classify_overall_status(summary: pd.DataFrame) -> str:
     if reversals == 1 or statuses.eq("weakened").any():
         return "weakened"
     return "stable"
+
+
+def summarize_factor_competition(
+    daily: pd.DataFrame,
+    *,
+    selection_start: pd.Timestamp,
+    selection_end: pd.Timestamp,
+    asof_date: pd.Timestamp,
+    recent_signal_days: int,
+    factor_directions: Mapping[str, float] = FACTOR_DIRECTIONS,
+    factor_availability: Mapping[str, object] | None = None,
+) -> pd.DataFrame:
+    """Build a cross-factor scoreboard without selecting on unseen observations."""
+    minimum_recent_days = min(10, recent_signal_days)
+    rows: list[dict[str, object]] = []
+    for factor, direction in factor_directions.items():
+        factor_daily = daily.loc[daily["factor"].eq(factor)]
+        if factor_daily.empty:
+            rows.append(
+                {
+                    "factor": factor,
+                    "direction": float(direction),
+                    "available": False,
+                    "valid_horizons": 0,
+                    "reference_mean_rank_ic": math.nan,
+                    "recent_mean_rank_ic": math.nan,
+                    "rank_ic_delta": math.nan,
+                    "recent_positive_horizons": 0,
+                    "recent_positive_ic_ratio": math.nan,
+                    "recent_mean_top_bottom_spread": math.nan,
+                    "support_status": "unavailable",
+                    "horizon_statuses": "",
+                }
+            )
+            continue
+        horizon_summary = summarize_factor_decay(
+            factor_daily,
+            selection_start=selection_start,
+            selection_end=selection_end,
+            asof_date=asof_date,
+            recent_signal_days=recent_signal_days,
+        )
+        valid = horizon_summary.loc[
+            horizon_summary["recent_days"].ge(minimum_recent_days)
+            & horizon_summary["recent_mean_rank_ic"].notna()
+        ]
+        source_available = (
+            bool(factor_availability.get(factor, False))
+            if factor_availability is not None
+            else True
+        )
+        reference_ic = pd.to_numeric(
+            valid["reference_mean_rank_ic"], errors="coerce"
+        ).mean()
+        recent_ic = pd.to_numeric(valid["recent_mean_rank_ic"], errors="coerce").mean()
+        recent_positive_ratio = pd.to_numeric(
+            valid["recent_positive_ic_ratio"], errors="coerce"
+        ).mean()
+        recent_spread = pd.to_numeric(
+            valid["recent_mean_top_bottom_spread"], errors="coerce"
+        ).mean()
+        positive_horizons = int(
+            pd.to_numeric(valid["recent_mean_rank_ic"], errors="coerce").gt(0.0).sum()
+        )
+        if not source_available:
+            support_status = "unavailable"
+        elif len(valid) < 2:
+            support_status = "insufficient_history"
+        elif (
+            positive_horizons >= 2
+            and pd.notna(recent_ic)
+            and float(recent_ic) > 0.0
+            and pd.notna(recent_positive_ratio)
+            and float(recent_positive_ratio) >= 0.5
+        ):
+            support_status = "supported"
+        else:
+            support_status = "not_supported"
+        rows.append(
+            {
+                "factor": factor,
+                "direction": float(direction),
+                "available": source_available,
+                "valid_horizons": int(len(valid)),
+                "reference_mean_rank_ic": reference_ic,
+                "recent_mean_rank_ic": recent_ic,
+                "rank_ic_delta": recent_ic - reference_ic,
+                "recent_positive_horizons": positive_horizons,
+                "recent_positive_ic_ratio": recent_positive_ratio,
+                "recent_mean_top_bottom_spread": recent_spread,
+                "support_status": support_status,
+                "horizon_statuses": ",".join(
+                    f"{int(row.horizon)}d:{row.status}"
+                    for row in horizon_summary.itertuples(index=False)
+                ),
+            }
+        )
+    result = pd.DataFrame(rows)
+    incumbent = result.loc[result["factor"].eq(FACTOR)]
+    incumbent_recent_ic = (
+        float(incumbent.iloc[0]["recent_mean_rank_ic"])
+        if not incumbent.empty and pd.notna(incumbent.iloc[0]["recent_mean_rank_ic"])
+        else math.nan
+    )
+    result["recent_ic_advantage_vs_incumbent"] = (
+        pd.to_numeric(result["recent_mean_rank_ic"], errors="coerce")
+        - incumbent_recent_ic
+    )
+    result["candidate_status"] = "not_shortlisted"
+    result.loc[result["factor"].eq(FACTOR), "candidate_status"] = "incumbent"
+    shortlist = (
+        result["factor"].ne(FACTOR)
+        & result["support_status"].eq("supported")
+        & result["recent_ic_advantage_vs_incumbent"].gt(0.0)
+    )
+    result.loc[shortlist, "candidate_status"] = "shortlist"
+    return result.sort_values(
+        ["candidate_status", "recent_mean_rank_ic", "factor"],
+        ascending=[True, False, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+
+def update_factor_replacement_preregistration(
+    path: Path,
+    competition: pd.DataFrame,
+    *,
+    asof_date: pd.Timestamp,
+    incumbent_status: str,
+    shortlist_size: int = REPLACEMENT_SHORTLIST_SIZE,
+) -> dict[str, object] | None:
+    """Freeze a shortlist once; all later evidence must come from unseen dates."""
+    path = Path(path)
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"expected preregistration object: {path}")
+        if payload.get("research_only") is not True or payload.get("trade_instruction") is not False:
+            raise ValueError(f"invalid research boundary in preregistration: {path}")
+        return payload
+    if incumbent_status not in {"weakened", "direction_reversal"}:
+        return None
+    candidates = competition.loc[competition["candidate_status"].eq("shortlist")].copy()
+    candidates = candidates.sort_values(
+        ["recent_mean_rank_ic", "factor"],
+        ascending=[False, True],
+        kind="mergesort",
+    ).head(shortlist_size)
+    if candidates.empty:
+        return None
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "created_from_asof_date": asof_date.date().isoformat(),
+        "validation_start_date": (asof_date + timedelta(days=1)).date().isoformat(),
+        "selection_status": "exploratory_posthoc_shortlist_preregistered_forward",
+        "incumbent_factor": FACTOR,
+        "candidate_factors": candidates["factor"].astype(str).tolist(),
+        "horizons": [int(value) for value in DEFAULT_HORIZONS],
+        "target_mature_signal_days": REPLACEMENT_TARGET_MATURE_DAYS,
+        "gates": {
+            "min_mean_rank_ic": 0.01,
+            "min_positive_ic_ratio": 0.55,
+            "min_rank_ic_advantage_vs_incumbent": 0.0,
+        },
+        "selection_evidence": candidates[
+            [
+                "factor",
+                "recent_mean_rank_ic",
+                "recent_positive_ic_ratio",
+                "recent_ic_advantage_vs_incumbent",
+            ]
+        ].to_dict("records"),
+        "research_only": True,
+        "trade_instruction": False,
+        "automatic_model_change": False,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(
+            _json_safe(payload),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+            allow_nan=False,
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return payload
+
+
+def evaluate_preregistered_replacements(
+    daily: pd.DataFrame,
+    preregistration: Mapping[str, object] | None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    if preregistration is None:
+        return pd.DataFrame(), {
+            "status": "not_preregistered",
+            "research_only": True,
+            "trade_instruction": False,
+            "automatic_model_change": False,
+        }
+    start = pd.Timestamp(str(preregistration["validation_start_date"]))
+    incumbent = str(preregistration["incumbent_factor"])
+    candidates = [str(value) for value in preregistration.get("candidate_factors", [])]
+    horizons = [int(value) for value in preregistration.get("horizons", DEFAULT_HORIZONS)]
+    target_days = int(
+        preregistration.get("target_mature_signal_days", REPLACEMENT_TARGET_MATURE_DAYS)
+    )
+    gates = preregistration.get("gates")
+    gates = gates if isinstance(gates, Mapping) else {}
+    tracked = daily.loc[
+        daily["date"].ge(start)
+        & daily["factor"].isin([incumbent, *candidates])
+        & daily["horizon"].isin(horizons)
+    ].copy()
+    rows: list[dict[str, object]] = []
+    factor_summaries: dict[str, dict[str, object]] = {}
+    for factor in [incumbent, *candidates]:
+        horizon_rows: list[dict[str, object]] = []
+        for horizon in horizons:
+            group = tracked.loc[
+                tracked["factor"].eq(factor)
+                & tracked["horizon"].eq(horizon)
+                & tracked["rank_ic"].notna()
+            ]
+            rank_ic = pd.to_numeric(group["rank_ic"], errors="coerce").dropna()
+            row = {
+                "factor": factor,
+                "horizon": horizon,
+                "mature_signal_days": int(len(rank_ic)),
+                "mean_rank_ic": float(rank_ic.mean()) if not rank_ic.empty else math.nan,
+                "positive_ic_ratio": (
+                    float(rank_ic.gt(0.0).mean()) if not rank_ic.empty else math.nan
+                ),
+                "latest_mature_signal_date": (
+                    pd.Timestamp(group["date"].max()).date().isoformat()
+                    if not group.empty
+                    else None
+                ),
+            }
+            horizon_rows.append(row)
+            rows.append(row)
+        horizon_frame = pd.DataFrame(horizon_rows)
+        factor_summaries[factor] = {
+            "factor": factor,
+            "minimum_mature_signal_days": int(horizon_frame["mature_signal_days"].min()),
+            "mean_rank_ic": pd.to_numeric(
+                horizon_frame["mean_rank_ic"], errors="coerce"
+            ).mean(),
+            "positive_ic_ratio": pd.to_numeric(
+                horizon_frame["positive_ic_ratio"], errors="coerce"
+            ).mean(),
+        }
+    incumbent_mean = pd.to_numeric(
+        pd.Series([factor_summaries[incumbent]["mean_rank_ic"]]), errors="coerce"
+    ).iloc[0]
+    factor_results: list[dict[str, object]] = []
+    for factor in [incumbent, *candidates]:
+        result = dict(factor_summaries[factor])
+        factor_mean = pd.to_numeric(
+            pd.Series([result["mean_rank_ic"]]), errors="coerce"
+        ).iloc[0]
+        positive_ratio = pd.to_numeric(
+            pd.Series([result["positive_ic_ratio"]]), errors="coerce"
+        ).iloc[0]
+        advantage = factor_mean - incumbent_mean
+        result["rank_ic_advantage_vs_incumbent"] = advantage
+        if int(result["minimum_mature_signal_days"]) < target_days:
+            decision = "collecting"
+        elif factor == incumbent:
+            decision = "benchmark_ready"
+        elif (
+            pd.notna(factor_mean)
+            and float(factor_mean) >= float(gates.get("min_mean_rank_ic", 0.01))
+            and pd.notna(positive_ratio)
+            and float(positive_ratio) >= float(gates.get("min_positive_ic_ratio", 0.55))
+            and pd.notna(advantage)
+            and float(advantage)
+            >= float(gates.get("min_rank_ic_advantage_vs_incumbent", 0.0))
+        ):
+            decision = "ready_for_research_review"
+        else:
+            decision = "rejected"
+        result["decision"] = decision
+        factor_results.append(result)
+    candidate_decisions = [
+        str(row["decision"]) for row in factor_results if row["factor"] != incumbent
+    ]
+    if not candidate_decisions:
+        status = "no_candidates"
+    elif "collecting" in candidate_decisions:
+        status = "collecting"
+    elif "ready_for_research_review" in candidate_decisions:
+        status = "ready_for_research_review"
+    else:
+        status = "rejected"
+    payload = {
+        "status": status,
+        "validation_start_date": start.date().isoformat(),
+        "target_mature_signal_days": target_days,
+        "factors": factor_results,
+        "research_only": True,
+        "trade_instruction": False,
+        "automatic_model_change": False,
+    }
+    return pd.DataFrame(rows), payload
 
 
 def build_current_observation(
@@ -303,6 +713,77 @@ def build_report(
     return "\n".join(lines) + "\n"
 
 
+def build_factor_competition_report(
+    competition: pd.DataFrame,
+    tracking: Mapping[str, object],
+    preregistration: Mapping[str, object] | None,
+    asof_date: pd.Timestamp,
+) -> str:
+    lines = [
+        "# 衰减因子替代候选竞赛",
+        "",
+        "> 研究/模拟盘用途，不构成交易指令。历史竞赛只产生候选，只有冻结后的未来样本可用于研究复核。",
+        "",
+        f"- 数据截至：{asof_date.date().isoformat()}",
+        f"- 当前因子：`{FACTOR}`",
+        "- 负向因子已统一转换为‘数值越高越有利’后计算 RankIC。",
+        "- 自动改权重：关闭",
+        "",
+        "## 历史竞赛",
+        "",
+        "| 因子 | 方向 | 参考RankIC | 最近RankIC | 相对当前 | 正向周期 | 正IC比例 | 支持状态 | 候选状态 |",
+        "|---|---:|---:|---:|---:|---:|---:|---|---|",
+    ]
+    ordered = competition.sort_values(
+        ["candidate_status", "recent_mean_rank_ic", "factor"],
+        ascending=[True, False, True],
+        kind="mergesort",
+    )
+    for row in ordered.to_dict("records"):
+        lines.append(
+            f"| {row['factor']} | {int(row['direction']):+d} | "
+            f"{_number(row['reference_mean_rank_ic'])} | {_number(row['recent_mean_rank_ic'])} | "
+            f"{_number(row['recent_ic_advantage_vs_incumbent'])} | "
+            f"{int(row['recent_positive_horizons'])}/{int(row['valid_horizons'])} | "
+            f"{_pct(row['recent_positive_ic_ratio'])} | {row['support_status']} | "
+            f"{row['candidate_status']} |"
+        )
+    lines.extend(["", "## 前瞻冻结", ""])
+    if preregistration is None:
+        lines.append("- 当前没有同时满足门槛的替代候选，未创建前瞻验证名单。")
+    else:
+        candidates = "、".join(
+            f"`{value}`" for value in preregistration.get("candidate_factors", [])
+        )
+        lines.extend(
+            [
+                f"- 候选：{candidates or '无'}",
+                f"- 未见样本起点：{preregistration.get('validation_start_date')}",
+                f"- 每个周期目标成熟信号日：{preregistration.get('target_mature_signal_days')}",
+                f"- 当前跟踪状态：`{tracking.get('status')}`",
+            ]
+        )
+        for row in tracking.get("factors", []):
+            if not isinstance(row, Mapping):
+                continue
+            lines.append(
+                f"- `{row.get('factor')}`：最少成熟样本 "
+                f"{row.get('minimum_mature_signal_days', 0)}，平均 RankIC "
+                f"{_number(row.get('mean_rank_ic'))}，结论 `{row.get('decision')}`。"
+            )
+    lines.extend(
+        [
+            "",
+            "## 使用边界",
+            "",
+            "- 候选名单一旦写入预注册文件便不会随每日排行榜变化。",
+            "- `ready_for_research_review` 只允许人工复核和独立回测，不能直接进入正式排名。",
+            "- 所有收益标签继续采用下一开盘进入、对应持有期后开盘退出。",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def run_factor_decay_monitor(
     panel: pd.DataFrame,
     *,
@@ -312,11 +793,13 @@ def run_factor_decay_monitor(
     selection_end: pd.Timestamp,
     recent_signal_days: int = 20,
     top_n: int = 40,
+    replacement_preregistration: Path | None = None,
 ) -> dict[str, object]:
     panel = panel.loc[pd.to_datetime(panel["date"]).le(asof_date)].copy()
     factor_panel, metadata = prepare_factor_panel(panel)
     breadth = compute_healthy_breadth_state(factor_panel, ma_window=20)
-    daily = compute_daily_factor_observations(factor_panel, breadth)
+    competition_daily = compute_daily_factor_competition(factor_panel, breadth)
+    daily = competition_daily.loc[competition_daily["factor"].eq(FACTOR)].copy()
     summary = summarize_factor_decay(
         daily,
         selection_start=selection_start,
@@ -325,6 +808,14 @@ def run_factor_decay_monitor(
         recent_signal_days=recent_signal_days,
     )
     overall_status = classify_overall_status(summary)
+    competition = summarize_factor_competition(
+        competition_daily,
+        selection_start=selection_start,
+        selection_end=selection_end,
+        asof_date=asof_date,
+        recent_signal_days=recent_signal_days,
+        factor_availability=metadata.get("factor_availability"),
+    )
     observation = build_current_observation(factor_panel, asof_date, top_n)
     breadth_row = breadth.loc[asof_date]
 
@@ -336,13 +827,54 @@ def run_factor_decay_monitor(
     report_path = output_dir / f"factor_decay_monitor_{token}.md"
     observation_path = output_dir / f"liquidity_stability_observation_{token}.csv"
     history_path = output_dir / "factor_decay_monitor_history.csv"
+    competition_daily_path = output_dir / f"factor_replacement_daily_ic_{token}.csv"
+    competition_path = output_dir / f"factor_replacement_competition_{token}.csv"
+    competition_report_path = output_dir / f"factor_replacement_competition_{token}.md"
+    preregistration_path = (
+        Path(replacement_preregistration)
+        if replacement_preregistration is not None
+        else output_dir / "factor_replacement_preregistration.json"
+    )
+    tracking_path = output_dir / f"factor_replacement_tracking_{token}.csv"
+    tracking_json_path = output_dir / f"factor_replacement_tracking_{token}.json"
     summary.to_csv(csv_path, index=False)
     observation.to_csv(observation_path, index=False)
+    competition_daily.to_csv(competition_daily_path, index=False)
+    competition.to_csv(competition_path, index=False)
     history = update_monitor_history(history_path, asof_date, summary, overall_status)
+    preregistration = update_factor_replacement_preregistration(
+        preregistration_path,
+        competition,
+        asof_date=asof_date,
+        incumbent_status=overall_status,
+    )
+    tracking_rows, tracking = evaluate_preregistered_replacements(
+        competition_daily, preregistration
+    )
+    tracking_rows.to_csv(tracking_path, index=False)
+    tracking_json_path.write_text(
+        json.dumps(
+            _json_safe(tracking),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+            allow_nan=False,
+        ),
+        encoding="utf-8",
+    )
     report_path.write_text(
         build_report(summary, overall_status, asof_date, breadth_row, observation),
         encoding="utf-8",
     )
+    competition_report_path.write_text(
+        build_factor_competition_report(
+            competition, tracking, preregistration, asof_date
+        ),
+        encoding="utf-8",
+    )
+    shortlist = competition.loc[
+        competition["candidate_status"].eq("shortlist"), "factor"
+    ].astype(str).tolist()
     payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "asof_date": asof_date.date().isoformat(),
@@ -365,15 +897,49 @@ def run_factor_decay_monitor(
         "observation_count": int(len(observation)),
         "history_rows": int(len(history)),
         "factor_metadata": metadata,
+        "replacement_competition": {
+            "status": "complete",
+            "selection_status": "exploratory_posthoc",
+            "shortlist": shortlist,
+            "preregistered_candidates": (
+                list(preregistration.get("candidate_factors", []))
+                if preregistration is not None
+                else []
+            ),
+            "validation_start_date": (
+                preregistration.get("validation_start_date")
+                if preregistration is not None
+                else None
+            ),
+            "tracking_status": tracking.get("status"),
+            "research_only": True,
+            "trade_instruction": False,
+            "automatic_model_change": False,
+        },
         "artifacts": {
             "summary_csv": str(csv_path),
             "report": str(report_path),
             "observation": str(observation_path),
             "history": str(history_path),
+            "replacement_daily_ic": str(competition_daily_path),
+            "replacement_competition": str(competition_path),
+            "replacement_report": str(competition_report_path),
+            "replacement_preregistration": (
+                str(preregistration_path) if preregistration is not None else None
+            ),
+            "replacement_tracking": str(tracking_path),
+            "replacement_tracking_json": str(tracking_json_path),
         },
     }
     json_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        json.dumps(
+            _json_safe(payload),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+            allow_nan=False,
+        ),
+        encoding="utf-8",
     )
     return {**payload, "json": str(json_path)}
 
@@ -389,6 +955,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--selection-end", default="2025-12-31")
     parser.add_argument("--recent-signal-days", type=int, default=20)
     parser.add_argument("--top-n", type=int, default=40)
+    parser.add_argument(
+        "--replacement-preregistration",
+        default="configs/factor_replacement_preregistration.json",
+    )
     return parser.parse_args(argv)
 
 
@@ -402,6 +972,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         selection_end=pd.Timestamp(args.selection_end),
         recent_signal_days=args.recent_signal_days,
         top_n=args.top_n,
+        replacement_preregistration=Path(args.replacement_preregistration),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -107,10 +108,23 @@ def _warnings(record: dict[str, Any], artifacts: list[dict[str, Any]]) -> list[s
     verification = record.get("verification") or {}
     if verification.get("missing_stock_names"):
         warnings.append("stock_names_missing")
+    benchmark_status = str(verification.get("benchmark_refresh_status") or "")
+    if "degraded" in benchmark_status.lower():
+        warnings.append(f"benchmark_refresh:{benchmark_status}")
     tests = verification.get("tests")
-    if tests and tests not in {"passed", "not_run_by_pipeline"}:
+    if tests and _test_status_has_warning(str(tests)):
         warnings.append(f"tests:{tests}")
     return warnings
+
+
+def _test_status_has_warning(status: str) -> bool:
+    normalized = status.strip().lower()
+    if normalized in {"passed", "not_run_by_pipeline"}:
+        return False
+    failed = re.search(r"\b(\d+)\s+failed\b", normalized)
+    if failed and int(failed.group(1)) > 0:
+        return True
+    return re.search(r"\b\d+\s+passed\b", normalized) is None
 
 
 def _markdown(card: dict[str, Any]) -> str:

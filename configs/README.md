@@ -15,6 +15,8 @@ Status meanings:
 | Configuration | Status | Entry point / evidence |
 | --- | --- | --- |
 | `personal_trade_habit_overlay.yaml` | active-research | `run_daily_model_pipeline.py`; personal overlay only |
+| `factor_replacement_preregistration.json` | shadow | Frozen 2026-07-14 shortlist; unseen tracking starts 2026-07-15 |
+| `institutional_accumulation_shadow.yaml` | shadow | Frozen 2026-07-18 price-volume + THS flow proxy; prospective tracking starts 2026-07-20; no ranking effect |
 | `evolution_strong_pullback.yaml` | shadow | `run_strong_pullback_evolution.py`; `docs/superpowers/specs/2026-07-10-strong-pullback-self-evolution-design.md` |
 | `evolution_multifactor_observation.yaml` | shadow | `run_multifactor_observation_evolution.py`; observation-only gates |
 | `trend_ignition_shortlist_preregistered.yaml` | rejected | `docs/research-results/trend_ignition_shortlist_20260714_v1.md` |
