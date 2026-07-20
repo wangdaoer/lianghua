@@ -19,6 +19,9 @@ dependencies = [
 [project.scripts]
 quant-etf-lab = "quant_etf_lab.cli:main"
 
+[tool.vercel]
+entrypoint = "app:handler"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
