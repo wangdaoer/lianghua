@@ -6,6 +6,7 @@ import pytest
 
 from research_database import ResearchDatabase
 from sync_daily_research_database import sync_daily_research_database, write_status_atomic
+from update_model_panel_from_daily_data import read_daily_xls
 
 
 def test_sync_daily_research_database_is_incremental_and_auditable(tmp_path):
@@ -46,6 +47,36 @@ def test_sync_daily_research_database_is_incremental_and_auditable(tmp_path):
     assert stored["symbol"].tolist() == ["000001", "300001"]
     assert stored["volume"].tolist() == [100.0, 200.0]
     assert stored["amount"].tolist() == [1124.0, 4000.0]
+
+
+def test_panel_update_and_database_sync_share_the_same_ths_contract(tmp_path):
+    daily_dir = tmp_path / "daily"
+    output_dir = tmp_path / "outputs"
+    daily_dir.mkdir()
+    output_dir.mkdir()
+    daily_path = daily_dir / "ths_hs_a_share_2026-07-13.xls"
+    daily_path.write_text(
+        "代码\t现价\t开盘\t最高\t最低\t总手\t总金额\t换手\t总市值\t大单净额\t主力净量\n"
+        "000001\t11.24\t11.00\t11.30\t10.90\t100\t1124\t1.2\t10亿\t1.5万\t0.77\n",
+        encoding="gb18030",
+    )
+    pd.DataFrame({"symbol": ["000001"], "score": [0.9]}).to_csv(
+        output_dir / "merged_priority_watchlist_20260713.csv", index=False
+    )
+
+    panel_frame, _ = read_daily_xls(daily_path, "2026-07-13", ("000",))
+    db_path = tmp_path / "research.sqlite3"
+    status = sync_daily_research_database(
+        db_path, daily_dir, output_dir, "2026-07-13"
+    )
+    stored = ResearchDatabase(db_path).query(
+        "SELECT symbol, open, high, low, close, volume, amount FROM daily_prices"
+    )
+
+    expected = panel_frame.loc[:, stored.columns].reset_index(drop=True)
+    pd.testing.assert_frame_equal(stored, expected, check_dtype=False)
+    assert status["factor_sources"]["main_net_inflow"] == "大单净额"
+    assert status["factor_sources"]["main_net_volume_ratio"] == "主力净量"
 
 
 def test_sync_canonicalizes_relative_and_absolute_observation_sources(tmp_path, monkeypatch):

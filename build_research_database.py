@@ -8,6 +8,7 @@ import pandas as pd
 
 from research_database import ResearchDatabase, normalize_a_share_symbols
 from tdx_day_source import infer_tdx_archive_specs, iter_tdx_day_archive_member_frames
+from ths_daily_data import normalize_daily_market_file
 from workspace_paths import daily_data_root, tdx_data_root
 
 
@@ -98,28 +99,10 @@ def read_table(path: Path) -> pd.DataFrame:
 
 
 def prepare_daily_price_frame(path: Path) -> pd.DataFrame | None:
-    frame = read_table(path)
-    renamed = {str(column).lower(): column for column in frame.columns}
-    mapping = {
-        renamed[key]: key
-        for key in ("symbol", "date", "open", "high", "low", "close", "volume", "amount")
-        if key in renamed
-    }
-    mapping.update({
-        "代码": "symbol", "    名称": "stock_name", "现价": "close",
-        "开盘": "open", "最高": "high", "最低": "low",
-        "总成交量": "volume", "成交量": "volume", "成交额": "amount",
-    })
-    frame = frame.rename(columns=mapping)
-    if "date" not in frame.columns:
-        inferred_date = infer_file_date(path)
-        if inferred_date:
-            frame["date"] = inferred_date
-    if not {"symbol", "date", "close"}.issubset(frame.columns):
+    inferred_date = infer_file_date(path)
+    frame, sources = normalize_daily_market_file(path, inferred_date or "1970-01-01")
+    if inferred_date is None and sources.date == "filename":
         return None
-    for column in ("open", "high", "low", "volume", "amount"):
-        if column not in frame.columns:
-            frame[column] = None
     return frame
 
 

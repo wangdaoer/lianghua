@@ -5,3 +5,4 @@ tabulate>=0.9
 openpyxl>=3.1
 matplotlib>=3.8
 scipy>=1.13
+pyarrow>=16
