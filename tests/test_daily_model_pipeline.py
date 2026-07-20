@@ -316,7 +316,11 @@ class DailyModelPipelineTest(unittest.TestCase):
         self.assertIn("--state-record", command)
         self.assertIn(".marketlens_state_20260629.json", command)
         self.assertIn("--require-complete-inputs", command)
-        self.assertIn("C:\\dashboard\\data\\quant-model3-latest.json", command)
+        dashboard_index = step.command.index("--dashboard-output")
+        self.assertEqual(
+            step.command[dashboard_index + 1],
+            str(config.marketlens_dashboard_output),
+        )
 
     def test_trend_ignition_shadow_is_opt_in_and_runs_after_merged_outputs(self):
         default_config = PipelineConfig(
