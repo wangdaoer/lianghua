@@ -227,6 +227,10 @@ def _latest_artifact(path: Path) -> Path:
     return max(candidates, key=lambda item: item.stat().st_mtime)
 
 
+def _artifact_reference(path: Path, *, hidden: bool = False) -> str | None:
+    return None if hidden else str(_latest_artifact(path))
+
+
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
@@ -337,6 +341,41 @@ def _tracking_state_gate(
     if failure_index == tracking_index:
         return "failed", False
     return None, True
+
+
+def _pipeline_artifact_status_override(
+    steps: list[PipelineStep],
+    run_status: str,
+    failure: dict[str, object] | None,
+    step_executions: list[dict[str, object]] | None,
+    step_name: str,
+) -> str | None:
+    """Hide same-day artifacts left by an earlier attempt after a failed run."""
+
+    if run_status != "failed":
+        return None
+    step_names = [step.name for step in steps]
+    if step_name not in step_names:
+        return None
+
+    executions = {
+        str(item.get("name")): str(item.get("status"))
+        for item in (step_executions or [])
+        if item.get("name")
+    }
+    execution_status = executions.get(step_name)
+    if execution_status in {"success", "cached"}:
+        return None
+    if execution_status == "failed":
+        return "failed"
+
+    failure_step = (failure or {}).get("step")
+    if failure_step == step_name:
+        return "failed"
+    if isinstance(failure_step, str) and failure_step in step_names:
+        if step_names.index(failure_step) > step_names.index(step_name):
+            return None
+    return "not_run"
 
 
 def _research_database_sync_state(
@@ -1464,6 +1503,22 @@ def build_daily_run_state(
         marketlens_export_status = "not_run"
     else:
         marketlens_export_status = "pending"
+    artifact_overrides = {
+        step_name: _pipeline_artifact_status_override(
+            steps,
+            run_status,
+            failure,
+            step_executions,
+            step_name,
+        )
+        for step_name in (
+            "main_net_volume_shadow",
+            "institutional_accumulation_shadow",
+            "institutional_accumulation_tracking",
+            "czsc_structure_shadow",
+            "strategy_arena",
+        )
+    }
     priority_path = _latest_artifact(paths["merged_priority_watchlist"])
     early_path = _latest_artifact(paths["early_watchlist"])
     main_net_volume_shadow_path = _latest_artifact(paths["main_net_volume_shadow"])
@@ -1485,33 +1540,58 @@ def build_daily_run_state(
     )
     priority_rows = _read_csv_rows(priority_path)
     early_rows = _read_csv_rows(early_path)
-    main_net_volume_shadow_rows = _read_csv_rows(main_net_volume_shadow_path)
-    main_net_volume_shadow_metadata = _read_json_object(
-        paths["main_net_volume_shadow_metadata"]
+    main_override = artifact_overrides["main_net_volume_shadow"]
+    main_net_volume_shadow_rows = (
+        [] if main_override else _read_csv_rows(main_net_volume_shadow_path)
     )
-    institutional_accumulation_rows = _read_csv_rows(institutional_accumulation_path)
-    institutional_accumulation_metadata = _read_json_object(
-        paths["institutional_accumulation_metadata"]
+    main_net_volume_shadow_metadata = (
+        {"status": main_override}
+        if main_override
+        else _read_json_object(paths["main_net_volume_shadow_metadata"])
     )
-    institutional_accumulation_tracking_rows = _read_csv_rows(
-        institutional_accumulation_tracking_path
+    institutional_override = artifact_overrides["institutional_accumulation_shadow"]
+    institutional_accumulation_rows = (
+        [] if institutional_override else _read_csv_rows(institutional_accumulation_path)
     )
-    institutional_accumulation_tracking_summary = _read_json_object(
-        paths["institutional_accumulation_tracking_summary"]
+    institutional_accumulation_metadata = (
+        {"status": institutional_override}
+        if institutional_override
+        else _read_json_object(paths["institutional_accumulation_metadata"])
     )
-    czsc_structure_shadow_rows = _read_csv_rows(czsc_structure_shadow_path)
-    czsc_structure_shadow_metadata = _read_json_object(
-        paths["czsc_structure_shadow_metadata"]
+    institutional_tracking_override = artifact_overrides[
+        "institutional_accumulation_tracking"
+    ]
+    institutional_accumulation_tracking_rows = (
+        []
+        if institutional_tracking_override
+        else _read_csv_rows(institutional_accumulation_tracking_path)
+    )
+    institutional_accumulation_tracking_summary = (
+        {"status": institutional_tracking_override}
+        if institutional_tracking_override
+        else _read_json_object(paths["institutional_accumulation_tracking_summary"])
+    )
+    czsc_override = artifact_overrides["czsc_structure_shadow"]
+    czsc_structure_shadow_rows = (
+        [] if czsc_override else _read_csv_rows(czsc_structure_shadow_path)
+    )
+    czsc_structure_shadow_metadata = (
+        {"status": czsc_override}
+        if czsc_override
+        else _read_json_object(paths["czsc_structure_shadow_metadata"])
     )
     arena_enabled = config.include_strategy_arena and config.include_regime_shadow_compare
-    strategy_arena_metadata = (
-        _read_json_object(paths["strategy_arena_metadata"]) if arena_enabled else {}
-    )
-    if strategy_arena_metadata.get("asof_date") != config.asof_date:
+    arena_override = artifact_overrides["strategy_arena"] if arena_enabled else None
+    strategy_arena_metadata = {"status": arena_override} if arena_override else {}
+    if arena_enabled and not arena_override:
+        strategy_arena_metadata = _read_json_object(paths["strategy_arena_metadata"])
+    if not arena_override and strategy_arena_metadata.get("asof_date") != config.asof_date:
         strategy_arena_metadata = {}
     strategy_arena_portfolio_path = _latest_artifact(paths["strategy_arena_portfolio"])
     strategy_arena_portfolio_rows = (
-        _read_csv_rows(strategy_arena_portfolio_path) if strategy_arena_metadata else []
+        _read_csv_rows(strategy_arena_portfolio_path)
+        if strategy_arena_metadata and not arena_override
+        else []
     )
     hidden_tracking_rows = _read_csv_rows(hidden_tracking_path)
     model_rows = _read_csv_rows(model_path)
@@ -1871,62 +1951,72 @@ def build_daily_run_state(
             "selected": str(selected_path),
             "changes": str(changes_path),
             "early_watchlist": str(early_path),
-            "main_net_volume_shadow": str(main_net_volume_shadow_path),
-            "main_net_volume_shadow_cn": str(
-                _latest_artifact(
-                    paths["main_net_volume_shadow"].with_name(
-                        f"{paths['main_net_volume_shadow'].stem}_cn.csv"
-                    )
-                )
+            "main_net_volume_shadow": _artifact_reference(
+                main_net_volume_shadow_path, hidden=bool(main_override)
             ),
-            "main_net_volume_shadow_metadata": str(
-                _latest_artifact(paths["main_net_volume_shadow_metadata"])
+            "main_net_volume_shadow_cn": _artifact_reference(
+                paths["main_net_volume_shadow"].with_name(
+                    f"{paths['main_net_volume_shadow'].stem}_cn.csv"
+                ),
+                hidden=bool(main_override),
             ),
-            "main_net_volume_shadow_report": str(
-                _latest_artifact(paths["main_net_volume_shadow_report"])
+            "main_net_volume_shadow_metadata": _artifact_reference(
+                paths["main_net_volume_shadow_metadata"], hidden=bool(main_override)
             ),
-            "main_net_volume_shadow_chart": str(
-                _latest_artifact(paths["main_net_volume_shadow_chart"])
+            "main_net_volume_shadow_report": _artifact_reference(
+                paths["main_net_volume_shadow_report"], hidden=bool(main_override)
             ),
-            "institutional_accumulation_shadow": str(institutional_accumulation_path),
-            "institutional_accumulation_shadow_cn": str(
-                _latest_artifact(
-                    paths["institutional_accumulation_shadow"].with_name(
-                        f"{paths['institutional_accumulation_shadow'].stem}_cn.csv"
-                    )
-                )
+            "main_net_volume_shadow_chart": _artifact_reference(
+                paths["main_net_volume_shadow_chart"], hidden=bool(main_override)
             ),
-            "institutional_accumulation_metadata": str(
-                _latest_artifact(paths["institutional_accumulation_metadata"])
+            "institutional_accumulation_shadow": _artifact_reference(
+                institutional_accumulation_path, hidden=bool(institutional_override)
             ),
-            "institutional_accumulation_report": str(
-                _latest_artifact(paths["institutional_accumulation_report"])
+            "institutional_accumulation_shadow_cn": _artifact_reference(
+                paths["institutional_accumulation_shadow"].with_name(
+                    f"{paths['institutional_accumulation_shadow'].stem}_cn.csv"
+                ),
+                hidden=bool(institutional_override),
             ),
-            "institutional_accumulation_tracking": str(
-                institutional_accumulation_tracking_path
+            "institutional_accumulation_metadata": _artifact_reference(
+                paths["institutional_accumulation_metadata"],
+                hidden=bool(institutional_override),
             ),
-            "institutional_accumulation_tracking_summary": str(
-                _latest_artifact(paths["institutional_accumulation_tracking_summary"])
+            "institutional_accumulation_report": _artifact_reference(
+                paths["institutional_accumulation_report"],
+                hidden=bool(institutional_override),
             ),
-            "institutional_accumulation_tracking_report": str(
-                _latest_artifact(paths["institutional_accumulation_tracking_report"])
+            "institutional_accumulation_tracking": _artifact_reference(
+                institutional_accumulation_tracking_path,
+                hidden=bool(institutional_tracking_override),
             ),
-            "czsc_structure_shadow": str(czsc_structure_shadow_path),
-            "czsc_structure_shadow_cn": str(
-                _latest_artifact(
-                    paths["czsc_structure_shadow"].with_name(
-                        f"{paths['czsc_structure_shadow'].stem}_cn.csv"
-                    )
-                )
+            "institutional_accumulation_tracking_summary": _artifact_reference(
+                paths["institutional_accumulation_tracking_summary"],
+                hidden=bool(institutional_tracking_override),
             ),
-            "czsc_structure_shadow_metadata": str(
-                _latest_artifact(paths["czsc_structure_shadow_metadata"])
+            "institutional_accumulation_tracking_report": _artifact_reference(
+                paths["institutional_accumulation_tracking_report"],
+                hidden=bool(institutional_tracking_override),
             ),
-            "czsc_structure_shadow_report": str(
-                _latest_artifact(paths["czsc_structure_shadow_report"])
+            "czsc_structure_shadow": _artifact_reference(
+                czsc_structure_shadow_path, hidden=bool(czsc_override)
+            ),
+            "czsc_structure_shadow_cn": _artifact_reference(
+                paths["czsc_structure_shadow"].with_name(
+                    f"{paths['czsc_structure_shadow'].stem}_cn.csv"
+                ),
+                hidden=bool(czsc_override),
+            ),
+            "czsc_structure_shadow_metadata": _artifact_reference(
+                paths["czsc_structure_shadow_metadata"], hidden=bool(czsc_override)
+            ),
+            "czsc_structure_shadow_report": _artifact_reference(
+                paths["czsc_structure_shadow_report"], hidden=bool(czsc_override)
             ),
             "strategy_arena_portfolio": (
-                str(strategy_arena_portfolio_path) if strategy_arena_metadata else None
+                str(strategy_arena_portfolio_path)
+                if strategy_arena_metadata and not arena_override
+                else None
             ),
             "strategy_arena_portfolio_cn": (
                 str(
@@ -1936,32 +2026,34 @@ def build_daily_run_state(
                         )
                     )
                 )
-                if strategy_arena_metadata
+                if strategy_arena_metadata and not arena_override
                 else None
             ),
             "strategy_arena_pairwise": (
                 str(_latest_artifact(paths["strategy_arena_pairwise"]))
-                if strategy_arena_metadata
+                if strategy_arena_metadata and not arena_override
                 else None
             ),
             "strategy_arena_signal_division": (
                 str(_latest_artifact(paths["strategy_arena_signal_division"]))
-                if strategy_arena_metadata
+                if strategy_arena_metadata and not arena_override
                 else None
             ),
             "strategy_arena_metadata": (
                 str(_latest_artifact(paths["strategy_arena_metadata"]))
-                if strategy_arena_metadata
+                if strategy_arena_metadata and not arena_override
                 else None
             ),
             "strategy_arena_report": (
                 str(_latest_artifact(paths["strategy_arena_report"]))
-                if strategy_arena_metadata
+                if strategy_arena_metadata and not arena_override
                 else None
             ),
             "strategy_arena_history": (
                 str(paths["strategy_arena_history"])
-                if strategy_arena_metadata and paths["strategy_arena_history"].exists()
+                if strategy_arena_metadata
+                and not arena_override
+                and paths["strategy_arena_history"].exists()
                 else None
             ),
             "hidden_accumulation_tracking": str(hidden_tracking_path),
