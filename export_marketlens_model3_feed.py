@@ -9,6 +9,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from workspace_paths import dashboard_root
 
@@ -59,6 +60,13 @@ def latest_state_record(state_log: Path, asof_date: str) -> dict[str, Any]:
         if record.get("asof_date") == asof_date:
             records.append(record)
     return records[-1] if records else {}
+
+
+def read_state_record(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a JSON object in state record: {path}")
+    return value
 
 
 def sanitize_public_value(value: Any) -> Any:
@@ -167,7 +175,70 @@ def compact_artifacts(output_root: Path, asof_date: str) -> dict[str, str]:
     return {key: value for key, value in names.items() if (output_root / value).exists()}
 
 
-def build_feed(asof_date: str, output_root: Path, state_log: Path) -> dict[str, Any]:
+def _validate_current_inputs(
+    asof_date: str,
+    paths: dict[str, Path],
+    state_record: dict[str, Any],
+    row_counts: dict[str, int],
+) -> None:
+    missing = [str(path) for path in paths.values() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Required MarketLens input missing: {', '.join(missing)}")
+    if state_record.get("asof_date") != asof_date:
+        raise ValueError(
+            "MarketLens state date mismatch: "
+            f"expected {asof_date}, got {state_record.get('asof_date')!r}"
+        )
+    if state_record.get("run_status") != "success":
+        raise ValueError(
+            "MarketLens publication requires a successful current run state, got "
+            f"{state_record.get('run_status')!r}"
+        )
+
+    verification = state_record.get("verification")
+    if not isinstance(verification, dict):
+        raise ValueError("MarketLens state record is missing verification details")
+    expected_counts = {
+        "priority_rows": row_counts["priority"],
+        "early_pattern_rows": row_counts["early"],
+        "model_decision_rows": row_counts["model"],
+    }
+    for key, actual in expected_counts.items():
+        if verification.get(key) != actual:
+            raise ValueError(
+                f"MarketLens state count mismatch for {key}: "
+                f"state={verification.get(key)!r}, actual={actual}"
+            )
+
+    artifacts = state_record.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("MarketLens state record is missing artifact paths")
+    artifact_keys = {
+        "priority": "priority",
+        "early": "early_watchlist",
+        "model": "model_decision",
+    }
+    for input_key, artifact_key in artifact_keys.items():
+        recorded = artifacts.get(artifact_key)
+        if not recorded:
+            raise ValueError(f"MarketLens state record is missing artifact: {artifact_key}")
+        recorded_path = Path(str(recorded)).resolve(strict=False)
+        expected_path = paths[input_key].resolve(strict=False)
+        if recorded_path != expected_path:
+            raise ValueError(
+                f"MarketLens artifact mismatch for {artifact_key}: "
+                f"state={recorded_path}, expected={expected_path}"
+            )
+
+
+def build_feed(
+    asof_date: str,
+    output_root: Path,
+    state_log: Path,
+    *,
+    state_record: dict[str, Any] | None = None,
+    require_complete_inputs: bool = False,
+) -> dict[str, Any]:
     token = date_token(asof_date)
     priority_path = output_root / f"merged_priority_watchlist_{token}.csv"
     early_path = output_root / f"early_pattern_watchlist_{token}.csv"
@@ -175,7 +246,20 @@ def build_feed(asof_date: str, output_root: Path, state_log: Path) -> dict[str, 
     priority_rows_raw = read_csv_rows(priority_path)
     early_rows = read_csv_rows(early_path)
     model_rows = read_csv_rows(model_path)
-    state_record = latest_state_record(state_log, asof_date)
+    current_state = dict(state_record) if state_record is not None else latest_state_record(
+        state_log, asof_date
+    )
+    if require_complete_inputs:
+        _validate_current_inputs(
+            asof_date,
+            {"priority": priority_path, "early": early_path, "model": model_path},
+            current_state,
+            {
+                "priority": len(priority_rows_raw),
+                "early": len(early_rows),
+                "model": len(model_rows),
+            },
+        )
     priority_rows = [shape_priority_row(row) for row in priority_rows_raw]
     bucket_counts = dict(Counter(row.get("bucket", "未分层") for row in priority_rows))
     shadow_account_counts = dict(
@@ -185,7 +269,7 @@ def build_feed(asof_date: str, output_root: Path, state_log: Path) -> dict[str, 
         )
     )
     verification = {
-        "tests": state_record.get("verification", {}).get("tests", "unknown"),
+        "tests": current_state.get("verification", {}).get("tests", "unknown"),
         "priorityRows": len(priority_rows),
         "earlyPatternRows": len(early_rows),
         "modelDecisionRows": len(model_rows),
@@ -200,7 +284,7 @@ def build_feed(asof_date: str, output_root: Path, state_log: Path) -> dict[str, 
             "purpose": "MarketLens website research snapshot",
             "publicPathsOnly": True,
         },
-        "runType": state_record.get("run_type", "unknown"),
+        "runType": current_state.get("run_type", "unknown"),
         "verification": verification,
         "bucketCounts": bucket_counts,
         "shadowAccountCounts": shadow_account_counts,
@@ -221,15 +305,33 @@ def export_feed(
     state_log: Path,
     output_path: Path,
     dashboard_output: Path | None = None,
+    *,
+    state_record: dict[str, Any] | None = None,
+    require_complete_inputs: bool = False,
 ) -> dict[str, Any]:
-    feed = build_feed(asof_date, output_root, state_log)
+    feed = build_feed(
+        asof_date,
+        output_root,
+        state_log,
+        state_record=state_record,
+        require_complete_inputs=require_complete_inputs,
+    )
     text = json.dumps(feed, ensure_ascii=False, indent=2) + "\n"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(text, encoding="utf-8")
+    _write_text_atomic(output_path, text)
     if dashboard_output:
-        dashboard_output.parent.mkdir(parents=True, exist_ok=True)
-        dashboard_output.write_text(text, encoding="utf-8")
+        if dashboard_output.resolve(strict=False) != output_path.resolve(strict=False):
+            _write_text_atomic(dashboard_output, text)
     return feed
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -237,8 +339,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asof-date", default="")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--state-log", default="daily_run_state.jsonl")
+    parser.add_argument("--state-record", default="")
     parser.add_argument("--output", default="")
     parser.add_argument("--dashboard-output", default=str(DEFAULT_DASHBOARD_OUTPUT))
+    parser.add_argument("--require-complete-inputs", action="store_true")
     return parser.parse_args()
 
 
@@ -248,7 +352,16 @@ def main() -> None:
     asof_date = args.asof_date or latest_asof_date(output_root)
     output_path = Path(args.output) if args.output else output_root / "marketlens_model3_latest.json"
     dashboard_output = Path(args.dashboard_output) if args.dashboard_output else None
-    feed = export_feed(asof_date, output_root, Path(args.state_log), output_path, dashboard_output)
+    state_record = read_state_record(Path(args.state_record)) if args.state_record else None
+    feed = export_feed(
+        asof_date,
+        output_root,
+        Path(args.state_log),
+        output_path,
+        dashboard_output,
+        state_record=state_record,
+        require_complete_inputs=args.require_complete_inputs,
+    )
     print(f"Exported Model3 feed: {output_path}")
     if dashboard_output:
         print(f"Dashboard copy: {dashboard_output}")

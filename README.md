@@ -22,6 +22,10 @@
 `.vercelignore` 会把这些研究文件排除在部署包之外。每日流水线仍应在已配置数据目录的
 本地或专用计算环境中执行。
 
+日更、数据、回测、风险和发布的强制行为守则见
+[`MODEL_OPERATING_SYSTEM.md`](MODEL_OPERATING_SYSTEM.md)。出现重复问题时，应先按该规范完成
+上游修复、回归测试和下游重跑，再继续讨论模型结果。
+
 ## 路径配置
 
 仓库默认只使用相对目录。不同机器的数据位置通过环境变量配置，命令行显式参数仍有
@@ -158,7 +162,19 @@ python migrate_tdx_history.py `
 默认每日入口会在股票面板更新和双轨影子回测之前刷新
 `$env:QUANT_DATA_ROOT\benchmarks\510300.csv`。刷新器使用新浪实时行情、
 搜狐历史行情和 Yahoo 日线交叉核验日期、OHLC 与成交量，验证通过后才以原子替换方式写入；
-任一来源冲突或缺少目标交易日都会终止流水线，不会继续生成当日风险档位。
+任一数值冲突都会终止流水线。若搜狐或 Yahoo 仅缺少目标交易日，但另一个历史源与收盘后的
+新浪行情逐字段一致，则允许以 `degraded_two_source` 模式原子更新，并在状态文件和运行卡中
+保留警告；缺少两个有效来源、缺少更早日期或任一数值不一致时仍会终止。
+
+每日命令默认启用严格步骤缓存。只有目标日期、基础面板、当日行情、基准、全部 Python
+代码和配置，以及步骤命令与既有产物的 SHA-256 全部一致时才会命中；任一可缓存上游重算，
+其可缓存下游会自动重算。命中情况写入运行状态和运行卡。需要强制全量复算时使用
+`--disable-step-cache`。
+
+因子衰减监控支持跨交易日增量检查点。只有上一期源面板哈希与本次基础面板完全一致、相关
+计算代码指纹一致且日期严格前进时才复用已成熟 RankIC；系统按每只股票的实际交易记录确定
+受新增数据影响的信号日，并为停牌或稀疏记录补足滚动窗口。任一校验失败会自动全量计算，
+`calculation_mode`、重算起点和父检查点日期会写入监控 JSON 与每日运行卡。
 
 每日流程的最后一步会把当天标准化行情和当天模型 CSV 产物增量写入
 `data/research.sqlite3`，不会重新扫描完整历史面板或 TDX 历史库。同步结果写入
@@ -166,9 +182,21 @@ python migrate_tdx_history.py `
 `daily_run_state.jsonl`。完全相同的数据重复运行不会新增记录；当天行情或模型产物修正后，
 对应记录会更新。历史回放或故障诊断时可显式添加 `--skip-research-db-sync`。
 
+核心步骤成功后，默认日更会使用尚未发布的当日运行状态严格校验优先观察表、早期形态表和
+模型决策表，再原子生成 `outputs/high_return_v2/marketlens_model3_latest.json`，并同步到
+`$env:QUANT_DASHBOARD_ROOT/data/quant-model3-latest.json`。状态日期、行数、正式产物路径或
+必需文件任一不一致都会让 `marketlens_export` 失败，整次运行不能标记成功；`_pending` 文件
+不会替代正式文件发布。离线诊断可显式添加 `--skip-marketlens-export`。
+
 ```powershell
 python run_daily_model_pipeline.py --asof-date 2026-07-13
 ```
+
+日更默认最多并行执行两个依赖安全的子任务，并在运行卡中记录逐步骤耗时。资源受限或排查并发
+问题时可使用 `--max-parallel-steps 1` 恢复严格串行执行。
+
+日更内部历史面板默认写为 Parquet，以减少重复读取和磁盘占用；已有 CSV 历史面板仍可直接作为
+基础输入，统一读取层会保持两种格式的计算口径一致。
 
 刷新审计写入 `outputs/high_return_v2/benchmark_refresh_status_<YYYYMMDD>.json`，
 并同步进入 `daily_run_state.jsonl`。离线历史复盘可显式添加
@@ -331,3 +359,47 @@ python .\normalize_data.py `
 
 若列名为 `code_open`、`code_close` 这种 `symbol_field` 形式，脚本会自动识别；  
 若只有 `000001,000002...` 这类纯 symbol 列，默认会把它们当 `close` 处理（可用 `--wide-value-field` 修改）。
+
+## TDX 实时行情源验证
+
+TDX 实时行情源来自 `oficcejo/tdx-api`，当前部署在：
+
+- 源码：`D:\codex\_repo_cache\tdx-api`
+- 编译测试服务：`D:\codex\_repo_cache\tdx-api\_bin\tdx-api-server.exe`
+- Go 探针：`D:\codex\_repo_cache\tdx-api\_probe\realtime_probe.go`
+- 主模型采样器：`D:\codex\智能化\high_risk_quant_model3\tdx_realtime_probe.py`
+- 默认配置：`D:\codex\智能化\high_risk_quant_model3\configs\tdx_realtime_probe.yaml`
+
+单次快照验证：
+
+```bash
+python .\tdx_realtime_probe.py --samples 1
+```
+
+交易时间连续验证：
+
+```powershell
+.\run_tdx_realtime_probe.ps1 -Samples 8 -IntervalSeconds 30
+```
+
+说明：
+- 默认读取最新 `merged_priority_watchlist_*_cn.csv` 前 20 只，并额外读取 `510300` 做基准连通性对照。
+- 输出在 `outputs/realtime_tdx/`，包括行情明细、采样状态、汇总 JSON 和 Markdown 报告。
+- 该模块只做研究观察和网站实时状态候选数据源验证，不产生买卖指令，也不替代统一每日数据目录。
+
+## 疑似机构提前建仓影子观察
+
+该观察层组合未过热的价格结构、连续成交额放大、同花顺主力净量和大单净额。公开数据无法识别
+真实机构账户，因此输出只称为“疑似建仓”，不改变主模型排序、仓位或交易边界。
+
+```powershell
+python .\institutional_accumulation_shadow.py `
+  --data .\data_panel_history_main_chinext_20220101_YYYYMMDD.csv `
+  --output .\outputs\high_return_v2\institutional_accumulation_shadow_YYYYMMDD.csv `
+  --asof-date YYYY-MM-DD `
+  --config .\configs\institutional_accumulation_shadow.yaml `
+  --names-source "$env:QUANT_DATA_ROOT\ths_exports\normalized\ths_hs_a_share_YYYY-MM-DD.xls"
+```
+
+每日流水线会随后执行 1/3/5/10 日的次日开盘前视跟踪。v1 注册日为 2026-07-18，独立验证从
+2026-07-20 开始；5 日完整信号至少需要 5 个连续资金流交易日，验证门槛需要 80 个已完成样本。

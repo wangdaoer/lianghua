@@ -1,4 +1,5 @@
 import unittest
+import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -289,6 +290,8 @@ class MergedDailyOutputsTest(unittest.TestCase):
         self.assertEqual(table.loc[0, "priority_bucket"], "model_focus")
         self.assertEqual(table.loc[1, "priority_bucket"], "risk_watch")
         self.assertEqual(table.loc[1, "risk_flags"], "st_or_special_treatment")
+        self.assertFalse(bool(table.loc[1, "personal_selected"]))
+        self.assertEqual(float(table.loc[1, "personal_target_weight"]), 0.0)
 
     def test_priority_watchlist_keeps_risk_watch_visible_in_default_view(self):
         state_pattern_scan = pd.DataFrame(
@@ -475,13 +478,15 @@ class MergedDailyOutputsTest(unittest.TestCase):
             ],
         }
         with TemporaryDirectory() as tmp:
-            paths = write_outputs(
-                Path(tmp),
-                "2026-06-29",
-                state_pattern_scan,
-                model_decision_table,
-                shadow_account_review=shadow_review,
-            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", FutureWarning)
+                paths = write_outputs(
+                    Path(tmp),
+                    "2026-06-29",
+                    state_pattern_scan,
+                    model_decision_table,
+                    shadow_account_review=shadow_review,
+                )
             priority = pd.read_csv(paths["priority_watchlist"], dtype={"symbol": str})
             priority_cn = pd.read_csv(
                 paths["priority_watchlist_cn"], dtype={"股票代码": str}

@@ -129,6 +129,38 @@ def test_point_in_time_money_flow_uses_trailing_positive_day_share():
     assert meta["money_flow_column"] == "net_money_flow"
 
 
+def test_factor_metadata_separates_historical_from_current_flow_availability():
+    panel = make_monotonic_panel(periods=25)
+    panel["net_money_flow"] = 1.0
+    panel.loc[panel.index[-1], "net_money_flow"] = np.nan
+
+    factors, meta = compute_observation_factors(panel)
+
+    assert meta["factor_availability"]["flow_persistence"] is True
+    assert meta["factor_current_availability"]["flow_persistence"] is False
+    assert meta["factor_current_complete"]["flow_persistence"] is False
+    assert meta["factor_current_coverage"]["flow_persistence"] == 0.0
+    assert meta["factor_latest_dates"]["flow_persistence"] == "2026-01-24"
+    assert meta["factor_input_latest_dates"]["net_money_flow"] == "2026-01-24"
+    assert meta["money_flow_current_available"] is False
+    assert meta["money_flow_current_coverage"] == 0.0
+    assert factors.iloc[-1]["flow_persistence"] != factors.iloc[-1]["flow_persistence"]
+
+
+def test_money_flow_source_without_full_window_is_not_factor_available():
+    panel = make_monotonic_panel(periods=10)
+    panel["net_money_flow"] = 1.0
+
+    factors, meta = compute_observation_factors(panel)
+
+    assert meta["money_flow_column"] == "net_money_flow"
+    assert meta["factor_input_latest_dates"]["net_money_flow"] == "2026-01-10"
+    assert meta["factor_availability"]["flow_persistence"] is False
+    assert meta["factor_latest_dates"]["flow_persistence"] is None
+    assert meta["factor_current_availability"]["flow_persistence"] is False
+    assert factors["flow_persistence"].isna().all()
+
+
 def test_output_uses_explicit_next_observed_trading_session_semantics():
     panel = make_panel(periods=80)
     panel["signal_lag_days"] = 1

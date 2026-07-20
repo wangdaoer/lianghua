@@ -318,19 +318,59 @@ def compute_observation_factors(
     out["trade_instruction"] = False
 
     factor_availability = {
-        "momentum_20": True,
-        "momentum_60": True,
-        "breakout_distance_20": True,
-        "trend_acceleration": True,
-        "volatility_20": True,
-        "liquidity_20": amount_available,
-        "liquidity_stability_20": amount_available,
-        "flow_persistence": money_flow_column is not None,
-        "capacity_risk": capacity_available,
+        factor: bool(factor in out and out[factor].notna().any())
+        for factor in OBSERVATION_SCORE_INPUTS
     }
+    latest_date = out["date"].max()
+    latest_rows = out["date"].eq(latest_date)
+    latest_row_count = int(latest_rows.sum())
+    factor_latest_dates: dict[str, str | None] = {}
+    factor_current_coverage: dict[str, float] = {}
+    for factor in factor_availability:
+        usable = out[factor].notna() if factor in out else pd.Series(False, index=out.index)
+        latest_usable_date = out.loc[usable, "date"].max()
+        factor_latest_dates[factor] = (
+            latest_usable_date.strftime("%Y-%m-%d")
+            if not pd.isna(latest_usable_date)
+            else None
+        )
+        factor_current_coverage[factor] = (
+            float(usable.loc[latest_rows].mean()) if latest_row_count else 0.0
+        )
+    factor_current_availability = {
+        factor: coverage > 0.0
+        for factor, coverage in factor_current_coverage.items()
+    }
+    factor_current_complete = {
+        factor: coverage == 1.0
+        for factor, coverage in factor_current_coverage.items()
+    }
+    factor_input_latest_dates: dict[str, str | None] = {}
+    for column in ("amount", *MONEY_FLOW_COLUMNS):
+        if column not in out:
+            continue
+        usable = pd.to_numeric(out[column], errors="coerce").notna()
+        latest_usable_date = out.loc[usable, "date"].max()
+        factor_input_latest_dates[column] = (
+            latest_usable_date.strftime("%Y-%m-%d")
+            if not pd.isna(latest_usable_date)
+            else None
+        )
+    money_flow_current_coverage = (
+        float(out.loc[latest_rows, money_flow_column].notna().mean())
+        if money_flow_column is not None and latest_row_count
+        else 0.0
+    )
     metadata: dict[str, object] = {
         "factor_availability": factor_availability,
+        "factor_latest_dates": factor_latest_dates,
+        "factor_current_availability": factor_current_availability,
+        "factor_current_complete": factor_current_complete,
+        "factor_current_coverage": factor_current_coverage,
+        "factor_input_latest_dates": factor_input_latest_dates,
         "money_flow_column": money_flow_column,
+        "money_flow_current_available": money_flow_current_coverage > 0.0,
+        "money_flow_current_coverage": money_flow_current_coverage,
         "score_inputs": list(OBSERVATION_SCORE_INPUTS),
         "signal_lag_sessions": 1,
         "signal_timing": (

@@ -14,6 +14,8 @@ from typing import Mapping
 
 import pandas as pd
 
+from panel_io import iter_panel
+
 from strong_pullback_evolution import load_evolution_config
 
 
@@ -216,7 +218,7 @@ def _benchmark_last_date(path: Path, asof_date: str) -> str:
 
 def ensure_panel_asof_date(path: Path, asof_date: str) -> None:
     latest: pd.Timestamp | None = None
-    for chunk in pd.read_csv(path, usecols=["date"], chunksize=250_000):
+    for chunk in iter_panel(path, columns=["date"], chunksize=250_000):
         dates = pd.to_datetime(chunk["date"], errors="coerce")
         if dates.isna().any():
             raise ValueError(f"Panel contains invalid dates: {path}")

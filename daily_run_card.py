@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,7 @@ def build_daily_run_card(record: dict[str, Any], generated_at: str | None = None
     ]
     commands = list(stable_record.get("commands") or [])
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": generated_at or datetime.now().isoformat(timespec="seconds"),
         "asof_date": stable_record.get("asof_date"),
         "run_status": stable_record.get("run_status", "unknown"),
@@ -62,6 +63,7 @@ def build_daily_run_card(record: dict[str, Any], generated_at: str | None = None
         "record_hash": stable_json_hash(stable_record),
         "command_count": len(commands),
         "commands": commands,
+        "execution": stable_record.get("execution") or {},
         "verification": stable_record.get("verification") or {},
         "fallback_fetch_status": stable_record.get("fallback_fetch_status"),
         "top10": stable_record.get("top10") or [],
@@ -107,10 +109,23 @@ def _warnings(record: dict[str, Any], artifacts: list[dict[str, Any]]) -> list[s
     verification = record.get("verification") or {}
     if verification.get("missing_stock_names"):
         warnings.append("stock_names_missing")
+    benchmark_status = str(verification.get("benchmark_refresh_status") or "")
+    if "degraded" in benchmark_status.lower():
+        warnings.append(f"benchmark_refresh:{benchmark_status}")
     tests = verification.get("tests")
-    if tests and tests not in {"passed", "not_run_by_pipeline"}:
+    if tests and _test_status_has_warning(str(tests)):
         warnings.append(f"tests:{tests}")
     return warnings
+
+
+def _test_status_has_warning(status: str) -> bool:
+    normalized = status.strip().lower()
+    if normalized in {"passed", "not_run_by_pipeline"}:
+        return False
+    failed = re.search(r"\b(\d+)\s+failed\b", normalized)
+    if failed and int(failed.group(1)) > 0:
+        return True
+    return re.search(r"\b\d+\s+passed\b", normalized) is None
 
 
 def _markdown(card: dict[str, Any]) -> str:
@@ -139,6 +154,29 @@ def _markdown(card: dict[str, Any]) -> str:
             lines.append(f"- {key}: {value}")
     else:
         lines.append("- none")
+    execution = card.get("execution") or {}
+    lines.extend(
+        [
+            "",
+            "## Execution",
+            f"- Max parallel steps: {execution.get('max_parallel_steps')}",
+            f"- Wall duration seconds: {execution.get('wall_duration_seconds')}",
+            f"- Summed step duration seconds: {execution.get('summed_step_duration_seconds')}",
+            f"- Cache hits: {execution.get('cache_hits')}",
+            "",
+            "| step | status | duration_seconds | cache_hit |",
+            "|---|---|---:|---:|",
+        ]
+    )
+    step_executions = execution.get("steps") or []
+    if step_executions:
+        for item in step_executions:
+            lines.append(
+                f"| {item.get('name')} | {item.get('status')} | "
+                f"{item.get('duration_seconds')} | {item.get('cache_hit')} |"
+            )
+    else:
+        lines.append("| none | not_run | 0 | False |")
     lines.extend(["", "## Artifacts", "| key | exists | size_bytes | sha256 | path |", "|---|---:|---:|---|---|"])
     for item in card.get("artifacts") or []:
         lines.append(

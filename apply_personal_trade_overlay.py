@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from build_daily_personal_overlay_report import load_name_map
+
 
 DEFAULT_RULES: dict[str, Any] = {
     "low_entry_position_max": 0.50,
@@ -38,6 +40,7 @@ DEFAULT_RULES: dict[str, Any] = {
     "reselect_top_n": None,
     "default_target_weight": None,
     "selection_mode": "conservative_fill",
+    "special_treatment_action": "watch_only",
 }
 
 
@@ -51,6 +54,7 @@ REASON_CN = {
     "personal_history_severe_loss_symbol": "个人历史在该标的亏损较重，先观察",
     "personal_history_bad_symbol_reduce": "个人历史在该标的胜率/收益较差，降权",
     "personal_history_good_symbol_small_bonus": "个人历史在该标的表现较好，小幅加分",
+    "special_treatment_execution_unsupported": "ST股票涨跌停执行规则未完整建模，仅保留风险观察",
     "no_personal_overlay_adjustment": "未触发个人行为层调整",
 }
 
@@ -110,6 +114,9 @@ def decide_row(row: pd.Series, rules: dict[str, Any]) -> dict[str, object]:
     symbol_trades = _num(row.get("personal_trades"), 0.0)
     symbol_pnl = _num(row.get("personal_pnl"), 0.0)
     symbol_win_rate = _num(row.get("personal_win_rate"), np.nan)
+    stock_name = str(
+        row.get("stock_name", row.get("security_name", row.get("name", ""))) or ""
+    ).upper()
 
     if np.isfinite(close_position) and close_position <= float(rules["low_entry_position_max"]):
         delta += float(rules["low_entry_score_bonus"])
@@ -148,6 +155,11 @@ def decide_row(row: pd.Series, rules: dict[str, Any]) -> dict[str, object]:
         ):
             delta += float(rules["good_symbol_score_bonus"])
             reasons.append("personal_history_good_symbol_small_bonus")
+
+    if stock_name.startswith(("ST", "*ST", "SST", "S*ST")):
+        action = str(rules["special_treatment_action"])
+        multiplier = 0.0
+        reasons.append("special_treatment_execution_unsupported")
 
     if action == "allow" and multiplier < 0.999:
         action = "reduce"
@@ -359,6 +371,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Apply personal trade-habit overlay to model candidates.")
     parser.add_argument("--candidates", required=True)
     parser.add_argument("--symbol-history", default=None)
+    parser.add_argument("--names-source", default=None)
     parser.add_argument("--rules", default=None)
     parser.add_argument("--output", required=True)
     parser.add_argument("--reselect-top-n", type=int, default=None)
@@ -374,6 +387,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     candidates = pd.read_csv(args.candidates, dtype={"symbol": str})
+    candidates["symbol"] = candidates["symbol"].astype(str).str.zfill(6)
+    if args.names_source:
+        name_map = load_name_map(Path(args.names_source))
+        candidates["stock_name"] = candidates["symbol"].map(name_map).fillna("")
     rules = _load_rules(Path(args.rules) if args.rules else None)
     symbol_history = load_symbol_history(Path(args.symbol_history) if args.symbol_history else None)
     out = apply_overlay(
