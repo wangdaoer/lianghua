@@ -13,7 +13,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from uuid import uuid4
 
 from daily_run_card import write_daily_run_card
@@ -39,6 +39,8 @@ DEFAULT_MARKETLENS_DASHBOARD_OUTPUT = dashboard_root() / "data" / "quant-model3-
 class PipelineStep:
     name: str
     command: tuple[str, ...]
+    max_attempts: int = 1
+    retry_delay_seconds: float = 0.0
 
 
 class PipelineStepExecutionError(RuntimeError):
@@ -693,6 +695,8 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                     "--status-output",
                     str(paths["benchmark_refresh_status"]),
                 ),
+                max_attempts=2,
+                retry_delay_seconds=2.0,
             )
         )
     steps.extend([
@@ -712,6 +716,8 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                 "--output",
                 str(paths["panel"]),
             ),
+            max_attempts=2,
+            retry_delay_seconds=2.0,
         ),
         PipelineStep(
             "trend_state",
@@ -1249,6 +1255,8 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                     "--status-output",
                     str(paths["research_database_sync_status"]),
                 ),
+                max_attempts=2,
+                retry_delay_seconds=2.0,
             )
         )
     return steps
@@ -1275,6 +1283,8 @@ def build_marketlens_export_step(config: PipelineConfig) -> PipelineStep | None:
             str(paths["marketlens_dashboard_feed"]),
             "--require-complete-inputs",
         ),
+        max_attempts=2,
+        retry_delay_seconds=2.0,
     )
 
 
@@ -1310,27 +1320,47 @@ def _run_pipeline_step(
     index: int,
     total: int,
 ) -> dict[str, object]:
+    if step.max_attempts < 1:
+        raise ValueError(f"Pipeline step {step.name} max_attempts must be at least 1")
+    if step.retry_delay_seconds < 0:
+        raise ValueError(
+            f"Pipeline step {step.name} retry_delay_seconds cannot be negative"
+        )
     started_at = datetime.now().isoformat(timespec="milliseconds")
     started = perf_counter()
     print(f"[{index}/{total}] {step.name}")
     print(" ".join(step.command))
-    try:
-        subprocess.run(step.command, cwd=project_root, check=True)
-    except subprocess.CalledProcessError as exc:
-        execution = {
-            "name": step.name,
-            "status": "failed",
-            "started_at": started_at,
-            "finished_at": datetime.now().isoformat(timespec="milliseconds"),
-            "duration_seconds": round(perf_counter() - started, 6),
-            "returncode": int(exc.returncode),
-            "cache_hit": False,
-        }
-        raise PipelineStepExecutionError(
-            step,
-            int(exc.returncode),
-            execution=execution,
-        ) from exc
+    attempt = 0
+    while attempt < step.max_attempts:
+        attempt += 1
+        try:
+            subprocess.run(step.command, cwd=project_root, check=True)
+            break
+        except subprocess.CalledProcessError as exc:
+            if attempt < step.max_attempts:
+                print(
+                    f"[{index}/{total}] {step.name} failed with exit code "
+                    f"{exc.returncode}; retrying ({attempt + 1}/{step.max_attempts})"
+                )
+                if step.retry_delay_seconds:
+                    sleep(step.retry_delay_seconds)
+                continue
+            execution = {
+                "name": step.name,
+                "status": "failed",
+                "started_at": started_at,
+                "finished_at": datetime.now().isoformat(timespec="milliseconds"),
+                "duration_seconds": round(perf_counter() - started, 6),
+                "returncode": int(exc.returncode),
+                "cache_hit": False,
+                "attempts": attempt,
+                "retried": attempt > 1,
+            }
+            raise PipelineStepExecutionError(
+                step,
+                int(exc.returncode),
+                execution=execution,
+            ) from exc
     return {
         "name": step.name,
         "status": "success",
@@ -1339,6 +1369,8 @@ def _run_pipeline_step(
         "duration_seconds": round(perf_counter() - started, 6),
         "returncode": 0,
         "cache_hit": False,
+        "attempts": attempt,
+        "retried": attempt > 1,
     }
 
 
@@ -1400,6 +1432,8 @@ def run_steps(
                         "duration_seconds": round(perf_counter() - started, 6),
                         "returncode": 0,
                         "cache_hit": True,
+                        "attempts": 0,
+                        "retried": False,
                     }
                     print(f"[{order[step.name] + 1}/{len(steps)}] {step.name} [cache hit]")
                     executions.append(execution)
@@ -1479,6 +1513,8 @@ def execution_summary(
         "summed_step_duration_seconds": round(sum(durations), 6),
         "status_counts": status_counts,
         "cache_hits": sum(bool(item.get("cache_hit")) for item in executions),
+        "retried_steps": sum(bool(item.get("retried")) for item in executions),
+        "total_attempts": sum(int(item.get("attempts") or 0) for item in executions),
         "steps": executions,
     }
 

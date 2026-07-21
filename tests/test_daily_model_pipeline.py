@@ -101,6 +101,91 @@ class DailyModelPipelineTest(unittest.TestCase):
         self.assertEqual(len(raised.exception.completed_executions), 1)
         self.assertEqual(raised.exception.completed_executions[0]["status"], "failed")
 
+    def test_retryable_io_step_retries_once_then_succeeds(self):
+        step = PipelineStep(
+            "benchmark_refresh",
+            ("python", "benchmark.py"),
+            max_attempts=2,
+            retry_delay_seconds=2.0,
+        )
+        first_failure = subprocess.CalledProcessError(1, step.command)
+        with (
+            patch(
+                "run_daily_model_pipeline.subprocess.run",
+                side_effect=[first_failure, None],
+            ) as run,
+            patch("run_daily_model_pipeline.sleep") as retry_sleep,
+        ):
+            executions = run_steps([step], Path("C:/model"))
+
+        self.assertEqual(run.call_count, 2)
+        retry_sleep.assert_called_once_with(2.0)
+        self.assertEqual(executions[0]["status"], "success")
+        self.assertEqual(executions[0]["attempts"], 2)
+        self.assertTrue(executions[0]["retried"])
+
+    def test_strategy_step_fails_immediately_without_retry(self):
+        step = PipelineStep("train_rank_model", ("python", "train.py"))
+        with patch(
+            "run_daily_model_pipeline.subprocess.run",
+            side_effect=subprocess.CalledProcessError(1, step.command),
+        ) as run:
+            with self.assertRaises(PipelineStepExecutionError):
+                run_steps([step], Path("C:/model"))
+
+        self.assertEqual(run.call_count, 1)
+
+    def test_retry_exhaustion_is_recorded_in_failure_execution(self):
+        step = PipelineStep(
+            "update_panel",
+            ("python", "update.py"),
+            max_attempts=2,
+        )
+        failure = subprocess.CalledProcessError(7, step.command)
+        with patch(
+            "run_daily_model_pipeline.subprocess.run",
+            side_effect=[failure, failure],
+        ) as run:
+            with self.assertRaises(PipelineStepExecutionError) as raised:
+                run_steps([step], Path("C:/model"))
+
+        self.assertEqual(run.call_count, 2)
+        execution = raised.exception.completed_executions[0]
+        self.assertEqual(execution["status"], "failed")
+        self.assertEqual(execution["attempts"], 2)
+        self.assertTrue(execution["retried"])
+
+    def test_default_pipeline_retries_only_io_boundary_steps(self):
+        config = PipelineConfig(
+            asof_date="2026-06-29",
+            project_root=Path("C:/model"),
+            include_marketlens_export=True,
+        )
+        steps = build_daily_pipeline_steps(config)
+        marketlens = build_marketlens_export_step(config)
+        self.assertIsNotNone(marketlens)
+        all_steps = [*steps, marketlens]
+
+        retryable = {step.name for step in all_steps if step.max_attempts > 1}
+        self.assertEqual(
+            retryable,
+            {
+                "benchmark_refresh",
+                "update_panel",
+                "research_database_sync",
+                "marketlens_export",
+            },
+        )
+        strategy_steps = {
+            "trend_state",
+            "train_rank_model",
+            "rank_candidates",
+            "personal_overlay",
+            "strategy_arena",
+        }
+        attempts = {step.name: step.max_attempts for step in all_steps}
+        self.assertTrue(all(attempts[name] == 1 for name in strategy_steps))
+
     def test_discover_base_panel_uses_latest_panel_before_asof(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
