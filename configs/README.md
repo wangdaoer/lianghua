@@ -16,6 +16,7 @@ Status meanings:
 | --- | --- | --- |
 | `personal_trade_habit_overlay.yaml` | active-research | `run_daily_model_pipeline.py`; personal overlay only |
 | `factor_replacement_preregistration.json` | shadow | Frozen 2026-07-14 shortlist; unseen tracking starts 2026-07-15 |
+| `dynamic_breadth_overlay_preregistration.json` | shadow | Frozen 2026-07-21 incumbent-vs-breadth contract; 60-day forward observation starts 2026-07-22; automatic promotion disabled |
 | `institutional_accumulation_shadow.yaml` | shadow | Frozen 2026-07-18 price-volume + THS flow proxy; prospective tracking starts 2026-07-20; no ranking effect |
 | `evolution_strong_pullback.yaml` | shadow | `run_strong_pullback_evolution.py`; `docs/superpowers/specs/2026-07-10-strong-pullback-self-evolution-design.md` |
 | `evolution_multifactor_observation.yaml` | shadow | `run_multifactor_observation_evolution.py`; observation-only gates |
@@ -50,3 +51,22 @@ Status meanings:
 The current daily rank model is configured by explicit `PipelineConfig` and CLI fields in
 `run_daily_model_pipeline.py`; it does not silently select one of the
 `high_risk_strategy_high_return_v2*` files.
+
+## Concentrated return research
+
+`research_concentrated_return_frontier.py` pairs 3/5/8/10-stock portfolios
+with feasible position caps and evaluates normal costs, doubled costs, and a
+3% next-open gap limit. It is research-only and cannot promote a strategy into
+the daily production pipeline. The 900% cumulative-return threshold is an
+exploration target, not a promised result.
+
+`run_legacy_alpha_strict_replay.py` is the frozen follow-up audit. It replays
+the legacy momentum/trend/reversal/low-volatility/liquidity Top10 score under
+the current next-open execution contract and compares only the preregistered
+control, market-filter, and breadth-filter variants. Its outputs are historical
+research evidence only and cannot update daily production state.
+
+`track_dynamic_breadth_overlay.py` is the forward-only observer for the daily
+rank incumbent and breadth-guard challenger. It excludes every date before
+2026-07-22 from gate statistics, requires 60 valid shared trading days, and
+cannot promote or modify the production model automatically.

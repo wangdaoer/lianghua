@@ -8,11 +8,19 @@ import pytest
 from run_backtest import (
     BacktestEngine,
     StrategyConfig,
+    annualized_return,
     clean_symbol,
     load_config,
     load_prices,
     prepare_prices,
 )
+
+
+def test_annualized_return_uses_trading_observations_not_calendar_days():
+    dates = pd.bdate_range("2025-01-02", periods=253)
+    equity = pd.Series(np.linspace(1.0, 1.10, len(dates)), index=dates)
+
+    assert annualized_return(equity) == pytest.approx(0.10)
 
 
 def make_config(**overrides):
@@ -185,6 +193,30 @@ def test_load_prices_preserves_legacy_zero_row_filtering(tmp_path):
 
 
 class RunBacktestEngineTest(unittest.TestCase):
+    def test_engine_reuses_supplied_signal_and_universe_caches(self):
+        dates = pd.date_range("2026-01-01", periods=6, freq="D")
+        raw = pd.DataFrame(
+            {
+                "date": list(dates) * 2,
+                "symbol": ["000001"] * len(dates) + ["000002"] * len(dates),
+                "open": [10.0] * 12,
+                "high": [10.0] * 12,
+                "low": [10.0] * 12,
+                "close": [10.0] * 12,
+                "volume": [1_000.0] * 12,
+                "amount": [10_000.0] * 12,
+            }
+        )
+        cache = pd.DataFrame(0.0, index=dates, columns=["000001", "000002"])
+        membership = pd.DataFrame(True, index=dates, columns=cache.columns)
+        engine = BacktestEngine(make_config())
+        engine._precompute_signal_panel = lambda close: self.fail("signal cache recomputed")
+        engine._precompute_universe_panel = lambda close, amount: self.fail("universe cache recomputed")
+
+        result = engine.run(raw, signal_cache=cache, universe_cache=membership)
+
+        self.assertEqual(result["metrics"]["trade_days"], 6)
+
     def test_execution_constraint_counts_accept_new_diagnostic_keys(self):
         engine = BacktestEngine(make_config())
 

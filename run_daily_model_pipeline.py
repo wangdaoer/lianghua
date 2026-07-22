@@ -76,6 +76,8 @@ class PipelineConfig:
     institutional_accumulation_config: Path = Path(
         "configs/institutional_accumulation_shadow.yaml"
     )
+    world_event_config: Path = Path("configs/world_event_shadow.yaml")
+    world_event_snapshot: Path | None = None
     symbol_history: Path | None = None
     shadow_account_review: Path | None = None
     train_model: bool = True
@@ -99,12 +101,17 @@ class PipelineConfig:
     include_benchmark_refresh: bool = True
     include_regime_shadow_compare: bool = True
     include_regime_shadow_tracking: bool = True
+    include_dynamic_breadth_tracking: bool = True
+    include_world_event_shadow: bool = True
     include_research_db_sync: bool = True
     include_marketlens_export: bool = False
     include_trend_ignition_shadow: bool = False
     marketlens_dashboard_output: Path = DEFAULT_MARKETLENS_DASHBOARD_OUTPUT
     regime_shadow_config: Path = Path("configs/evolution_strong_pullback.yaml")
     regime_shadow_candidate_id: str = "regime_090_balanced"
+    dynamic_breadth_preregistration: Path = Path(
+        "configs/dynamic_breadth_overlay_preregistration.json"
+    )
     arena_breadth_ma_window: int = 60
     arena_breadth_threshold: float = 0.45
     arena_breadth_below_exposure: float = 0.55
@@ -129,6 +136,11 @@ PIPELINE_STEP_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "regime_shadow_tracking": ("regime_shadow_compare",),
     "train_rank_model": ("update_panel", "benchmark_refresh"),
     "train_breadth_guard_challenger": ("update_panel", "benchmark_refresh"),
+    "dynamic_breadth_overlay_tracking": (
+        "train_rank_model",
+        "train_breadth_guard_challenger",
+    ),
+    "world_event_shadow": (),
     "rank_candidates": ("trend_state", "train_rank_model"),
     "personal_overlay": ("rank_candidates",),
     "early_pattern_watchlist": ("update_panel",),
@@ -412,6 +424,120 @@ def _research_database_sync_state(
     return status, str(_latest_artifact(status_path))
 
 
+def _world_event_shadow_state(
+    config: PipelineConfig,
+    steps: list[PipelineStep],
+    paths: dict[str, Path],
+    run_status: str,
+    failure: dict[str, object] | None,
+    step_executions: list[dict[str, object]] | None,
+) -> tuple[dict[str, object], dict[str, str | None]]:
+    artifacts = {"json": None, "csv": None, "report": None}
+    if not config.include_world_event_shadow:
+        return {"status": "skipped"}, artifacts
+
+    override = _pipeline_artifact_status_override(
+        steps,
+        run_status,
+        failure,
+        step_executions,
+        "world_event_shadow",
+    )
+    if override:
+        return {"status": override}, artifacts
+
+    metadata = _read_json_object(paths["world_event_shadow_json"])
+    if not metadata:
+        return {"status": "missing"}, artifacts
+    if metadata.get("asof_date") != config.asof_date:
+        return {
+            "status": "stale",
+            "source_asof_date": metadata.get("asof_date"),
+        }, artifacts
+
+    required_outputs = (
+        paths["world_event_shadow_json"],
+        paths["world_event_shadow_csv"],
+        paths["world_event_shadow_report"],
+    )
+    if not all(path.exists() for path in required_outputs):
+        return {"status": "incomplete_outputs"}, artifacts
+
+    artifacts.update(
+        {
+            "json": str(_latest_artifact(paths["world_event_shadow_json"])),
+            "csv": str(_latest_artifact(paths["world_event_shadow_csv"])),
+            "report": str(_latest_artifact(paths["world_event_shadow_report"])),
+        }
+    )
+    return metadata, artifacts
+
+
+def _dynamic_breadth_tracking_state(
+    config: PipelineConfig,
+    steps: list[PipelineStep],
+    paths: dict[str, Path],
+    run_status: str,
+    failure: dict[str, object] | None,
+    step_executions: list[dict[str, object]] | None,
+) -> tuple[dict[str, object], dict[str, str | None]]:
+    enabled = (
+        config.include_dynamic_breadth_tracking
+        and config.train_model
+        and config.include_strategy_arena
+        and config.include_regime_shadow_compare
+    )
+    artifacts = {
+        "preregistration": (
+            str(paths["dynamic_breadth_preregistration"])
+            if paths["dynamic_breadth_preregistration"].exists()
+            else None
+        ),
+        "ledger": None,
+        "summary": None,
+        "report": None,
+    }
+    if not enabled:
+        return {"status": "skipped"}, artifacts
+
+    override = _pipeline_artifact_status_override(
+        steps,
+        run_status,
+        failure,
+        step_executions,
+        "dynamic_breadth_overlay_tracking",
+    )
+    if override:
+        return {"status": override}, artifacts
+
+    summary_path = paths["dynamic_breadth_tracking_summary"]
+    if not summary_path.exists():
+        return {"status": "missing"}, artifacts
+    summary = _read_json_object(summary_path)
+    if summary.get("source_latest_date") != config.asof_date:
+        return {
+            "status": "stale",
+            "source_latest_date": summary.get("source_latest_date"),
+        }, artifacts
+
+    required_outputs = (
+        paths["dynamic_breadth_tracking_ledger"],
+        summary_path,
+        paths["dynamic_breadth_tracking_report"],
+    )
+    if not all(path.exists() for path in required_outputs):
+        return {"status": "incomplete_outputs"}, artifacts
+
+    artifacts.update(
+        {
+            "ledger": str(_latest_artifact(paths["dynamic_breadth_tracking_ledger"])),
+            "summary": str(_latest_artifact(summary_path)),
+            "report": str(_latest_artifact(paths["dynamic_breadth_tracking_report"])),
+        }
+    )
+    return summary, artifacts
+
+
 def _trend_ignition_shadow_state(
     config: PipelineConfig,
     steps: list[PipelineStep],
@@ -653,6 +779,20 @@ def _paths(config: PipelineConfig) -> dict[str, Path]:
         "regime_shadow_tracking_ledger": output_root / "regime_shadow_tracking.csv",
         "regime_shadow_tracking_summary": output_root / "regime_shadow_tracking_summary.json",
         "regime_shadow_tracking_report": output_root / "regime_shadow_tracking_report.md",
+        "dynamic_breadth_preregistration": _resolve(
+            root, config.dynamic_breadth_preregistration
+        ),
+        "dynamic_breadth_tracking_ledger": output_root
+        / "dynamic_breadth_overlay_tracking.csv",
+        "dynamic_breadth_tracking_summary": output_root
+        / "dynamic_breadth_overlay_tracking_summary.json",
+        "dynamic_breadth_tracking_report": output_root
+        / "dynamic_breadth_overlay_tracking_report.md",
+        "world_event_config": _resolve(root, config.world_event_config),
+        "world_event_shadow_json": output_root / f"world_event_shadow_{token}.json",
+        "world_event_shadow_csv": output_root / f"world_event_shadow_{token}.csv",
+        "world_event_shadow_report": output_root / f"world_event_shadow_{token}.md",
+        "world_event_shadow_cache": output_root / "world_event_shadow_payload_cache.json",
         "benchmark_refresh_status": output_root / f"benchmark_refresh_status_{token}.json",
         "pipeline_step_cache": output_root / f"pipeline_step_cache_{token}.json",
         "research_db": _resolve(root, config.research_db),
@@ -735,6 +875,24 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
             ),
         ),
     ])
+    if config.include_world_event_shadow:
+        world_event_command = [
+            config.python_exe,
+            str(config.project_root / "world_event_shadow.py"),
+            "--asof-date",
+            config.asof_date,
+            "--config",
+            str(paths["world_event_config"]),
+            "--output",
+            str(paths["world_event_shadow_json"]),
+            "--cache",
+            str(paths["world_event_shadow_cache"]),
+        ]
+        if config.world_event_snapshot is not None:
+            world_event_command.extend(
+                ["--snapshot", str(_resolve(config.project_root, config.world_event_snapshot))]
+            )
+        steps.append(PipelineStep("world_event_shadow", tuple(world_event_command)))
     if config.include_regime_shadow_compare:
         steps.append(
             PipelineStep(
@@ -859,6 +1017,32 @@ def build_daily_pipeline_steps(config: PipelineConfig) -> list[PipelineStep]:
                         str(config.arena_breadth_crash_threshold),
                         "--breadth-crash-exposure",
                         str(config.arena_breadth_crash_exposure),
+                    ),
+                )
+            )
+        if (
+            config.include_dynamic_breadth_tracking
+            and config.include_strategy_arena
+            and config.include_regime_shadow_compare
+        ):
+            steps.append(
+                PipelineStep(
+                    "dynamic_breadth_overlay_tracking",
+                    (
+                        config.python_exe,
+                        str(config.project_root / "track_dynamic_breadth_overlay.py"),
+                        "--incumbent-equity",
+                        str(paths["model_dir"] / "equity_curve.csv"),
+                        "--challenger-equity",
+                        str(paths["breadth_model_dir"] / "equity_curve.csv"),
+                        "--ledger",
+                        str(paths["dynamic_breadth_tracking_ledger"]),
+                        "--summary",
+                        str(paths["dynamic_breadth_tracking_summary"]),
+                        "--report",
+                        str(paths["dynamic_breadth_tracking_report"]),
+                        "--config",
+                        str(paths["dynamic_breadth_preregistration"]),
                     ),
                 )
             )
@@ -1553,6 +1737,7 @@ def build_daily_run_state(
             "institutional_accumulation_tracking",
             "czsc_structure_shadow",
             "strategy_arena",
+            "world_event_shadow",
         )
     }
     priority_path = _latest_artifact(paths["merged_priority_watchlist"])
@@ -1699,6 +1884,22 @@ def build_daily_run_state(
         tracking_ledger_artifact = None
         tracking_summary_artifact = None
         tracking_report_artifact = None
+    dynamic_breadth_tracking, dynamic_breadth_artifacts = _dynamic_breadth_tracking_state(
+        config,
+        steps,
+        paths,
+        run_status,
+        failure,
+        step_executions,
+    )
+    world_event_shadow, world_event_artifacts = _world_event_shadow_state(
+        config,
+        steps,
+        paths,
+        run_status,
+        failure,
+        step_executions,
+    )
     if not config.include_benchmark_refresh:
         benchmark_refresh = {"status": "skipped"}
     elif paths["benchmark_refresh_status"].exists():
@@ -1888,6 +2089,45 @@ def build_daily_run_state(
             "regime_shadow_tracking_benchmark_fresh": tracking_benchmark_fresh,
             "regime_shadow_tracking_risk_regime": tracking_risk_regime,
             "regime_shadow_tracking_target_leverage": tracking_target_leverage,
+            "dynamic_breadth_tracking_status": dynamic_breadth_tracking.get("status"),
+            "dynamic_breadth_tracking_source_latest_date": dynamic_breadth_tracking.get(
+                "source_latest_date"
+            ),
+            "dynamic_breadth_tracking_valid_observations": dynamic_breadth_tracking.get(
+                "valid_observation_count"
+            ),
+            "dynamic_breadth_tracking_target_days": dynamic_breadth_tracking.get(
+                "target_valid_trade_days"
+            ),
+            "dynamic_breadth_tracking_remaining_days": dynamic_breadth_tracking.get(
+                "remaining_observation_days"
+            ),
+            "dynamic_breadth_tracking_cumulative_excess_return": dynamic_breadth_tracking.get(
+                "cumulative_excess_return"
+            ),
+            "dynamic_breadth_tracking_positive_excess_day_ratio": dynamic_breadth_tracking.get(
+                "positive_excess_day_ratio"
+            ),
+            "dynamic_breadth_tracking_gate_allowed": dynamic_breadth_tracking.get(
+                "gate_evaluation_allowed"
+            ),
+            "dynamic_breadth_tracking_provisional_only": dynamic_breadth_tracking.get(
+                "provisional_only"
+            ),
+            "dynamic_breadth_tracking_promotion_allowed": dynamic_breadth_tracking.get(
+                "promotion_allowed"
+            ),
+            "world_event_shadow_status": world_event_shadow.get("status"),
+            "world_event_global_risk_score": world_event_shadow.get(
+                "global_risk_score"
+            ),
+            "world_event_risk_level": world_event_shadow.get("risk_level"),
+            "world_event_source_count": world_event_shadow.get("event_source_count"),
+            "world_event_confidence": world_event_shadow.get("event_confidence"),
+            "world_event_data_freshness": world_event_shadow.get("data_freshness"),
+            "world_event_selection_effect": world_event_shadow.get(
+                "selection_effect"
+            ),
             "benchmark_refresh_status": benchmark_refresh.get("status"),
             "benchmark_latest_date": benchmark_refresh.get("latest_date"),
             "benchmark_source_agreement": benchmark_refresh.get("source_agreement"),
@@ -2158,6 +2398,15 @@ def build_daily_run_state(
             "regime_shadow_tracking_ledger": tracking_ledger_artifact,
             "regime_shadow_tracking_summary": tracking_summary_artifact,
             "regime_shadow_tracking_report": tracking_report_artifact,
+            "dynamic_breadth_preregistration": dynamic_breadth_artifacts[
+                "preregistration"
+            ],
+            "dynamic_breadth_tracking_ledger": dynamic_breadth_artifacts["ledger"],
+            "dynamic_breadth_tracking_summary": dynamic_breadth_artifacts["summary"],
+            "dynamic_breadth_tracking_report": dynamic_breadth_artifacts["report"],
+            "world_event_shadow_json": world_event_artifacts["json"],
+            "world_event_shadow_csv": world_event_artifacts["csv"],
+            "world_event_shadow_report": world_event_artifacts["report"],
             "benchmark_refresh_status": (
                 str(_latest_artifact(paths["benchmark_refresh_status"]))
                 if config.include_benchmark_refresh
@@ -2420,6 +2669,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-benchmark-refresh", action="store_true")
     parser.add_argument("--skip-regime-shadow-compare", action="store_true")
     parser.add_argument("--skip-regime-shadow-tracking", action="store_true")
+    parser.add_argument("--skip-dynamic-breadth-tracking", action="store_true")
+    parser.add_argument("--skip-world-event-shadow", action="store_true")
+    parser.add_argument(
+        "--world-event-config",
+        default="configs/world_event_shadow.yaml",
+    )
+    parser.add_argument("--world-event-snapshot", default=None)
     parser.add_argument("--skip-research-db-sync", action="store_true")
     parser.add_argument("--skip-marketlens-export", action="store_true")
     parser.add_argument(
@@ -2519,6 +2775,12 @@ def main() -> None:
         include_benchmark_refresh=not args.skip_benchmark_refresh,
         include_regime_shadow_compare=not args.skip_regime_shadow_compare,
         include_regime_shadow_tracking=not args.skip_regime_shadow_tracking,
+        include_dynamic_breadth_tracking=not args.skip_dynamic_breadth_tracking,
+        include_world_event_shadow=not args.skip_world_event_shadow,
+        world_event_config=Path(args.world_event_config),
+        world_event_snapshot=(
+            Path(args.world_event_snapshot) if args.world_event_snapshot else None
+        ),
         include_research_db_sync=not args.skip_research_db_sync,
         include_marketlens_export=not args.skip_marketlens_export,
         include_trend_ignition_shadow=args.enable_trend_ignition_shadow,
@@ -2582,8 +2844,20 @@ def main() -> None:
         print(output_root / "regime_shadow_tracking.csv")
         print(output_root / "regime_shadow_tracking_summary.json")
         print(output_root / "regime_shadow_tracking_report.md")
+    if (
+        config.include_dynamic_breadth_tracking
+        and config.train_model
+        and config.include_strategy_arena
+        and config.include_regime_shadow_compare
+    ):
+        print(output_root / "dynamic_breadth_overlay_tracking.csv")
+        print(output_root / "dynamic_breadth_overlay_tracking_summary.json")
+        print(output_root / "dynamic_breadth_overlay_tracking_report.md")
     if config.include_benchmark_refresh:
         print(output_root / f"benchmark_refresh_status_{token}.json")
+    if config.include_world_event_shadow:
+        print(output_root / f"world_event_shadow_{token}.json")
+        print(output_root / f"world_event_shadow_{token}.md")
     if config.include_research_db_sync:
         print(output_root / f"research_database_sync_{token}.json")
     if not args.dry_run and not args.skip_state_log:

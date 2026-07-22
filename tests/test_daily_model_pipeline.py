@@ -274,6 +274,23 @@ class DailyModelPipelineTest(unittest.TestCase):
         self.assertIn("next_open_rank_model_breadth_guard_bench20260629", breadth_args)
         self.assertIn("--breadth-filter", breadth_args)
         self.assertIn("--breadth-threshold 0.45", breadth_args)
+        self.assertIn("dynamic_breadth_overlay_tracking", names)
+        dynamic_index = names.index("dynamic_breadth_overlay_tracking")
+        self.assertGreater(dynamic_index, names.index("train_rank_model"))
+        self.assertGreater(dynamic_index, names.index("train_breadth_guard_challenger"))
+        self.assertLess(dynamic_index, names.index("rank_candidates"))
+        dynamic_step = steps[dynamic_index]
+        dynamic_args = " ".join(str(part) for part in dynamic_step.command)
+        self.assertIn("track_dynamic_breadth_overlay.py", dynamic_args)
+        self.assertIn("next_open_rank_model_stock_focus_lev093_marketfilter_bench20260629", dynamic_args)
+        self.assertIn("next_open_rank_model_breadth_guard_bench20260629", dynamic_args)
+        self.assertIn("dynamic_breadth_overlay_tracking_summary.json", dynamic_args)
+        self.assertIn("configs/dynamic_breadth_overlay_preregistration.json", dynamic_args.replace("\\", "/"))
+        dependencies = pipeline_step_dependencies(steps)
+        self.assertEqual(
+            dependencies["dynamic_breadth_overlay_tracking"],
+            ("train_rank_model", "train_breadth_guard_challenger"),
+        )
 
         self.assertEqual(
             names[-14:],
@@ -653,6 +670,29 @@ class DailyModelPipelineTest(unittest.TestCase):
                 self.fail(f"parse_args should accept --skip-regime-shadow-tracking: {exc}")
 
         self.assertTrue(args.skip_regime_shadow_tracking)
+
+    def test_parse_args_accepts_skip_dynamic_breadth_tracking_flag(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["run_daily_model_pipeline.py", "--skip-dynamic-breadth-tracking"],
+        ):
+            args = parse_args()
+
+        self.assertTrue(args.skip_dynamic_breadth_tracking)
+
+    def test_pipeline_can_skip_dynamic_breadth_tracking(self):
+        config = PipelineConfig(
+            asof_date="2026-06-29",
+            python_exe="python",
+            project_root=Path("C:/model"),
+            include_dynamic_breadth_tracking=False,
+        )
+
+        names = [step.name for step in build_daily_pipeline_steps(config)]
+
+        self.assertNotIn("dynamic_breadth_overlay_tracking", names)
+        self.assertIn("train_breadth_guard_challenger", names)
 
     def test_pipeline_can_skip_benchmark_refresh(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1229,6 +1269,63 @@ class DailyModelPipelineTest(unittest.TestCase):
             self.assertIsNone(record["artifacts"]["regime_shadow_tracking_summary"])
             self.assertIsNone(record["artifacts"]["regime_shadow_tracking_report"])
 
+    def test_daily_run_state_exposes_current_dynamic_breadth_observer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            output.mkdir(parents=True)
+            self._seed_minimal_daily_state_inputs(output, "20260722")
+            self._write_dynamic_breadth_outputs(output, source_latest_date="2026-07-22")
+            config_dir = root / "configs"
+            config_dir.mkdir()
+            (config_dir / "dynamic_breadth_overlay_preregistration.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            config = PipelineConfig(
+                asof_date="2026-07-22",
+                python_exe="python",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                daily_data_dir=root,
+                fetch_status_utils=root / "missing_utils.py",
+            )
+            steps = build_daily_pipeline_steps(config)
+
+            record = build_daily_run_state(config, steps)
+
+        verification = record["verification"]
+        self.assertEqual(verification["dynamic_breadth_tracking_status"], "collecting")
+        self.assertEqual(verification["dynamic_breadth_tracking_valid_observations"], 1)
+        self.assertEqual(verification["dynamic_breadth_tracking_target_days"], 60)
+        self.assertEqual(verification["dynamic_breadth_tracking_remaining_days"], 59)
+        self.assertFalse(verification["dynamic_breadth_tracking_gate_allowed"])
+        self.assertTrue(verification["dynamic_breadth_tracking_provisional_only"])
+        self.assertFalse(verification["dynamic_breadth_tracking_promotion_allowed"])
+        self.assertTrue(str(record["artifacts"]["dynamic_breadth_tracking_summary"]).endswith(".json"))
+
+    def test_daily_run_state_rejects_stale_dynamic_breadth_observer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "outputs" / "high_return_v2"
+            output.mkdir(parents=True)
+            self._seed_minimal_daily_state_inputs(output, "20260722")
+            self._write_dynamic_breadth_outputs(output, source_latest_date="2026-07-21")
+            config = PipelineConfig(
+                asof_date="2026-07-22",
+                project_root=root,
+                output_root=Path("outputs/high_return_v2"),
+                daily_data_dir=root,
+                fetch_status_utils=root / "missing_utils.py",
+            )
+            steps = build_daily_pipeline_steps(config)
+
+            record = build_daily_run_state(config, steps)
+
+        self.assertEqual(record["verification"]["dynamic_breadth_tracking_status"], "stale")
+        self.assertIsNone(record["artifacts"]["dynamic_breadth_tracking_ledger"])
+        self.assertIsNone(record["artifacts"]["dynamic_breadth_tracking_summary"])
+        self.assertIsNone(record["artifacts"]["dynamic_breadth_tracking_report"])
+
     def test_daily_run_state_uses_newest_pending_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1557,6 +1654,36 @@ class DailyModelPipelineTest(unittest.TestCase):
             encoding="utf-8",
         )
         (output / "regime_shadow_tracking_report.md").write_text("tracking report", encoding="utf-8")
+
+    def _write_dynamic_breadth_outputs(
+        self,
+        output: Path,
+        *,
+        source_latest_date: str,
+    ) -> None:
+        (output / "dynamic_breadth_overlay_tracking.csv").write_text(
+            "date\n2026-07-22\n", encoding="utf-8"
+        )
+        (output / "dynamic_breadth_overlay_tracking_summary.json").write_text(
+            json.dumps(
+                {
+                    "status": "collecting",
+                    "source_latest_date": source_latest_date,
+                    "valid_observation_count": 1,
+                    "target_valid_trade_days": 60,
+                    "remaining_observation_days": 59,
+                    "cumulative_excess_return": 0.001,
+                    "positive_excess_day_ratio": 1.0,
+                    "gate_evaluation_allowed": False,
+                    "provisional_only": True,
+                    "promotion_allowed": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (output / "dynamic_breadth_overlay_tracking_report.md").write_text(
+            "dynamic breadth report", encoding="utf-8"
+        )
 
 
 if __name__ == "__main__":

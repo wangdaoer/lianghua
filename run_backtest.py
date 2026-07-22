@@ -209,11 +209,11 @@ def pivot_prices(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
 
 
 def annualized_return(equity: pd.Series) -> float:
-    if equity.empty:
+    if len(equity) < 2:
         return 0.0
     total = equity.iloc[-1] / equity.iloc[0] - 1
-    days = max((equity.index[-1] - equity.index[0]).days, 1)
-    return (1 + total) ** (252 / days) - 1
+    trading_periods = len(equity) - 1
+    return (1 + total) ** (252 / trading_periods) - 1
 
 
 def max_drawdown(equity: pd.Series) -> float:
@@ -612,7 +612,13 @@ class BacktestEngine:
         scale = min(1.0, target_vol / port_vol)
         return weights * float(scale)
 
-    def run(self, raw_df: pd.DataFrame) -> Dict[str, Any]:
+    def run(
+        self,
+        raw_df: pd.DataFrame,
+        *,
+        signal_cache: pd.DataFrame | None = None,
+        universe_cache: pd.DataFrame | None = None,
+    ) -> Dict[str, Any]:
         close = pivot_prices(raw_df, "close")
         close = self._clean_price_matrix(close)
         amount = (
@@ -623,8 +629,16 @@ class BacktestEngine:
         returns = close.pct_change(fill_method=None).fillna(0.0)
         if close.shape[1] == 0 or len(close) < max(self.cfg.long_window, 2):
             raise ValueError("Not enough data for backtest.")
-        self.signal_cache = self._precompute_signal_panel(close)
-        self.universe_cache = self._precompute_universe_panel(close, amount)
+        self.signal_cache = (
+            signal_cache.reindex(index=close.index, columns=close.columns)
+            if signal_cache is not None
+            else self._precompute_signal_panel(close)
+        )
+        self.universe_cache = (
+            universe_cache.reindex(index=close.index, columns=close.columns, fill_value=False)
+            if universe_cache is not None
+            else self._precompute_universe_panel(close, amount)
+        )
 
         if self.cfg.execution_model.lower().strip() == "next_open":
             open_px = pivot_prices(raw_df, "open").reindex_like(close)

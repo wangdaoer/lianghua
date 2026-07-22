@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from execution_rules import apply_open_constraints, next_open_return_label
-from run_backtest import clean_symbol, load_prices, max_drawdown, pivot_prices, sharpe_like
+from run_backtest import annualized_return, clean_symbol, load_prices, max_drawdown, pivot_prices, sharpe_like
 
 
 MAIN_CHINEXT_PREFIXES = ("000", "001", "002", "003", "300", "301", "600", "601", "603", "605")
@@ -303,7 +303,7 @@ def main() -> None:
         "initial_capital": args.initial_capital,
         "final_equity": float(nav.iloc[-1]),
         "total_return": float(nav.iloc[-1] / nav.iloc[0] - 1),
-        "annualized_return": float((1.0 + nav.iloc[-1] / nav.iloc[0] - 1.0) ** (252 / max(len(nav), 1)) - 1.0),
+        "annualized_return": float(annualized_return(nav)),
         "max_drawdown": float(max_drawdown(nav)),
         "sharpe_like": float(sharpe_like(returns)),
         "trade_days": int(len(nav)),
